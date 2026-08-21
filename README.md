@@ -1,8 +1,8 @@
 # foo_spectrum_compare - foobar2000 频谱对比插件
 
-[![Build](https://github.com/YOUR_USERNAME/foo_spectrum_compare/actions/workflows/build.yml/badge.svg)](https://github.com/YOUR_USERNAME/foo_spectrum_compare/actions/workflows/build.yml)
+[![Build](https://github.com/a1waysbeta/foo_spectrum_compare/actions/workflows/build.yml/badge.svg)](https://github.com/a1waysbeta/foo_spectrum_compare/actions/workflows/build.yml)
 
-一个 foobar2000 UI 面板插件，用于垂直对比多首音轨的声学频谱图。配色方案借鉴自 Spek / Spek-X。
+一个 foobar2000 面板插件，用于垂直对比多首音轨的声学频谱图。配色方案借鉴自 Spek / Spek-X。
 
 ## 功能特性
 
