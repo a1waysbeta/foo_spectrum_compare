@@ -4,12 +4,28 @@
 #include <algorithm>
 #include <cmath>
 
+// Static config storage (registered once at program startup)
+cfg_bool g_cfg_show_freq_axis(guid_cfg_show_freq_axis, true);
+cfg_bool g_cfg_show_time_axis(guid_cfg_show_time_axis, true);
+cfg_string g_cfg_title_format(guid_cfg_title_format, DEFAULT_TITLE_FORMAT);
+cfg_int g_cfg_max_tracks(guid_cfg_max_tracks, 4);
+cfg_int g_cfg_palette(guid_cfg_palette, (int)PALETTE_SPECTRUM);
+
 SpectrumCompareWindow::SpectrumCompareWindow(
     ui_element_config::ptr config,
     ui_element_instance_callback_ptr p_callback)
     : m_callback(p_callback)
     , m_config(config)
 {
+    // Load persistent config into runtime members
+    m_show_freq_axis = g_cfg_show_freq_axis;
+    m_show_time_axis = g_cfg_show_time_axis;
+    m_title_format = g_cfg_title_format.get();
+    m_max_tracks = (int)g_cfg_max_tracks;
+    m_palette = (palette_t)(int)g_cfg_palette;
+
+    // Apply to analyzer
+    m_analyzer.set_title_format(m_title_format.c_str());
 }
 
 SpectrumCompareWindow::~SpectrumCompareWindow() {
@@ -282,6 +298,8 @@ void SpectrumCompareWindow::OnPaint(CDCHandle) {
     // Calculate layout: vertical split, equal heights
     int track_count = (int)m_tracks.size();
     int label_height = 20;
+    int freq_axis_width = m_show_freq_axis ? 42 : 0;
+    int time_axis_height = m_show_time_axis ? 18 : 0;
     int gap = 2;
     int total_gap = gap * (track_count - 1);
     int available_height = rc.Height() - total_gap;
@@ -296,8 +314,22 @@ void SpectrumCompareWindow::OnPaint(CDCHandle) {
         CRect label_rc(track_rc.left, track_rc.top, track_rc.right, track_rc.top + label_height);
         render_track_label(dc.m_hDC, label_rc, *m_tracks[i]);
 
-        // Draw spectrum area
-        CRect spec_rc(track_rc.left, track_rc.top + label_height, track_rc.right, track_rc.bottom);
+        // Spectrum area: subtract freq axis (left) and time axis (bottom)
+        CRect spec_rc(
+            track_rc.left + freq_axis_width,
+            track_rc.top + label_height,
+            track_rc.right,
+            track_rc.bottom - time_axis_height
+        );
+
+        // Draw frequency axis (left of spectrum)
+        if (m_show_freq_axis) {
+            CRect freq_rc(track_rc.left, track_rc.top + label_height,
+                          track_rc.left + freq_axis_width, track_rc.bottom - time_axis_height);
+            render_freq_axis(dc.m_hDC, freq_rc, m_tracks[i]->data.sample_rate);
+        }
+
+        // Draw spectrum or status
         if (m_tracks[i]->data.ready && !m_tracks[i]->data.error) {
             render_spectrum(dc.m_hDC, spec_rc, m_tracks[i]->data);
         } else if (m_tracks[i]->data.error) {
@@ -314,6 +346,13 @@ void SpectrumCompareWindow::OnPaint(CDCHandle) {
             SelectObjectScope fontScope(dc, (HGDIOBJ)m_callback->query_font_ex(ui_font_default));
             dc.DrawText(_T("Analyzing..."), -1, &spec_rc, DT_NOPREFIX | DT_CENTER | DT_VCENTER | DT_SINGLELINE);
         }
+
+        // Draw time axis (below spectrum)
+        if (m_show_time_axis && m_tracks[i]->data.duration > 0) {
+            CRect time_rc(track_rc.left + freq_axis_width, track_rc.bottom - time_axis_height,
+                          track_rc.right, track_rc.bottom);
+            render_time_axis(dc.m_hDC, time_rc, m_tracks[i]->data.duration);
+        }
     }
 }
 
@@ -324,23 +363,15 @@ void SpectrumCompareWindow::render_track_label(CDCHandle dc, const RECT& rc, con
     brush.CreateSolidBrush(bg);
     dc.FillRect(&rc, brush);
 
-    // Draw track title
+    // Draw track title (already formatted by analyzer using configured titleformat string)
     dc.SetTextColor(m_callback->query_std_color(ui_color_text));
     dc.SetBkMode(TRANSPARENT);
     SelectObjectScope fontScope(dc, (HGDIOBJ)m_callback->query_font_ex(ui_font_default));
 
-    pfc::string8 label;
-    label << track.data.title.c_str();
-    if (track.data.sample_rate > 0) {
-        label << "  [" << track.data.sample_rate << " Hz";
-        if (track.data.channels > 0) label << ", " << track.data.channels << "ch";
-        label << "]";
-    }
-
     CRect text_rc(rc);
     text_rc.left += 4;
     text_rc.right -= 4;
-    pfc::stringcvt::string_wide_from_utf8 label_w(label);
+    pfc::stringcvt::string_wide_from_utf8 label_w(track.data.title.c_str());
     dc.DrawText(label_w, -1, &text_rc, DT_NOPREFIX | DT_LEFT | DT_VCENTER | DT_SINGLELINE | DT_END_ELLIPSIS);
 }
 
@@ -414,24 +445,109 @@ void SpectrumCompareWindow::render_spectrum(CDCHandle dc, const RECT& rc, const 
     SelectObject(mem_dc, old_bmp);
     DeleteDC(mem_dc);
     DeleteObject(hbmp);
+}
 
-    // Draw frequency axis labels on right side
-    dc.SetTextColor(m_callback->query_std_color(ui_color_text));
+void SpectrumCompareWindow::render_freq_axis(CDCHandle dc, const RECT& rc, int sample_rate) {
+    int width = rc.right - rc.left;
+    int height = rc.bottom - rc.top;
+    if (width <= 0 || height <= 0 || sample_rate <= 0) return;
+
+    int nyquist = sample_rate / 2;
+
+    // Frequency labels at 0, 5, 10, 15, 20, 22 kHz (capped at Nyquist)
+    // Match the spectrum's pow(1.5) frequency compression:
+    //   freq_norm = pow(freq/nyquist, 2.0/3.0)
+    //   py = (1 - freq_norm) * (height - 1)
+    static const int kHz_ticks[] = { 0, 5, 10, 15, 20, 22 };
+
+    COLORREF text_color = m_callback->query_std_color(ui_color_text);
+    COLORREF bg_color = m_callback->query_std_color(ui_color_background);
+    COLORREF grid_color = RGB(
+        (GetRValue(text_color) + GetRValue(bg_color)) / 2,
+        (GetGValue(text_color) + GetGValue(bg_color)) / 2,
+        (GetBValue(text_color) + GetBValue(bg_color)) / 2
+    );
+
+    dc.SetTextColor(text_color);
     dc.SetBkMode(TRANSPARENT);
     SelectObjectScope fontScope(dc, (HGDIOBJ)m_callback->query_font_ex(ui_font_default));
 
-    if (data.sample_rate > 0 && width > 60) {
-        int nyquist = data.sample_rate / 2;
-        // Top label (high freq)
-        pfc::string8 top_label;
-        top_label << nyquist / 1000 << "k";
-        pfc::stringcvt::string_wide_from_utf8 top_label_w(top_label);
-        CRect top_rc(rc.right - 40, rc.top + 2, rc.right - 2, rc.top + 16);
-        dc.DrawText(top_label_w, -1, &top_rc, DT_NOPREFIX | DT_RIGHT | DT_VCENTER | DT_SINGLELINE);
+    // Draw axis line on the right edge
+    CPen axisPen;
+    axisPen.CreatePen(PS_SOLID, 1, grid_color);
+    SelectObjectScope penScope(dc, axisPen);
+    dc.MoveTo(rc.right - 1, rc.top);
+    dc.LineTo(rc.right - 1, rc.bottom);
 
-        // Bottom label (low freq)
-        CRect bot_rc(rc.right - 40, rc.bottom - 18, rc.right - 2, rc.bottom - 4);
-        dc.DrawText(_T("20"), -1, &bot_rc, DT_NOPREFIX | DT_RIGHT | DT_VCENTER | DT_SINGLELINE);
+    for (int khz : kHz_ticks) {
+        int freq_hz = khz * 1000;
+        if (freq_hz > nyquist) continue;
+
+        // Map frequency to y position (matching spectrum's pow(1.5) compression)
+        float freq_ratio = (float)freq_hz / nyquist;
+        float freq_norm = powf(freq_ratio, 2.0f / 3.0f);
+        int py = rc.top + (int)((1.0f - freq_norm) * (height - 1));
+
+        if (py < rc.top || py > rc.bottom) continue;
+
+        // Tick mark
+        dc.MoveTo(rc.right - 4, py);
+        dc.LineTo(rc.right - 1, py);
+
+        // Label (right-aligned, left of tick)
+        pfc::string8 label;
+        label << khz << "k";
+        pfc::stringcvt::string_wide_from_utf8 label_w(label);
+        CRect label_rc(rc.left, py - 8, rc.right - 5, py + 8);
+        dc.DrawText(label_w, -1, &label_rc, DT_NOPREFIX | DT_RIGHT | DT_VCENTER | DT_SINGLELINE);
+    }
+}
+
+void SpectrumCompareWindow::render_time_axis(CDCHandle dc, const RECT& rc, double duration) {
+    int width = rc.right - rc.left;
+    int height = rc.bottom - rc.top;
+    if (width <= 0 || height <= 0 || duration <= 0) return;
+
+    // Time labels at 20-second intervals (like Spek)
+    const int time_interval = 20; // seconds
+
+    COLORREF text_color = m_callback->query_std_color(ui_color_text);
+    COLORREF bg_color = m_callback->query_std_color(ui_color_background);
+    COLORREF grid_color = RGB(
+        (GetRValue(text_color) + GetRValue(bg_color)) / 2,
+        (GetGValue(text_color) + GetGValue(bg_color)) / 2,
+        (GetBValue(text_color) + GetBValue(bg_color)) / 2
+    );
+
+    dc.SetTextColor(text_color);
+    dc.SetBkMode(TRANSPARENT);
+    SelectObjectScope fontScope(dc, (HGDIOBJ)m_callback->query_font_ex(ui_font_default));
+
+    // Draw axis line on top edge
+    CPen axisPen;
+    axisPen.CreatePen(PS_SOLID, 1, grid_color);
+    SelectObjectScope penScope(dc, axisPen);
+    dc.MoveTo(rc.left, rc.top);
+    dc.LineTo(rc.right, rc.top);
+
+    for (int t = 0; t <= (int)duration; t += time_interval) {
+        int px = rc.left + (int)((double)t / duration * width);
+        if (px < rc.left || px > rc.right) continue;
+
+        // Tick mark
+        dc.MoveTo(px, rc.top);
+        dc.LineTo(px, rc.top + 4);
+
+        // Label (centered below tick)
+        int min = t / 60;
+        int sec = t % 60;
+        pfc::string8 label;
+        label << min << ":";
+        if (sec < 10) label << "0";
+        label << sec;
+        pfc::stringcvt::string_wide_from_utf8 label_w(label);
+        CRect label_rc(px - 20, rc.top + 4, px + 20, rc.bottom);
+        dc.DrawText(label_w, -1, &label_rc, DT_NOPREFIX | DT_CENTER | DT_VCENTER | DT_SINGLELINE);
     }
 }
 
@@ -494,6 +610,22 @@ void SpectrumCompareWindow::OnContextMenu(CWindow wnd, CPoint point) {
     menu.AppendMenu(MF_POPUP, (UINT_PTR)palette_menu.m_hMenu, _T("Palette"));
 
     menu.AppendMenu(MF_SEPARATOR);
+
+    // Axes submenu
+    CMenu axes_menu;
+    axes_menu.CreatePopupMenu();
+    axes_menu.AppendMenu(MF_STRING | (m_show_freq_axis ? MF_CHECKED : 0), IDM_TOGGLE_FREQ_AXIS, _T("Frequency axis (kHz)"));
+    axes_menu.AppendMenu(MF_STRING | (m_show_time_axis ? MF_CHECKED : 0), IDM_TOGGLE_TIME_AXIS, _T("Time axis (20s)"));
+    menu.AppendMenu(MF_POPUP, (UINT_PTR)axes_menu.m_hMenu, _T("Axes"));
+
+    // Title format submenu
+    CMenu fmt_menu;
+    fmt_menu.CreatePopupMenu();
+    fmt_menu.AppendMenu(MF_STRING, IDM_EDIT_TITLE_FORMAT, _T("Edit format..."));
+    fmt_menu.AppendMenu(MF_STRING, IDM_RESET_TITLE_FORMAT, _T("Reset to default"));
+    menu.AppendMenu(MF_POPUP, (UINT_PTR)fmt_menu.m_hMenu, _T("Title format"));
+
+    menu.AppendMenu(MF_SEPARATOR);
     menu.AppendMenu(MF_STRING, IDM_REFRESH, _T("Refresh analysis"));
 
     // Track menu must outlive TrackPopupMenu
@@ -519,6 +651,7 @@ void SpectrumCompareWindow::OnSetCount(UINT uNotifyCode, int nID, CWindow wndCtl
     }
     if (new_count > 0 && new_count != m_max_tracks) {
         m_max_tracks = new_count;
+        g_cfg_max_tracks = (int64_t)new_count;
         update_selection();
     }
 }
@@ -577,7 +710,184 @@ void SpectrumCompareWindow::OnPalette(UINT uNotifyCode, int nID, CWindow wndCtl)
     case IDM_PALETTE_SOX: m_palette = PALETTE_SOX; break;
     case IDM_PALETTE_MONO: m_palette = PALETTE_MONO; break;
     }
+    g_cfg_palette = (int64_t)m_palette;
     Invalidate();
+}
+
+// ============================================================
+// Axis and title format toggles
+// ============================================================
+
+void SpectrumCompareWindow::OnToggleFreqAxis(UINT uNotifyCode, int nID, CWindow wndCtl) {
+    m_show_freq_axis = !m_show_freq_axis;
+    g_cfg_show_freq_axis = m_show_freq_axis;
+    Invalidate();
+}
+
+void SpectrumCompareWindow::OnToggleTimeAxis(UINT uNotifyCode, int nID, CWindow wndCtl) {
+    m_show_time_axis = !m_show_time_axis;
+    g_cfg_show_time_axis = m_show_time_axis;
+    Invalidate();
+}
+
+// In-memory dialog for editing the title format string
+namespace {
+    // Dialog item IDs
+    enum { IDC_EDIT = 1000 };
+
+    // Build an in-memory dialog template with a label, a multiline edit, and OK/Cancel buttons.
+    // Uses the standard (non-EX) DLGTEMPLATE format for DialogBoxIndirectParamW.
+    struct DialogData {
+        pfc::string8* result;
+    };
+
+    INT_PTR CALLBACK TitleFormatDlgProc(HWND hDlg, UINT msg, WPARAM wParam, LPARAM lParam) {
+        switch (msg) {
+        case WM_INITDIALOG: {
+            DialogData* data = (DialogData*)lParam;
+            SetWindowLongPtr(hDlg, GWLP_USERDATA, (LONG_PTR)data);
+            // Set initial text in edit control
+            pfc::stringcvt::string_wide_from_utf8 w(data->result->c_str());
+            SetWindowTextW(GetDlgItem(hDlg, IDC_EDIT), w);
+            // Select all text
+            SendMessage(GetDlgItem(hDlg, IDC_EDIT), EM_SETSEL, 0, -1);
+            SetFocus(GetDlgItem(hDlg, IDC_EDIT));
+            return FALSE; // we set focus
+        }
+        case WM_COMMAND:
+            switch (LOWORD(wParam)) {
+            case IDOK: {
+                DialogData* data = (DialogData*)GetWindowLongPtr(hDlg, GWLP_USERDATA);
+                HWND edit = GetDlgItem(hDlg, IDC_EDIT);
+                int len = GetWindowTextLengthW(edit);
+                pfc::array_t<wchar_t> buf;
+                buf.set_size(len + 1);
+                GetWindowTextW(edit, buf.get_ptr(), (int)buf.get_size());
+                *(data->result) = pfc::stringcvt::string_utf8_from_wide(buf.get_ptr());
+                EndDialog(hDlg, IDOK);
+                return TRUE;
+            }
+            case IDCANCEL:
+                EndDialog(hDlg, IDCANCEL);
+                return TRUE;
+            }
+            break;
+        }
+        return FALSE;
+    }
+
+    bool showTitleFormatDialog(HWND parent, pfc::string8& format) {
+        // Build dialog template in memory (standard DLGTEMPLATE format).
+        // DLGTEMPLATE: style(DWORD) exStyle(DWORD) cdit(WORD) x(WORD) y(WORD) cx(WORD) cy(WORD)
+        //   menu(WORD-or-string) class(WORD-or-string) title(wide-string)
+        // Each DLGITEMTEMPLATE: style(DWORD) exStyle(DWORD) x(WORD) y(WORD) cx(WORD) cy(WORD) id(WORD)
+        //   class(WORD-or-string) title(string) extra(WORD=0)
+        // All items and the header must be DWORD-aligned.
+
+        std::vector<BYTE> buf;
+        auto align = [&buf]() {
+            while (buf.size() % 4 != 0) buf.push_back(0);
+        };
+        auto writeDW = [&buf](DWORD dw) {
+            buf.push_back((BYTE)(dw & 0xFF));
+            buf.push_back((BYTE)((dw >> 8) & 0xFF));
+            buf.push_back((BYTE)((dw >> 16) & 0xFF));
+            buf.push_back((BYTE)((dw >> 24) & 0xFF));
+        };
+        auto writeW = [&buf](WORD w) {
+            buf.push_back((BYTE)(w & 0xFF));
+            buf.push_back((BYTE)(w >> 8));
+        };
+        auto writeWStr = [&buf](const wchar_t* s) {
+            while (*s) { buf.push_back((BYTE)(*s & 0xFF)); buf.push_back((BYTE)(*s >> 8)); s++; }
+            buf.push_back(0); buf.push_back(0); // null terminator
+        };
+
+        // --- DLGTEMPLATE header ---
+        align();
+        writeDW(WS_POPUP | WS_CAPTION | WS_SYSMENU | DS_MODALFRAME | DS_CENTER); // style (DWORD)
+        writeDW(WS_EX_DLGMODALFRAME); // exStyle (DWORD)
+        writeW(4); // cdit = 4 items (label, edit, OK, Cancel)
+        writeW(0); writeW(0);   // x=0, y=0
+        writeW(300); writeW(180); // cx, cy (dialog units)
+        writeW(0); // menu = 0
+        writeW(0); // class = 0 (default)
+        writeWStr(L"Edit Title Format");
+
+        // --- Item 1: Static text (label) ---
+        align();
+        writeDW(WS_CHILD | WS_VISIBLE | SS_LEFT); // style
+        writeDW(0); // exStyle
+        writeW(5); writeW(5);     // x, y
+        writeW(290); writeW(10);  // cx, cy
+        writeW(0); // id (static, id=0)
+        // class: 0x0082 = Static control (atom)
+        writeW(0x0082);
+        // title as Unicode (DialogBoxIndirectParamW requires wide strings)
+        writeWStr(L"Enter foobar2000 titleformat string:");
+        writeW(0); // extra count = 0
+
+        // --- Item 2: Edit control (multiline) ---
+        align();
+        writeDW(WS_CHILD | WS_VISIBLE | WS_BORDER | WS_TABSTOP | WS_VSCROLL | ES_MULTILINE | ES_AUTOVSCROLL);
+        writeDW(WS_EX_CLIENTEDGE); // exStyle for sunken border
+        writeW(5); writeW(20);     // x, y
+        writeW(290); writeW(120);  // cx, cy
+        writeW(IDC_EDIT); // id
+        writeW(0x0081); // class: 0x0081 = Edit control (atom)
+        writeW(0); // title = empty (wide null terminator)
+        writeW(0); // extra count = 0
+
+        // --- Item 3: OK button ---
+        align();
+        writeDW(WS_CHILD | WS_VISIBLE | WS_TABSTOP | BS_DEFPUSHBUTTON);
+        writeDW(0); // exStyle
+        writeW(190); writeW(155); // x, y
+        writeW(50); writeW(14);   // cx, cy
+        writeW(IDOK); // id
+        writeW(0x0080); // class: 0x0080 = Button (atom)
+        writeWStr(L"OK");
+        writeW(0); // extra count = 0
+
+        // --- Item 4: Cancel button ---
+        align();
+        writeDW(WS_CHILD | WS_VISIBLE | WS_TABSTOP);
+        writeDW(0); // exStyle
+        writeW(245); writeW(155); // x, y
+        writeW(50); writeW(14);   // cx, cy
+        writeW(IDCANCEL); // id
+        writeW(0x0080); // class: Button
+        writeWStr(L"Cancel");
+        writeW(0); // extra count = 0
+
+        DialogData data{ &format };
+        INT_PTR ret = DialogBoxIndirectParamW(
+            core_api::get_my_instance(),
+            (LPCDLGTEMPLATEW)buf.data(),
+            parent,
+            TitleFormatDlgProc,
+            (LPARAM)&data
+        );
+        return ret == IDOK;
+    }
+}
+
+void SpectrumCompareWindow::OnEditTitleFormat(UINT uNotifyCode, int nID, CWindow wndCtl) {
+    pfc::string8 newFormat = m_title_format;
+    if (showTitleFormatDialog(m_hWnd, newFormat)) {
+        m_title_format = newFormat;
+        g_cfg_title_format.set(m_title_format);
+        m_analyzer.set_title_format(m_title_format.c_str());
+        // Re-analyze all tracks to update labels
+        OnRefresh(0, IDM_REFRESH, nullptr);
+    }
+}
+
+void SpectrumCompareWindow::OnResetTitleFormat(UINT uNotifyCode, int nID, CWindow wndCtl) {
+    m_title_format = DEFAULT_TITLE_FORMAT;
+    g_cfg_title_format.set(m_title_format);
+    m_analyzer.set_title_format(m_title_format.c_str());
+    OnRefresh(0, IDM_REFRESH, nullptr);
 }
 
 // ============================================================

@@ -12,6 +12,31 @@ static const GUID guid_spectrum_compare =
 // Window class GUID
 static const wchar_t* SPECTRUM_WND_CLASS = L"{SpectrumCompare-8F3A2B1C-4D5E-6F7A-8B9C-0D1E2F3A4B5C}";
 
+// Default title format string (foobar2000 titleformat syntax)
+static const char* DEFAULT_TITLE_FORMAT =
+    "%title% \xC2\xB7 %artist% | %codec% | %bitrate% kbps"
+    "[ | $info(bitspersample) bit] | %samplerate% Hz | $info(channels) CH | %path%";
+
+// Config storage GUIDs
+static const GUID guid_cfg_show_freq_axis =
+    { 0x1a2b3c4d, 0x5e6f, 0x7081, { 0x92, 0xa3, 0xb4, 0xc5, 0xd6, 0xe7, 0xf8, 0x09 } };
+static const GUID guid_cfg_show_time_axis =
+    { 0x2b3c4d5e, 0x6f70, 0x8192, { 0xa3, 0xb4, 0xc5, 0xd6, 0xe7, 0xf8, 0x09, 0x1a } };
+static const GUID guid_cfg_title_format =
+    { 0x3c4d5e6f, 0x7081, 0x9293, { 0xa3, 0xb4, 0xc5, 0xd6, 0xe7, 0xf8, 0x09, 0x1a } };
+static const GUID guid_cfg_max_tracks =
+    { 0x4d5e6f70, 0x8192, 0xa3b4, { 0xc5, 0xd6, 0xe7, 0xf8, 0x09, 0x1a, 0x2b, 0x3c } };
+static const GUID guid_cfg_palette =
+    { 0x5e6f7081, 0x92a3, 0xb4c5, { 0xd6, 0xe7, 0xf8, 0x09, 0x1a, 0x2b, 0x3c, 0x4d } };
+
+// Persistent config storage (static globals, registered once at startup)
+// Defined as static so they persist across window creation/destruction.
+extern cfg_bool g_cfg_show_freq_axis;
+extern cfg_bool g_cfg_show_time_axis;
+extern cfg_string g_cfg_title_format;
+extern cfg_int g_cfg_max_tracks;
+extern cfg_int g_cfg_palette;
+
 // Menu command IDs
 #define IDM_SET_COUNT_1  1001
 #define IDM_SET_COUNT_2  1002
@@ -21,6 +46,10 @@ static const wchar_t* SPECTRUM_WND_CLASS = L"{SpectrumCompare-8F3A2B1C-4D5E-6F7A
 #define IDM_PALETTE_SPECTRUM 1010
 #define IDM_PALETTE_SOX      1011
 #define IDM_PALETTE_MONO     1012
+#define IDM_TOGGLE_FREQ_AXIS 1020
+#define IDM_TOGGLE_TIME_AXIS 1021
+#define IDM_EDIT_TITLE_FORMAT 1022
+#define IDM_RESET_TITLE_FORMAT 1023
 
 // Holds per-track spectrum state
 struct TrackSpectrum {
@@ -93,6 +122,10 @@ public:
         COMMAND_ID_HANDLER_EX(IDM_PALETTE_SPECTRUM, OnPalette)
         COMMAND_ID_HANDLER_EX(IDM_PALETTE_SOX, OnPalette)
         COMMAND_ID_HANDLER_EX(IDM_PALETTE_MONO, OnPalette)
+        COMMAND_ID_HANDLER_EX(IDM_TOGGLE_FREQ_AXIS, OnToggleFreqAxis)
+        COMMAND_ID_HANDLER_EX(IDM_TOGGLE_TIME_AXIS, OnToggleTimeAxis)
+        COMMAND_ID_HANDLER_EX(IDM_EDIT_TITLE_FORMAT, OnEditTitleFormat)
+        COMMAND_ID_HANDLER_EX(IDM_RESET_TITLE_FORMAT, OnResetTitleFormat)
     END_MSG_MAP()
 
     // ImplementBumpableElem (CRTP base via ui_element_impl_withpopup) accesses m_callback
@@ -108,19 +141,28 @@ private:
     void OnSetCount(UINT uNotifyCode, int nID, CWindow wndCtl);
     void OnRefresh(UINT uNotifyCode, int nID, CWindow wndCtl);
     void OnPalette(UINT uNotifyCode, int nID, CWindow wndCtl);
+    void OnToggleFreqAxis(UINT uNotifyCode, int nID, CWindow wndCtl);
+    void OnToggleTimeAxis(UINT uNotifyCode, int nID, CWindow wndCtl);
+    void OnEditTitleFormat(UINT uNotifyCode, int nID, CWindow wndCtl);
+    void OnResetTitleFormat(UINT uNotifyCode, int nID, CWindow wndCtl);
 
     // Spectrum rendering
     void render_spectrum(CDCHandle dc, const RECT& rc, const SpectrumData& data);
     void render_track_label(CDCHandle dc, const RECT& rc, const TrackSpectrum& track);
+    void render_freq_axis(CDCHandle dc, const RECT& rc, int sample_rate);
+    void render_time_axis(CDCHandle dc, const RECT& rc, double duration);
 
     // Selection management
     void update_selection();
     void start_analysis_for_track(size_t index);
     void analysis_worker(metadb_handle_ptr handle, std::shared_ptr<TrackSpectrum> target);
 
-    // Config
+    // Runtime config (mirrors of cfg vars for fast access)
     int m_max_tracks = 4;
     palette_t m_palette = PALETTE_SPECTRUM;
+    bool m_show_freq_axis = true;
+    bool m_show_time_axis = true;
+    pfc::string8 m_title_format = DEFAULT_TITLE_FORMAT;
 
     ui_element_config::ptr m_config;
     const ui_element_instance_callback_ptr m_callback;

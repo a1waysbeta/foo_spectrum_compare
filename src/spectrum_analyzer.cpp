@@ -58,12 +58,12 @@ bool SpectrumAnalyzer::analyze(metadb_handle_ptr track, SpectrumData& out, abort
         out.duration = info.get_length();
     }
 
-    // Get title using format_title_from_external_info with already-fetched info
-    // This avoids locking issues that format_title() may have across threads
+    // Get title using the configured titleformat string
     try {
         titleformat_hook* hook = NULL;
         service_ptr_t<titleformat_object> obj;
-        static_api_ptr_t<titleformat_compiler>()->compile_safe(obj, "%title%");
+        const char* fmt = m_title_format.empty() ? "%title%" : m_title_format.c_str();
+        static_api_ptr_t<titleformat_compiler>()->compile_safe(obj, fmt);
         pfc::string8 title_tmp;
         if (got_info) {
             track->format_title_from_external_info(info, hook, title_tmp, obj, NULL);

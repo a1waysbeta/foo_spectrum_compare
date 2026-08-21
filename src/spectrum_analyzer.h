@@ -56,10 +56,15 @@ public:
     void set_time_resolution(int frames) { m_target_frames = frames; }
     int get_time_resolution() const { return m_target_frames; }
 
+    // Set the titleformat string used to format the track label
+    void set_title_format(const char* fmt) { m_title_format = fmt ? fmt : ""; }
+    const char* get_title_format() const { return m_title_format.c_str(); }
+
 private:
     int m_fft_bits = 11; // 2048-point FFT by default
     window_function_t m_window = WINDOW_DEFAULT;
     int m_target_frames = 800; // target number of time columns
+    std::string m_title_format = "%title%";
 
     void apply_window(float* data, int n, window_function_t w);
     float get_window_val(window_function_t f, int i, int n);
