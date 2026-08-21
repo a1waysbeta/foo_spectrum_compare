@@ -30,6 +30,46 @@ jobs:
     - name: Add MSBuild to PATH
       uses: microsoft/setup-msbuild@v2
 
+    - name: Ensure ATL (atlbase.h) is installed
+      shell: pwsh
+      timeout-minutes: 15
+      run: |
+        $vsWhere = "${env:ProgramFiles(x86)}\Microsoft Visual Studio\Installer\vswhere.exe"
+        if (-not (Test-Path $vsWhere)) {
+          $vsWhere = "${env:ProgramFiles}\Microsoft Visual Studio\Installer\vswhere.exe"
+        }
+        if (-not (Test-Path $vsWhere)) {
+          Write-Host "::warning::vswhere.exe not found, skipping ATL check"
+          exit 0
+        }
+        $vsPath = & $vsWhere -latest -property installationPath
+        Write-Host "Visual Studio path: $vsPath"
+        $atlHeader = Get-ChildItem -Path "$vsPath\VC\Tools\MSVC" -Recurse -Filter "atlbase.h" -ErrorAction SilentlyContinue | Select-Object -First 1
+        if ($atlHeader) {
+          Write-Host "ATL already installed: $($atlHeader.FullName)"
+          exit 0
+        }
+        Write-Host "ATL not found. Installing Microsoft.VisualStudio.Component.VC.ATL ..."
+        $installer = "${env:ProgramFiles(x86)}\Microsoft Visual Studio\Installer\vs_installer.exe"
+        if (-not (Test-Path $installer)) {
+          $installer = "${env:ProgramFiles}\Microsoft Visual Studio\Installer\vs_installer.exe"
+        }
+        if (-not (Test-Path $installer)) {
+          Write-Host "::error::vs_installer.exe not found"
+          exit 1
+        }
+        $argList = @("modify","--installPath","`"$vsPath`"","--add","Microsoft.VisualStudio.Component.VC.ATL","--add","Microsoft.VisualStudio.Component.VC.ATLMFC","--quiet","--norestart","--wait")
+        Write-Host "Running: $installer $($argList -join ' ')"
+        $proc = Start-Process -FilePath $installer -ArgumentList $argList -Wait -PassThru -NoNewWindow
+        Write-Host "Installer exit code: $($proc.ExitCode)"
+        Start-Sleep -Seconds 3
+        $atlHeader = Get-ChildItem -Path "$vsPath\VC\Tools\MSVC" -Recurse -Filter "atlbase.h" -ErrorAction SilentlyContinue | Select-Object -First 1
+        if ($atlHeader) {
+          Write-Host "ATL installed successfully: $($atlHeader.FullName)"
+        } else {
+          Write-Host "::warning::ATL installation verification failed"
+        }
+
     - name: Restore NuGet packages (if any)
       working-directory: ${{env.GITHUB_WORKSPACE}}
       run: nuget restore ${{env.SOLUTION_FILE_PATH}} 2>$null; if ($LASTEXITCODE -ne 0) { Write-Host "NuGet restore skipped or failed (may be normal)" }
@@ -67,6 +107,7 @@ jobs:
 
     - name: Rename to .fb2k-component
       shell: pwsh
+      id: rename
       run: |
         $dllPath = "${{ steps.locate.outputs.dll_path }}"
         $platform = "${{ matrix.platform }}"
@@ -74,7 +115,6 @@ jobs:
         Copy-Item $dllPath $componentName
         Write-Host "Created: $componentName"
         "component_name=$componentName" | Out-File -FilePath $env:GITHUB_OUTPUT -Append -Encoding utf8
-      id: rename
 
     - name: Upload build artifact
       uses: actions/upload-artifact@v4
@@ -94,10 +134,8 @@ jobs:
       uses: actions/download-artifact@v4
       with:
         path: artifacts
-
     - name: List artifacts
       run: ls -R artifacts
-
     - name: Create Release
       uses: softprops/action-gh-release@v2
       with:
