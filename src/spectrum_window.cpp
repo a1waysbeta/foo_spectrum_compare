@@ -297,9 +297,9 @@ void SpectrumCompareWindow::OnPaint(CDCHandle) {
 
     // DPI-aware scaling: get system DPI and scale dimensions accordingly.
     // All measurements below are in pixels at 96 DPI, scaled to actual DPI.
-    HDC screenDC = GetDC(NULL);
+    HDC screenDC = ::GetDC(NULL);
     int dpi = GetDeviceCaps(screenDC, LOGPIXELSX);
-    ReleaseDC(NULL, screenDC);
+    ::ReleaseDC(NULL, screenDC);
     auto scale = [dpi](int v) -> int { return MulDiv(v, dpi, 96); };
 
     // Layout measurements (designed at 96 DPI, scaled to actual DPI)
@@ -381,9 +381,9 @@ void SpectrumCompareWindow::render_track_label(CDCHandle dc, const RECT& rc, con
     SelectObjectScope fontScope(dc, (HGDIOBJ)m_callback->query_font_ex(ui_font_default));
 
     // DPI-aware horizontal padding
-    HDC screenDC = GetDC(NULL);
+    HDC screenDC = ::GetDC(NULL);
     int dpi = GetDeviceCaps(screenDC, LOGPIXELSX);
-    ReleaseDC(NULL, screenDC);
+    ::ReleaseDC(NULL, screenDC);
     int pad = MulDiv(8, dpi, 96);
 
     CRect text_rc(rc);
@@ -476,9 +476,9 @@ void SpectrumCompareWindow::render_freq_axis(CDCHandle dc, const RECT& rc, int s
     static const int kHz_ticks[] = { 0, 5, 10, 15, 20, 22 };
 
     // DPI-aware tick and label dimensions
-    HDC screenDC = GetDC(NULL);
+    HDC screenDC = ::GetDC(NULL);
     int dpi = GetDeviceCaps(screenDC, LOGPIXELSX);
-    ReleaseDC(NULL, screenDC);
+    ::ReleaseDC(NULL, screenDC);
     auto scale = [dpi](int v) { return MulDiv(v, dpi, 96); };
     int tick_len = scale(4);
     int label_half_h = scale(8);
@@ -536,9 +536,9 @@ void SpectrumCompareWindow::render_time_axis(CDCHandle dc, const RECT& rc, doubl
     const int time_interval = 20; // seconds
 
     // DPI-aware dimensions
-    HDC screenDC = GetDC(NULL);
+    HDC screenDC = ::GetDC(NULL);
     int dpi = GetDeviceCaps(screenDC, LOGPIXELSX);
-    ReleaseDC(NULL, screenDC);
+    ::ReleaseDC(NULL, screenDC);
     auto scale = [dpi](int v) { return MulDiv(v, dpi, 96); };
     int tick_len = scale(4);
     int tick_gap = scale(1);
@@ -818,81 +818,94 @@ namespace {
         auto align = [&buf]() {
             while (buf.size() % 4 != 0) buf.push_back(0);
         };
-        auto writeW = [&buf](WORD w) {
+        // Helper lambdas. NOTE: we do NOT cross-call lambdas to avoid MSVC
+        // issues with lambda-variable capture inside another lambda.
+        auto pushWord = [&buf](WORD w) {
             buf.push_back((BYTE)(w & 0xFF));
             buf.push_back((BYTE)(w >> 8));
         };
-        auto writeDW = [&buf](DWORD dw) {
+        auto pushDWord = [&buf](DWORD dw) {
             buf.push_back((BYTE)(dw & 0xFF));
             buf.push_back((BYTE)((dw >> 8) & 0xFF));
             buf.push_back((BYTE)((dw >> 16) & 0xFF));
             buf.push_back((BYTE)((dw >> 24) & 0xFF));
         };
-        auto writeWStr = [&buf](const wchar_t* s) {
-            while (*s) { buf.push_back((BYTE)(*s & 0xFF)); buf.push_back((BYTE)(*s >> 8)); s++; }
-            writeW(0); // null terminator
+        auto pushWideStr = [&buf](const wchar_t* s) {
+            while (*s) {
+                WORD ch = (WORD)*s;
+                buf.push_back((BYTE)(ch & 0xFF));
+                buf.push_back((BYTE)(ch >> 8));
+                ++s;
+            }
+            // explicit null terminator (WORD 0)
+            buf.push_back(0);
+            buf.push_back(0);
+        };
+        auto pushWordZero = [&buf]() {
+            buf.push_back(0);
+            buf.push_back(0);
         };
 
         align();
         // DLGTEMPLATEEX header
-        writeW(0xFFFF); // signature
-        writeW(1);       // dlgVer
-        writeDW(0);      // helpID
-        writeDW(WS_EX_DLGMODALFRAME); // exStyle
-        writeDW(WS_POPUP | WS_CAPTION | WS_SYSMENU | DS_MODALFRAME | DS_CENTER | DS_SETFONT); // style
-        writeW(4);       // cDlgItems
-        writeW(0); writeW(0);   // x, y
-        writeW(300); writeW(180); // cx, cy
+        pushWord(0xFFFF); // signature
+        pushWord(1);       // dlgVer
+        pushDWord(0);      // helpID
+        pushDWord(WS_EX_DLGMODALFRAME); // exStyle
+        pushDWord(WS_POPUP | WS_CAPTION | WS_SYSMENU | DS_MODALFRAME | DS_CENTER | DS_SETFONT); // style
+        pushWord(4);       // cDlgItems
+        pushWord(0); pushWord(0);   // x, y
+        pushWord(300); pushWord(180); // cx, cy
         // menu, class (both 0)
-        writeW(0); writeW(0);
+        pushWordZero(); pushWordZero();
         // title
-        writeWStr(L"Edit Title Format");
+        pushWideStr(L"Edit Title Format");
         // font (DS_SETFONT): point size + face name
-        writeW(9); // 9pt
-        writeWStr(L"Segoe UI");
+        pushWord(9); // 9pt
+        pushWideStr(L"Segoe UI");
 
         // Item 1: Static text (label)
         align();
-        writeDW(WS_CHILD | WS_VISIBLE | SS_LEFT); // style
-        writeDW(0); // exStyle
-        writeW(5); writeW(5); writeW(290); writeW(10); // x,y,cx,cy
-        writeW(0xFFFF); // class as atom
-        writeW(0x0082); // Static atom
-        writeWStr(L"Enter foobar2000 titleformat string:");
-        writeW(0); // extra count
+        pushDWord(WS_CHILD | WS_VISIBLE | SS_LEFT); // style
+        pushDWord(0); // exStyle
+        pushWord(5); pushWord(5); pushWord(290); pushWord(10); // x,y,cx,cy
+        pushWord(0xFFFF); // class as atom
+        pushWord(0x0082); // Static atom
+        pushWideStr(L"Enter foobar2000 titleformat string:");
+        pushWordZero(); // extra count
 
         // Item 2: Edit control (multiline)
         align();
-        writeDW(WS_CHILD | WS_VISIBLE | WS_BORDER | WS_TABSTOP | WS_VSCROLL | ES_MULTILINE | ES_AUTOVSCROLL);
-        writeDW(WS_EX_CLIENTEDGE); // exStyle
-        writeW(5); writeW(20); writeW(290); writeW(120);
-        writeW(IDC_EDIT);
-        writeW(0xFFFF); // class as atom
-        writeW(0x0081); // Edit atom
-        writeW(0); // empty title (wide null)
-        writeW(0); // extra count
+        pushDWord(WS_CHILD | WS_VISIBLE | WS_BORDER | WS_TABSTOP | WS_VSCROLL | ES_MULTILINE | ES_AUTOVSCROLL);
+        pushDWord(WS_EX_CLIENTEDGE); // exStyle
+        pushWord(5); pushWord(20); pushWord(290); pushWord(120);
+        pushWord(IDC_EDIT);
+        pushWord(0xFFFF); // class as atom
+        pushWord(0x0081); // Edit atom
+        pushWordZero(); // empty title (wide null)
+        pushWordZero(); // extra count
 
         // Item 3: OK button
         align();
-        writeDW(WS_CHILD | WS_VISIBLE | WS_TABSTOP | BS_DEFPUSHBUTTON);
-        writeDW(0);
-        writeW(190); writeW(155); writeW(50); writeW(14);
-        writeW(IDOK);
-        writeW(0xFFFF);
-        writeW(0x0080); // Button atom
-        writeWStr(L"OK");
-        writeW(0);
+        pushDWord(WS_CHILD | WS_VISIBLE | WS_TABSTOP | BS_DEFPUSHBUTTON);
+        pushDWord(0);
+        pushWord(190); pushWord(155); pushWord(50); pushWord(14);
+        pushWord(IDOK);
+        pushWord(0xFFFF);
+        pushWord(0x0080); // Button atom
+        pushWideStr(L"OK");
+        pushWordZero();
 
         // Item 4: Cancel button
         align();
-        writeDW(WS_CHILD | WS_VISIBLE | WS_TABSTOP);
-        writeDW(0);
-        writeW(245); writeW(155); writeW(50); writeW(14);
-        writeW(IDCANCEL);
-        writeW(0xFFFF);
-        writeW(0x0080); // Button atom
-        writeWStr(L"Cancel");
-        writeW(0);
+        pushDWord(WS_CHILD | WS_VISIBLE | WS_TABSTOP);
+        pushDWord(0);
+        pushWord(245); pushWord(155); pushWord(50); pushWord(14);
+        pushWord(IDCANCEL);
+        pushWord(0xFFFF);
+        pushWord(0x0080); // Button atom
+        pushWideStr(L"Cancel");
+        pushWordZero();
 
         return buf;
     }
