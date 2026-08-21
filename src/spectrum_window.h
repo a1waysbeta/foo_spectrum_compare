@@ -94,6 +94,9 @@ public:
         COMMAND_ID_HANDLER_EX(IDM_PALETTE_MONO, OnPalette)
     END_MSG_MAP()
 
+    // ImplementBumpableElem (CRTP base via ui_element_impl_withpopup) accesses m_callback
+    template<typename TClass> friend class ImplementBumpableElem;
+
 private:
     LRESULT OnEraseBkgnd(CDCHandle dc);
     void OnPaint(CDCHandle);
