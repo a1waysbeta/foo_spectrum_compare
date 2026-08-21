@@ -53,7 +53,9 @@ bool SpectrumAnalyzer::analyze(metadb_handle_ptr track, SpectrumData& out, abort
         titleformat_hook* hook = NULL;
         service_ptr_t<titleformat_object> obj;
         static_api_ptr_t<titleformat_compiler>()->compile_safe(obj, "%title%");
-        track->format_title(hook, out.title, obj, NULL);
+        pfc::string8 title;
+        track->format_title(hook, title, obj, NULL);
+        out.title = title.get_ptr();
     } catch (...) {
         out.title = track->get_path();
     }

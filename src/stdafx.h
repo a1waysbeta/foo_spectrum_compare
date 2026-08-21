@@ -1,11 +1,11 @@
 #pragma once
 
 #ifdef __cplusplus
-#include <SDK/foobar2000-lite.h>
-#include <SDK/foobar2000.h>
-#include <helpers/input_helpers.h>
+#define NOMINMAX
 #include <windows.h>
 #include <windowsx.h>
+#include <SDK/foobar2000.h>
+#include <helpers/input_helpers.h>
 #include <atomic>
 #include <vector>
 #include <mutex>

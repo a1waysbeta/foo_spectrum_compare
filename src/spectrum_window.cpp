@@ -27,7 +27,6 @@ SpectrumCompareWindow::~SpectrumCompareWindow()
         m_hWnd = NULL;
     }
 
-    // Wait for any running analysis threads
     std::lock_guard<std::mutex> lock(m_tracks_mutex);
     m_tracks.clear();
 }
@@ -38,7 +37,6 @@ SpectrumCompareWindow::~SpectrumCompareWindow()
 
 void SpectrumCompareWindow::initialize_window(HWND parent)
 {
-    // Register window class once
     if (!s_classRegistered) {
         WNDCLASSEXW wc = {0};
         wc.cbSize = sizeof(WNDCLASSEXW);
@@ -46,26 +44,19 @@ void SpectrumCompareWindow::initialize_window(HWND parent)
         wc.lpfnWndProc = WindowProc;
         wc.hInstance = GetModuleHandleW(NULL);
         wc.hCursor = LoadCursorW(NULL, IDC_ARROW);
-        wc.hbrBackground = NULL; // We handle WM_ERASEBKGND
+        wc.hbrBackground = NULL;
         wc.lpszClassName = SPECTRUM_WND_CLASS;
         RegisterClassExW(&wc);
         s_classRegistered = true;
     }
 
-    // Create the window, pass 'this' as create param
     m_hWnd = CreateWindowExW(
-        0,
-        SPECTRUM_WND_CLASS,
-        L"",
+        0, SPECTRUM_WND_CLASS, L"",
         WS_CHILD | WS_VISIBLE | WS_CLIPCHILDREN,
         0, 0, 100, 100,
-        parent,
-        NULL,
-        GetModuleHandleW(NULL),
-        this
+        parent, NULL, GetModuleHandleW(NULL), this
     );
 
-    // Register playlist callback
     static_api_ptr_t<playlist_manager>()->register_callback(
         this,
         playlist_callback_single::flag_on_items_selection_change |
@@ -74,10 +65,7 @@ void SpectrumCompareWindow::initialize_window(HWND parent)
         playlist_callback_single::flag_on_items_removed
     );
 
-    // Start repaint timer (for gradual updates during analysis)
     SetTimer(m_hWnd, TIMER_REPAINT, 250, NULL);
-
-    // Initial selection
     update_selection();
 }
 
@@ -103,36 +91,28 @@ LRESULT SpectrumCompareWindow::HandleMessage(UINT uMsg, WPARAM wParam, LPARAM lP
 {
     switch (uMsg) {
     case WM_ERASEBKGND:
-        return 1; // We draw everything in WM_PAINT
-
+        return 1;
     case WM_PAINT:
         OnPaint();
         return 0;
-
     case WM_SIZE:
         OnSize();
         return 0;
-
     case WM_CONTEXTMENU:
         OnContextMenu(POINT{ GET_X_LPARAM(lParam), GET_Y_LPARAM(lParam) });
         return 0;
-
     case WM_TIMER:
         OnTimer((UINT_PTR)wParam);
         return 0;
-
     case WM_COMMAND:
         OnCommand(LOWORD(wParam));
         return 0;
-
     case WM_SPECTRUM_READY:
         InvalidateRect(m_hWnd, NULL, FALSE);
         return 0;
-
     case WM_NCDESTROY:
         m_hWnd = NULL;
         return DefWindowProcW(m_hWnd, uMsg, wParam, lParam);
-
     default:
         return DefWindowProcW(m_hWnd, uMsg, wParam, lParam);
     }
@@ -183,7 +163,6 @@ void SpectrumCompareWindow::OnContextMenu(POINT pt)
 {
     HMENU hMenu = CreatePopupMenu();
 
-    // Display count submenu
     HMENU hCountMenu = CreatePopupMenu();
     UINT countFlags[4] = { MF_STRING, MF_STRING, MF_STRING, MF_STRING };
     countFlags[m_max_tracks - 1] |= MF_CHECKED;
@@ -193,7 +172,6 @@ void SpectrumCompareWindow::OnContextMenu(POINT pt)
     AppendMenuW(hCountMenu, countFlags[3], IDM_SET_COUNT_4, L"4 tracks");
     AppendMenuW(hMenu, MF_POPUP, (UINT_PTR)hCountMenu, L"Display count");
 
-    // Palette submenu
     HMENU hPaletteMenu = CreatePopupMenu();
     UINT palFlags[3] = { MF_STRING, MF_STRING, MF_STRING };
     palFlags[(int)m_palette] |= MF_CHECKED;
@@ -205,7 +183,6 @@ void SpectrumCompareWindow::OnContextMenu(POINT pt)
     AppendMenuW(hMenu, MF_SEPARATOR, 0, NULL);
     AppendMenuW(hMenu, MF_STRING, IDM_REFRESH, L"Refresh");
 
-    // Convert screen coordinates if needed
     if (pt.x == -1 && pt.y == -1) {
         RECT rc;
         GetClientRect(m_hWnd, &rc);
@@ -233,7 +210,6 @@ void SpectrumCompareWindow::OnPaint()
     RECT rcClient;
     GetClientRect(m_hWnd, &rcClient);
 
-    // Background
     HBRUSH hBgBrush = CreateSolidBrush(RGB(20, 20, 24));
     FillRect(hdc, &rcClient, hBgBrush);
     DeleteObject(hBgBrush);
@@ -242,7 +218,6 @@ void SpectrumCompareWindow::OnPaint()
     size_t count = m_tracks.size();
 
     if (count == 0) {
-        // Empty state text
         SetTextColor(hdc, RGB(140, 140, 150));
         SetBkMode(hdc, TRANSPARENT);
         HFONT hFont = (HFONT)m_callback->query_font_ex(ui_font_default);
@@ -253,7 +228,6 @@ void SpectrumCompareWindow::OnPaint()
         return;
     }
 
-    // Calculate track heights (equal distribution)
     int labelHeight = 22;
     int totalHeight = rcClient.bottom - rcClient.top;
     int trackHeight = totalHeight / (int)count;
@@ -265,22 +239,17 @@ void SpectrumCompareWindow::OnPaint()
         rcTrack.top = rcClient.top + (int)i * trackHeight;
         rcTrack.bottom = (i == count - 1) ? rcClient.bottom : rcTrack.top + trackHeight;
 
-        // Label area
         RECT rcLabel = rcTrack;
         rcLabel.bottom = rcLabel.top + labelHeight;
 
-        // Spectrum area
         RECT rcSpec = rcTrack;
         rcSpec.top = rcLabel.bottom;
 
-        // Draw label
         render_track_label(hdc, rcLabel, *m_tracks[i]);
 
-        // Draw spectrum
-        if (m_tracks[i]->data.time_frames > 0 && m_tracks[i]->data.freq_bins > 0) {
+        if (m_tracks[i]->data.time_frames > 0 && m_tracks[i]->data.fft_bins > 0) {
             render_spectrum(hdc, rcSpec, m_tracks[i]->data);
         } else if (m_tracks[i]->analyzing.load()) {
-            // "Analyzing..." text
             SetTextColor(hdc, RGB(120, 120, 130));
             SetBkMode(hdc, TRANSPARENT);
             HFONT hFont = (HFONT)m_callback->query_font_ex(ui_font_default);
@@ -289,7 +258,6 @@ void SpectrumCompareWindow::OnPaint()
             SelectObject(hdc, hOldFont);
         }
 
-        // Separator line
         if (i < count - 1) {
             HPEN hPen = CreatePen(PS_SOLID, 1, RGB(50, 50, 58));
             HGDIOBJ hOldPen = SelectObject(hdc, hPen);
@@ -305,17 +273,20 @@ void SpectrumCompareWindow::OnPaint()
 
 void SpectrumCompareWindow::render_track_label(HDC hdc, const RECT& rc, const TrackSpectrum& track)
 {
-    // Background
     HBRUSH hBrush = CreateSolidBrush(RGB(32, 32, 38));
     FillRect(hdc, &rc, hBrush);
     DeleteObject(hBrush);
 
-    // Get track title
     pfc::string8 title;
     if (track.handle.is_valid()) {
-        track.handle->query_meta_field("title", 0, title);
+        file_info_impl info;
+        if (track.handle->get_info_async(info)) {
+            const char* meta = info.meta_get("title", 0);
+            if (meta && meta[0]) {
+                title = meta;
+            }
+        }
         if (title.is_empty()) {
-            // Fallback to filename
             pfc::string8 path = track.handle->get_path();
             const char* fn = pfc::string_filename(path);
             title = fn;
@@ -324,12 +295,10 @@ void SpectrumCompareWindow::render_track_label(HDC hdc, const RECT& rc, const Tr
         title = "Unknown";
     }
 
-    // Convert to wide string for DrawText
-    int wlen = MultiByteToWideChar(CP_UTF8, 0, title.c_str(), -1, NULL, 0);
+    int wlen = MultiByteToWideChar(CP_UTF8, 0, title.get_ptr(), -1, NULL, 0);
     std::wstring wtitle(wlen, L'\0');
-    MultiByteToWideChar(CP_UTF8, 0, title.c_str(), -1, &wtitle[0], wlen);
+    MultiByteToWideChar(CP_UTF8, 0, title.get_ptr(), -1, &wtitle[0], wlen);
 
-    // Text
     SetTextColor(hdc, RGB(220, 220, 230));
     SetBkMode(hdc, TRANSPARENT);
     HFONT hFont = (HFONT)m_callback->query_font_ex(ui_font_default);
@@ -350,11 +319,10 @@ void SpectrumCompareWindow::render_spectrum(HDC hdc, const RECT& rc, const Spect
 
     if (width <= 0 || height <= 0) return;
 
-    // Create DIB section for the spectrogram
     BITMAPINFO bmi = {0};
     bmi.bmiHeader.biSize = sizeof(BITMAPINFOHEADER);
     bmi.bmiHeader.biWidth = width;
-    bmi.bmiHeader.biHeight = -height; // top-down
+    bmi.bmiHeader.biHeight = -height;
     bmi.bmiHeader.biPlanes = 1;
     bmi.bmiHeader.biBitCount = 24;
     bmi.bmiHeader.biCompression = BI_RGB;
@@ -366,40 +334,40 @@ void SpectrumCompareWindow::render_spectrum(HDC hdc, const RECT& rc, const Spect
     HDC hMemDC = CreateCompatibleDC(hdc);
     HGDIOBJ hOldBmp = SelectObject(hMemDC, hBmp);
 
-    // Fill with background
     memset(pBits, 16, (size_t)width * height * 3);
 
-    // Render spectrogram pixels
-    const auto& palette = get_palette(m_palette);
-    int palette_size = (int)palette.size();
+    // Precompute normalization
+    float range = data.max_level - data.min_level;
+    if (range < 0.0001f) range = 0.0001f;
 
     for (int y = 0; y < height; y++) {
         // Map y to frequency bin (top = high freq, bottom = low freq)
         double freq_norm = 1.0 - (double)y / (double)height;
-        // Log frequency mapping (like Spek)
-        double log_freq = freq_norm; // linear for now, can adjust
-        int freq_idx = (int)(log_freq * (data.freq_bins - 1));
-        freq_idx = std::max(0, std::min((int)data.freq_bins - 1, freq_idx));
+        int freq_idx = (int)(freq_norm * (data.fft_bins - 1));
+        if (freq_idx < 0) freq_idx = 0;
+        if (freq_idx >= data.fft_bins) freq_idx = data.fft_bins - 1;
 
         BYTE* row = pBits + (size_t)y * width * 3;
 
         for (int x = 0; x < width; x++) {
             int time_idx = (int)((double)x / (double)width * (data.time_frames - 1));
-            time_idx = std::max(0, std::min((int)data.time_frames - 1, time_idx));
+            if (time_idx < 0) time_idx = 0;
+            if (time_idx >= data.time_frames) time_idx = data.time_frames - 1;
 
-            double val = data.data[freq_idx * data.time_frames + time_idx];
-            // val is 0..1 (normalized dB)
-            int pal_idx = (int)(val * (palette_size - 1));
-            pal_idx = std::max(0, std::min(palette_size - 1, pal_idx));
+            // data is time-major: data[t * fft_bins + f]
+            float raw = data.data[time_idx * data.fft_bins + freq_idx];
+            // Normalize to 0..1 (dB-like)
+            float val = (raw - data.min_level) / range;
+            if (val < 0.0f) val = 0.0f;
+            if (val > 1.0f) val = 1.0f;
 
-            const auto& c = palette[pal_idx];
-            row[x * 3 + 0] = (BYTE)(c.b * 255);
-            row[x * 3 + 1] = (BYTE)(c.g * 255);
-            row[x * 3 + 2] = (BYTE)(c.r * 255);
+            uint32_t color = spek_palette(m_palette, (double)val);
+            row[x * 3 + 0] = (BYTE)(color & 0xFF);         // B
+            row[x * 3 + 1] = (BYTE)((color >> 8) & 0xFF);  // G
+            row[x * 3 + 2] = (BYTE)((color >> 16) & 0xFF); // R
         }
     }
 
-    // Blit to screen
     BitBlt(hdc, rc.left, rc.top, width, height, hMemDC, 0, 0, SRCCOPY);
 
     SelectObject(hMemDC, hOldBmp);
@@ -415,15 +383,12 @@ void SpectrumCompareWindow::update_selection()
 {
     static_api_ptr_t<playlist_manager> pm;
     metadb_handle_list items;
-    bit_array_bittable mask(pm->activeplaylist_get_item_count());
     pm->activeplaylist_get_selected_items(items);
 
     std::lock_guard<std::mutex> lock(m_tracks_mutex);
 
-    // Limit to max_tracks
     size_t count = std::min((size_t)items.get_count(), (size_t)m_max_tracks);
 
-    // Check if selection changed
     bool changed = false;
     if (m_tracks.size() != count) {
         changed = true;
@@ -438,7 +403,6 @@ void SpectrumCompareWindow::update_selection()
 
     if (!changed) return;
 
-    // Rebuild tracks
     m_shutdown = false;
     m_tracks.clear();
 
@@ -450,7 +414,6 @@ void SpectrumCompareWindow::update_selection()
 
     InvalidateRect(m_hWnd, NULL, FALSE);
 
-    // Start analysis for each track
     for (size_t i = 0; i < m_tracks.size(); i++) {
         start_analysis_for_track(i);
     }
@@ -459,11 +422,10 @@ void SpectrumCompareWindow::update_selection()
 void SpectrumCompareWindow::start_analysis_for_track(size_t index)
 {
     if (index >= m_tracks.size()) return;
-    if (m_tracks[index]->analyzing.exchange(true)) return; // already running
+    if (m_tracks[index]->analyzing.exchange(true)) return;
 
     metadb_handle_ptr handle = m_tracks[index]->handle;
 
-    // Launch analysis in a detached thread
     std::thread([this, index, handle]() {
         analysis_worker(index, handle);
     }).detach();
@@ -472,7 +434,9 @@ void SpectrumCompareWindow::start_analysis_for_track(size_t index)
 void SpectrumCompareWindow::analysis_worker(size_t index, metadb_handle_ptr handle)
 {
     try {
-        SpectrumData result = m_analyzer.analyze(handle);
+        SpectrumData result;
+        abort_callback_dummy abort;
+        bool ok = m_analyzer.analyze(handle, result, abort);
 
         if (m_shutdown.load()) return;
 
@@ -485,7 +449,6 @@ void SpectrumCompareWindow::analysis_worker(size_t index, metadb_handle_ptr hand
             }
         }
 
-        // Notify main thread
         if (m_hWnd) {
             PostMessageW(m_hWnd, WM_SPECTRUM_READY, 0, 0);
         }
