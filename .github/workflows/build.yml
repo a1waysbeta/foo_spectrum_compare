@@ -1,11 +1,8 @@
 name: Build foobar2000 Spectrum Compare Component
 
+# Manual-only build (Actions page -> Run workflow). Users want explicit
+# control over when binaries are produced, not auto-trigger on every push.
 on:
-  push:
-    branches: [ main, master ]
-    tags: [ 'v*' ]
-  pull_request:
-    branches: [ main, master ]
   workflow_dispatch:
 
 env:
@@ -16,27 +13,39 @@ permissions:
   contents: read
 
 jobs:
-  build:
-    # Pin to windows-2022: ships VS 2022 Enterprise with ATL (atlbase.h) pre-installed.
-    # Do NOT use windows-latest — newer images may resolve a VS preview lacking ATL.
+# =============================================================================
+# 1. Build Win32 (x86) + x64  (matrix)
+# =============================================================================
+  build-multi-platform:
+    # Pin to windows-2022: ships VS 2022 Enterprise with ATL (atlbase.h)
+    # pre-installed. Do NOT use windows-latest — newer images may resolve a
+    # VS preview that lacks ATL headers.
     runs-on: windows-2022
     strategy:
       matrix:
-        platform: [x64, Win32]
+        platform: [x86, x64]
+        include:
+          - platform: x86
+            msbuild_platform: Win32
+            # x86 DLL goes at the ROOT of the .fb2k-component archive.
+            component_rel_dir: .
+          - platform: x64
+            msbuild_platform: x64
+            # x64 DLL goes in a top-level x64\ subdirectory.
+            component_rel_dir: x64
       fail-fast: false
 
     steps:
     - name: Checkout repository
-      uses: actions/checkout@v4
+      uses: actions/checkout@v6
 
-    - name: Add MSBuild to PATH
-      uses: microsoft/setup-msbuild@v2
+    - name: Setup MSBuild
+      uses: microsoft/setup-msbuild@v3
 
     - name: Download WTL 10.0.10320 headers
-      # foobar2000 SDK requires WTL 10.0.10320 (NOT the WTL 9.x in the repo root).
-      # The official WTL 10 release zip lives in the Releases/ directory of the
-      # Win32-WTL/WTL GitHub repo. We download it, extract, and expose the Include
-      # folder to ALL cl.exe invocations through the CL environment variable.
+      # foobar2000 SDK helpers pull in WTL through atlapp.h. Copy the Include
+      # folder under C:\WTL\Include and expose it to ALL cl.exe invocations
+      # through the CL env var (matches the project memory hard constraint).
       shell: pwsh
       run: |
         $url = "https://raw.githubusercontent.com/Win32-WTL/WTL/main/Releases/WTL10_10320_Final.zip"
@@ -53,77 +62,127 @@ jobs:
         echo "CL=/I`"$includePath`"" >> $env:GITHUB_ENV
 
     - name: Restore NuGet packages (if any)
-      working-directory: ${{env.GITHUB_WORKSPACE}}
-      run: nuget restore ${{env.SOLUTION_FILE_PATH}} 2>$null; if ($LASTEXITCODE -ne 0) { Write-Host "NuGet restore skipped or failed (may be normal)" }
+      working-directory: ${{ env.GITHUB_WORKSPACE }}
+      shell: pwsh
+      run: nuget restore "${{ env.SOLUTION_FILE_PATH }}" 2>$null; if ($LASTEXITCODE -ne 0) { Write-Host "NuGet restore skipped or failed (may be normal on fresh checkouts)" }
 
-    - name: Build ${{ matrix.platform }}
-      working-directory: ${{env.GITHUB_WORKSPACE}}
-      # /p:PlatformToolset=v143 forces the VS 2022 toolset for every project in the
-      # solution (the SDK sub-projects default to v142 which may be absent on the runner).
+    - name: Build ${{ matrix.platform }} (msbuild ${{ matrix.msbuild_platform }})
+      working-directory: ${{ env.GITHUB_WORKSPACE }}
+      # /p:PlatformToolset=v143 forces the VS 2022 toolset for every project in
+      # the solution (the bundled SDK sub-projects default to v142 which is
+      # absent on windows-2022 runners).
+      shell: pwsh
       run: |
-        msbuild /m /p:Configuration=${{env.BUILD_CONFIGURATION}} /p:Platform=${{ matrix.platform }} /p:PlatformToolset=v143 ${{env.SOLUTION_FILE_PATH}}
+        msbuild /m `
+          /p:Configuration=${{ env.BUILD_CONFIGURATION }} `
+          /p:Platform=${{ matrix.msbuild_platform }} `
+          /p:PlatformToolset=v143 `
+          "${{ env.SOLUTION_FILE_PATH }}"
         if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
 
-    - name: Locate built DLL
+    - name: Locate built DLL (${{ matrix.platform }})
       id: locate
       shell: pwsh
       run: |
-        $platform = "${{ matrix.platform }}"
-        if ($platform -eq "x64") {
-          $dllPath = "x64\Release\foo_spectrum_compare.dll"
+        $msbuild_platform = "${{ matrix.msbuild_platform }}"
+        if ($msbuild_platform -eq "x64") {
+          $dllPath = "x64\${{ env.BUILD_CONFIGURATION }}\foo_spectrum_compare.dll"
         } else {
-          $dllPath = "Release\foo_spectrum_compare.dll"
+          $dllPath = "${{ env.BUILD_CONFIGURATION }}\foo_spectrum_compare.dll"
         }
-        if (Test-Path $dllPath) {
-          Write-Host "Found: $dllPath"
-          "dll_path=$dllPath" | Out-File -FilePath $env:GITHUB_OUTPUT -Append -Encoding utf8
-        } else {
-          Write-Host "DLL not found at $dllPath, searching..."
+        if (-not (Test-Path $dllPath)) {
+          Write-Host "DLL not found at $dllPath, searching recursively..."
           $found = Get-ChildItem -Recurse -Filter "foo_spectrum_compare.dll" | Select-Object -First 1
-          if ($found) {
-            Write-Host "Found at: $($found.FullName)"
-            "dll_path=$($found.FullName)" | Out-File -FilePath $env:GITHUB_OUTPUT -Append -Encoding utf8
-          } else {
-            Write-Host "::error::DLL not found"
+          if ($found) { $dllPath = $found.FullName } else {
+            Write-Host "::error::foo_spectrum_compare.dll not built"
             exit 1
           }
         }
+        Write-Host "Using DLL: $dllPath"
+        "dll_path=$dllPath" | Out-File -FilePath $env:GITHUB_OUTPUT -Append -Encoding utf8
 
-    - name: Rename to .fb2k-component
+    # Stage the DLL into the layout the .fb2k-component archive expects. The
+    # package job later downloads these staged artifacts and zips them up.
+    - name: Stage DLL for packaging
       shell: pwsh
-      id: rename
       run: |
         $dllPath = "${{ steps.locate.outputs.dll_path }}"
-        $platform = "${{ matrix.platform }}"
-        $componentName = "foo_spectrum_compare-${platform}.fb2k-component"
-        Copy-Item $dllPath $componentName
-        Write-Host "Created: $componentName"
-        "component_name=$componentName" | Out-File -FilePath $env:GITHUB_OUTPUT -Append -Encoding utf8
+        $stageRoot = Join-Path $env:GITHUB_WORKSPACE "_component_stage"
+        $destDir = Join-Path $stageRoot "${{ matrix.component_rel_dir }}"
+        New-Item -ItemType Directory -Force -Path $destDir | Out-Null
+        Copy-Item $dllPath (Join-Path $destDir "foo_spectrum_compare.dll") -Force
+        Write-Host "Staged:"
+        Get-ChildItem -Recurse $stageRoot | ForEach-Object { $_.FullName }
 
-    - name: Upload build artifact
-      uses: actions/upload-artifact@v4
+    - name: Upload staged DLL (${{ matrix.platform }})
+      uses: actions/upload-artifact@v7
       with:
-        name: foo_spectrum_compare-${{ matrix.platform }}
-        path: ${{ steps.rename.outputs.component_name }}
+        name: foo_spectrum_compare_${{ matrix.platform }}
+        path: _component_stage/**/*
         if-no-files-found: error
 
-  release:
-    needs: build
-    if: startsWith(github.ref, 'refs/tags/v')
-    runs-on: ubuntu-latest
+# =============================================================================
+# 2. Package → ONE .fb2k-component (zip with renamed extension)
+# =============================================================================
+  package:
+    runs-on: windows-2022
+    needs: build-multi-platform
+    name: Package fb2k-component
+
     permissions:
-      contents: write
+      contents: write   # required if we later push a tagged release
+
     steps:
-    - name: Download all artifacts
-      uses: actions/download-artifact@v4
+    # x86 archive is the root of the final layout (component_temp\foo_*.dll).
+    - name: Download x86 staged DLL
+      uses: actions/download-artifact@v8
       with:
-        path: artifacts
-    - name: List artifacts
-      run: ls -R artifacts
-    - name: Create Release
+        name: foo_spectrum_compare_x86
+        path: component_temp
+
+    # x64 archive contains _component_stage\x64\foo_*.dll which maps to
+    # component_temp\x64\foo_*.dll (matches the requested layout exactly).
+    - name: Download x64 staged DLL
+      uses: actions/download-artifact@v8
+      with:
+        name: foo_spectrum_compare_x64
+        path: component_temp
+
+    - name: Verify component layout
+      shell: cmd
+      run: |
+        echo ===== expected structure =====
+        echo   foo_spectrum_compare.dll
+        echo   x64\foo_spectrum_compare.dll
+        echo ===== actual structure =====
+        dir component_temp /s /b
+
+    - name: Create foo_spectrum_compare.fb2k-component
+      shell: powershell
+      run: |
+        $zipPath = "foo_spectrum_compare.zip"
+        if (Test-Path $zipPath) { Remove-Item $zipPath -Force }
+        Compress-Archive `
+          -Path "component_temp\*" `
+          -DestinationPath $zipPath `
+          -CompressionLevel Optimal
+        Rename-Item -Path $zipPath -NewName "foo_spectrum_compare.fb2k-component" -Force
+        Get-ChildItem foo_spectrum_compare.fb2k-component | Select-Object Name, Length
+
+    - name: Upload final component artifact
+      uses: actions/upload-artifact@v7
+      with:
+        name: foo_spectrum_compare_component
+        path: foo_spectrum_compare.fb2k-component
+        if-no-files-found: error
+
+    # Keep the existing tag-release behaviour so `git tag vX.Y.Z && push`
+    # (then run the workflow manually or via push-trigger removed above) can
+    # still attach the built .fb2k-component to a GitHub Release.
+    - name: Publish tagged release
+      if: startsWith(github.ref, 'refs/tags/v')
       uses: softprops/action-gh-release@v2
       with:
         name: Release ${{ github.ref_name }}
         generate_release_notes: true
-        files: |
-          artifacts/**/*.fb2k-component
+        files: foo_spectrum_compare.fb2k-component
