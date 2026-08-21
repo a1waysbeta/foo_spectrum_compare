@@ -2,15 +2,11 @@
 
 #include "stdafx.h"
 #include "spectrum_analyzer.h"
-#include <thread>
 #include <atomic>
 
 // GUID for our UI element
 static const GUID guid_spectrum_compare =
     { 0x7a3f1c2d, 0x4e5b, 0x6f8a, { 0x9c, 0x1d, 0x2e, 0x3f, 0x4a, 0x5b, 0x6c, 0x7d } };
-
-// Window class GUID
-static const wchar_t* SPECTRUM_WND_CLASS = L"{SpectrumCompare-8F3A2B1C-4D5E-6F7A-8B9C-0D1E2F3A4B5C}";
 
 // Menu command IDs
 #define IDM_SET_COUNT_1  1001
@@ -22,6 +18,10 @@ static const wchar_t* SPECTRUM_WND_CLASS = L"{SpectrumCompare-8F3A2B1C-4D5E-6F7A
 #define IDM_PALETTE_SOX      1011
 #define IDM_PALETTE_MONO     1012
 
+// Custom messages
+#define WM_SPECTRUM_READY (WM_USER + 100)
+#define TIMER_REPAINT 1
+
 // Holds per-track spectrum state
 struct TrackSpectrum {
     metadb_handle_ptr handle;
@@ -30,20 +30,17 @@ struct TrackSpectrum {
     std::atomic<bool> needs_repaint{ false };
 };
 
-// Main UI element window
+// Main UI element window - raw Win32 implementation (no ATL dependency)
 class SpectrumCompareWindow :
     public ui_element_instance,
-    public CWindowImpl<SpectrumCompareWindow>,
     public playlist_callback_single
 {
 public:
-    DECLARE_WND_CLASS_EX(SPECTRUM_WND_CLASS, CS_VREDRAW | CS_HREDRAW, -1);
-
     SpectrumCompareWindow(ui_element_config::ptr config, ui_element_instance_callback_ptr p_callback);
     ~SpectrumCompareWindow();
 
     void initialize_window(HWND parent);
-    HWND get_wnd() { return *this; }
+    HWND get_wnd() { return m_hWnd; }
 
     void set_configuration(ui_element_config::ptr config) { m_config = config; }
     ui_element_config::ptr get_configuration() { return m_config; }
@@ -61,7 +58,7 @@ public:
     void notify(const GUID& p_what, t_size p_param1, const void* p_param2, t_size p_param2size);
 
     // playlist_callback_single
-    void on_items_added(t_size p_base, const pfc::list_base_const_t<metadb_handle_ptr>& p_data, const bit_array& p_selection) override;
+    void on_items_added(t_size p_base, metadb_handle_list_cref p_data, const bit_array& p_selection) override;
     void on_items_reordered(const t_size* p_order, t_size p_count) override;
     void on_items_removing(const bit_array& p_mask, t_size p_old_count, t_size p_new_count) override;
     void on_items_removed(const bit_array& p_mask, t_size p_old_count, t_size p_new_count) override;
@@ -77,44 +74,28 @@ public:
     void on_default_format_changed() override;
     void on_playback_order_changed(t_size p_new_index) override;
 
-    BEGIN_MSG_MAP_EX(SpectrumCompareWindow)
-        MSG_WM_ERASEBKGND(OnEraseBkgnd)
-        MSG_WM_PAINT(OnPaint)
-        MSG_WM_SIZE(OnSize)
-        MSG_WM_CONTEXTMENU(OnContextMenu)
-        MSG_WM_TIMER(OnTimer)
-        MESSAGE_HANDLER(WM_SPECTRUM_READY, OnSpectrumReady)
-        COMMAND_ID_HANDLER_EX(IDM_SET_COUNT_1, OnSetCount)
-        COMMAND_ID_HANDLER_EX(IDM_SET_COUNT_2, OnSetCount)
-        COMMAND_ID_HANDLER_EX(IDM_SET_COUNT_3, OnSetCount)
-        COMMAND_ID_HANDLER_EX(IDM_SET_COUNT_4, OnSetCount)
-        COMMAND_ID_HANDLER_EX(IDM_REFRESH, OnRefresh)
-        COMMAND_ID_HANDLER_EX(IDM_PALETTE_SPECTRUM, OnPalette)
-        COMMAND_ID_HANDLER_EX(IDM_PALETTE_SOX, OnPalette)
-        COMMAND_ID_HANDLER_EX(IDM_PALETTE_MONO, OnPalette)
-    END_MSG_MAP()
-
 private:
-    LRESULT OnEraseBkgnd(CDCHandle dc);
-    void OnPaint(CDCHandle);
-    void OnSize(UINT nType, CSize size);
-    void OnContextMenu(CWindow wnd, CPoint point);
+    // Static window procedure - dispatches to instance
+    static LRESULT CALLBACK WindowProc(HWND hWnd, UINT uMsg, WPARAM wParam, LPARAM lParam);
+    LRESULT HandleMessage(UINT uMsg, WPARAM wParam, LPARAM lParam);
+
+    // Message handlers
+    void OnPaint();
+    void OnSize();
+    void OnContextMenu(POINT pt);
     void OnTimer(UINT_PTR nIDEvent);
+    void OnCommand(int id);
 
-    void OnSetCount(UINT uNotifyCode, int nID, CWindow wndCtl);
-    void OnRefresh(UINT uNotifyCode, int nID, CWindow wndCtl);
-    void OnPalette(UINT uNotifyCode, int nID, CWindow wndCtl);
-
-    // Spectrum rendering
-    void render_spectrum(CDCHandle dc, const RECT& rc, const SpectrumData& data);
-    void render_track_label(CDCHandle dc, const RECT& rc, const TrackSpectrum& track);
+    // Rendering
+    void render_spectrum(HDC hdc, const RECT& rc, const SpectrumData& data);
+    void render_track_label(HDC hdc, const RECT& rc, const TrackSpectrum& track);
 
     // Selection management
     void update_selection();
     void start_analysis_for_track(size_t index);
     void analysis_worker(size_t index, metadb_handle_ptr handle);
 
-    // Config
+    HWND m_hWnd = NULL;
     int m_max_tracks = 4;
     palette_t m_palette = PALETTE_SPECTRUM;
 
@@ -127,8 +108,5 @@ private:
 
     SpectrumAnalyzer m_analyzer;
 
-    static const UINT_PTR TIMER_REPAINT = 1;
-    static const UINT WM_SPECTRUM_READY = WM_USER + 100;
-
-    LRESULT OnSpectrumReady(UINT uMsg, WPARAM wParam, LPARAM lParam, BOOL& bHandled);
+    static bool s_classRegistered;
 };
