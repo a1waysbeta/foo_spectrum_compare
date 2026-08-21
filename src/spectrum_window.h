@@ -128,7 +128,7 @@ public:
         COMMAND_ID_HANDLER_EX(IDM_RESET_TITLE_FORMAT, OnResetTitleFormat)
     END_MSG_MAP()
 
-    // ImplementBumpableElem (CRTP base via ui_element_impl_withpopup) accesses m_callback
+    // ImplementBumpableElem (CRTP base via ui_element_impl) accesses m_callback
     template<typename TClass> friend class ImplementBumpableElem;
 
 private:
