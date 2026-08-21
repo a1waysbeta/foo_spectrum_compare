@@ -40,13 +40,11 @@ bool SpectrumAnalyzer::analyze(metadb_handle_ptr track, SpectrumData& out, abort
     out.error = false;
     out.track_path = track->get_path();
 
-    // Get track info (technical info is stored as key-value pairs in this SDK version)
+    // Get track info
     file_info_impl info;
     if (track->get_info_async(info)) {
-        const char* sr = info.info_get("samplerate");
-        if (sr) out.sample_rate = atoi(sr);
-        const char* ch = info.info_get("channels");
-        if (ch) out.channels = atoi(ch);
+        out.sample_rate = info.get_sample_rate();
+        out.channels = info.get_channels();
         out.duration = info.get_length();
     }
 
@@ -55,9 +53,7 @@ bool SpectrumAnalyzer::analyze(metadb_handle_ptr track, SpectrumData& out, abort
         titleformat_hook* hook = NULL;
         service_ptr_t<titleformat_object> obj;
         static_api_ptr_t<titleformat_compiler>()->compile_safe(obj, "%title%");
-        pfc::string8 title;
-        track->format_title(hook, title, obj, NULL);
-        out.title = title.get_ptr();
+        track->format_title(hook, out.title, obj, NULL);
     } catch (...) {
         out.title = track->get_path();
     }
