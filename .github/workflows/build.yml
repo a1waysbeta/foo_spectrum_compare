@@ -1,0 +1,107 @@
+name: Build foobar2000 Spectrum Compare Component
+
+on:
+  push:
+    branches: [ main, master ]
+    tags: [ 'v*' ]
+  pull_request:
+    branches: [ main, master ]
+  workflow_dispatch:
+
+env:
+  SOLUTION_FILE_PATH: .
+  BUILD_CONFIGURATION: Release
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    runs-on: windows-latest
+    strategy:
+      matrix:
+        platform: [x64, Win32]
+      fail-fast: false
+
+    steps:
+    - name: Checkout repository
+      uses: actions/checkout@v4
+
+    - name: Add MSBuild to PATH
+      uses: microsoft/setup-msbuild@v2
+
+    - name: Restore NuGet packages (if any)
+      working-directory: ${{env.GITHUB_WORKSPACE}}
+      run: nuget restore ${{env.SOLUTION_FILE_PATH}} 2>$null; if ($LASTEXITCODE -ne 0) { Write-Host "NuGet restore skipped or failed (may be normal)" }
+
+    - name: Build ${{ matrix.platform }}
+      working-directory: ${{env.GITHUB_WORKSPACE}}
+      run: |
+        msbuild /m /p:Configuration=${{env.BUILD_CONFIGURATION}} /p:Platform=${{ matrix.platform }} ${{env.SOLUTION_FILE_PATH}}
+        if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+
+    - name: Locate built DLL
+      id: locate
+      shell: pwsh
+      run: |
+        $platform = "${{ matrix.platform }}"
+        if ($platform -eq "x64") {
+          $dllPath = "x64\Release\foo_spectrum_compare.dll"
+        } else {
+          $dllPath = "Release\foo_spectrum_compare.dll"
+        }
+        if (Test-Path $dllPath) {
+          Write-Host "Found: $dllPath"
+          "dll_path=$dllPath" | Out-File -FilePath $env:GITHUB_OUTPUT -Append -Encoding utf8
+        } else {
+          Write-Host "DLL not found at $dllPath, searching..."
+          $found = Get-ChildItem -Recurse -Filter "foo_spectrum_compare.dll" | Select-Object -First 1
+          if ($found) {
+            Write-Host "Found at: $($found.FullName)"
+            "dll_path=$($found.FullName)" | Out-File -FilePath $env:GITHUB_OUTPUT -Append -Encoding utf8
+          } else {
+            Write-Host "::error::DLL not found"
+            exit 1
+          }
+        }
+
+    - name: Rename to .fb2k-component
+      shell: pwsh
+      run: |
+        $dllPath = "${{ steps.locate.outputs.dll_path }}"
+        $platform = "${{ matrix.platform }}"
+        $componentName = "foo_spectrum_compare-${platform}.fb2k-component"
+        Copy-Item $dllPath $componentName
+        Write-Host "Created: $componentName"
+        "component_name=$componentName" | Out-File -FilePath $env:GITHUB_OUTPUT -Append -Encoding utf8
+      id: rename
+
+    - name: Upload build artifact
+      uses: actions/upload-artifact@v4
+      with:
+        name: foo_spectrum_compare-${{ matrix.platform }}
+        path: ${{ steps.rename.outputs.component_name }}
+        if-no-files-found: error
+
+  release:
+    needs: build
+    if: startsWith(github.ref, 'refs/tags/v')
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+    - name: Download all artifacts
+      uses: actions/download-artifact@v4
+      with:
+        path: artifacts
+
+    - name: List artifacts
+      run: ls -R artifacts
+
+    - name: Create Release
+      uses: softprops/action-gh-release@v2
+      with:
+        name: Release ${{ github.ref_name }}
+        generate_release_notes: true
+        files: |
+          artifacts/**/*.fb2k-component

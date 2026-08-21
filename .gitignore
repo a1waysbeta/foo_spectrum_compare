@@ -1,0 +1,52 @@
+# Visual Studio / MSBuild build output (only at project root, not in sdk/)
+/Debug/
+/Release/
+/x64/
+/Win32/
+*.obj
+*.pdb
+*.ilk
+*.exp
+*.idb
+*.ipdb
+*.iobj
+*.tlog
+*.log
+*.sdf
+*.opensdf
+*.suo
+*.user
+*.userosscache
+*.sln.docstates
+*.VC.db
+*.VC.opendb
+.vs/
+ipch/
+packages/
+
+# Built DLL / component (project output only)
+/foo_spectrum_compare.dll
+/foo_spectrum_compare.exe
+/foo_spectrum_compare*.fb2k-component
+
+# OS files
+Thumbs.db
+ehthumbs.db
+Desktop.ini
+$RECYCLE.BIN/
+
+# Editor files
+*.swp
+*.swo
+*~
+.vscode/
+.idea/
+*.iml
+
+# Temporary
+*.tmp
+*.bak
+*.cache
+
+# NOTE: Do NOT ignore *.lib in sdk/ directory - those are precompiled
+# foobar2000 SDK shared libraries required for building.
