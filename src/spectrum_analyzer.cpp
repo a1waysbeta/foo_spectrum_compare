@@ -40,11 +40,13 @@ bool SpectrumAnalyzer::analyze(metadb_handle_ptr track, SpectrumData& out, abort
     out.error = false;
     out.track_path = track->get_path();
 
-    // Get track info
+    // Get track info (technical info is stored as key-value pairs in this SDK version)
     file_info_impl info;
     if (track->get_info_async(info)) {
-        out.sample_rate = info.get_sample_rate();
-        out.channels = info.get_channels();
+        const char* sr = info.info_get("samplerate");
+        if (sr) out.sample_rate = atoi(sr);
+        const char* ch = info.info_get("channels");
+        if (ch) out.channels = atoi(ch);
         out.duration = info.get_length();
     }
 

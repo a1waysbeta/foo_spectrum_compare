@@ -502,12 +502,29 @@ void SpectrumCompareWindow::on_default_format_changed() {}
 void SpectrumCompareWindow::on_playback_order_changed(t_size) {}
 
 // ============================================================================
-// Component registration
+// Component registration (custom ui_element factory, no ATL dependency)
 // ============================================================================
 
-class SpectrumCompareUIElement : public ui_element_impl_withpopup<SpectrumCompareWindow> {};
+class SpectrumCompareUIFactory : public ui_element {
+public:
+    GUID get_guid() override { return SpectrumCompareWindow::g_get_guid(); }
+    GUID get_subclass() override { return SpectrumCompareWindow::g_get_subclass(); }
+    void get_name(pfc::string_base& out) override { SpectrumCompareWindow::g_get_name(out); }
 
-static service_factory_single_t<SpectrumCompareUIElement> g_spectrum_compare_factory;
+    ui_element_instance_ptr instantiate(fb2k::hwnd_t parent, ui_element_config::ptr cfg, ui_element_instance_callback_ptr callback) override {
+        service_ptr_t<SpectrumCompareWindow> instance = new service_impl_t<SpectrumCompareWindow>(cfg, callback);
+        instance->initialize_window(parent);
+        return instance;
+    }
+
+    ui_element_config::ptr get_default_configuration() override { return SpectrumCompareWindow::g_get_default_configuration(); }
+    ui_element_children_enumerator_ptr enumerate_children(ui_element_config::ptr cfg) override { (void)cfg; return NULL; }
+    bool get_description(pfc::string_base& out) override { out = SpectrumCompareWindow::g_get_description(); return true; }
+
+    FB2K_MAKE_SERVICE_INTERFACE_ENTRYPOINT(ui_element);
+};
+
+static service_factory_single_t<SpectrumCompareUIFactory> g_spectrum_compare_factory;
 
 DECLARE_COMPONENT_VERSION(
     "Spectrum Compare",
