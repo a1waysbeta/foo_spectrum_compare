@@ -17,6 +17,13 @@ SpectrumCompareWindow::SpectrumCompareWindow(
     : m_callback(p_callback)
     , m_config(config)
 {
+    // Cache system DPI once at construction so rendering helpers don't need
+    // to call ::GetDC(::GetDesktopWindow()) on every draw.
+    HDC screenDC = ::GetDC(NULL);
+    m_dpi = GetDeviceCaps(screenDC, LOGPIXELSX);
+    if (m_dpi < 96) m_dpi = 96;
+    ::ReleaseDC(NULL, screenDC);
+
     // Load persistent config into runtime members
     m_show_freq_axis = g_cfg_show_freq_axis;
     m_show_time_axis = g_cfg_show_time_axis;
@@ -30,6 +37,14 @@ SpectrumCompareWindow::SpectrumCompareWindow(
 
 SpectrumCompareWindow::~SpectrumCompareWindow() {
     m_shutdown = true;
+
+    // Destroy any lingering inline edit control so its subclass callback
+    // doesn't fire on a half-destroyed window.
+    if (m_hwnd_title_edit != NULL) {
+        RemoveWindowSubclass(m_hwnd_title_edit, title_edit_subclass_proc, 1);
+        DestroyWindow(m_hwnd_title_edit);
+        m_hwnd_title_edit = NULL;
+    }
 
     // Abort all in-flight analyses so worker threads exit promptly.
     {
@@ -295,11 +310,9 @@ void SpectrumCompareWindow::OnPaint(CDCHandle) {
         return;
     }
 
-    // DPI-aware scaling: get system DPI and scale dimensions accordingly.
-    // All measurements below are in pixels at 96 DPI, scaled to actual DPI.
-    HDC screenDC = ::GetDC(NULL);
-    int dpi = GetDeviceCaps(screenDC, LOGPIXELSX);
-    ::ReleaseDC(NULL, screenDC);
+    // DPI-aware scaling: use DPI cached at construction time so we don't need
+    // to grab a screen DC on every paint.
+    int dpi = m_dpi;
     auto scale = [dpi](int v) -> int { return MulDiv(v, dpi, 96); };
 
     // Layout measurements (designed at 96 DPI, scaled to actual DPI)
@@ -324,15 +337,18 @@ void SpectrumCompareWindow::OnPaint(CDCHandle) {
         CRect track_rc(rc.left + padding_outer, y, rc.right - padding_outer, y + track_height);
         y += track_height + track_gap;
 
-        // Label area (top of track, full width)
-        CRect label_rc(track_rc.left, track_rc.top, track_rc.right, track_rc.top + label_height);
-        render_track_label(dc.m_hDC, label_rc, *m_tracks[i]);
-
-        // Spectrum area: below label, with freq axis (left) and time axis (bottom)
+        // Spectrum area: below label, with freq axis (left) and time axis (bottom).
+        // Compute these edges first so the title label can be aligned with the
+        // spectrum left edge (avoids overlapping the 22kHz tick in the freq axis).
         int spec_top = track_rc.top + label_height + label_to_spec_gap;
         int spec_bottom = track_rc.bottom - time_axis_height - spec_to_axis_gap;
         int spec_left = track_rc.left + freq_axis_width;
         int spec_right = track_rc.right;
+
+        // Label area. Left edge is intentionally aligned with the spectrum
+        // itself (not the outer panel) to keep text out of the freq axis column.
+        CRect label_rc(spec_left, track_rc.top, spec_right, track_rc.top + label_height);
+        render_track_label(dc.m_hDC, label_rc, *m_tracks[i]);
 
         // Frequency axis (left of spectrum, aligned with spectrum vertical range)
         if (m_show_freq_axis) {
@@ -381,10 +397,7 @@ void SpectrumCompareWindow::render_track_label(CDCHandle dc, const RECT& rc, con
     SelectObjectScope fontScope(dc, (HGDIOBJ)m_callback->query_font_ex(ui_font_default));
 
     // DPI-aware horizontal padding
-    HDC screenDC = ::GetDC(NULL);
-    int dpi = GetDeviceCaps(screenDC, LOGPIXELSX);
-    ::ReleaseDC(NULL, screenDC);
-    int pad = MulDiv(8, dpi, 96);
+    int pad = MulDiv(8, m_dpi, 96);
 
     CRect text_rc(rc);
     text_rc.left += pad;
@@ -476,9 +489,7 @@ void SpectrumCompareWindow::render_freq_axis(CDCHandle dc, const RECT& rc, int s
     static const int kHz_ticks[] = { 0, 5, 10, 15, 20, 22 };
 
     // DPI-aware tick and label dimensions
-    HDC screenDC = ::GetDC(NULL);
-    int dpi = GetDeviceCaps(screenDC, LOGPIXELSX);
-    ::ReleaseDC(NULL, screenDC);
+    int dpi = m_dpi;
     auto scale = [dpi](int v) { return MulDiv(v, dpi, 96); };
     int tick_len = scale(4);
     int label_half_h = scale(8);
@@ -536,9 +547,7 @@ void SpectrumCompareWindow::render_time_axis(CDCHandle dc, const RECT& rc, doubl
     const int time_interval = 20; // seconds
 
     // DPI-aware dimensions
-    HDC screenDC = ::GetDC(NULL);
-    int dpi = GetDeviceCaps(screenDC, LOGPIXELSX);
-    ::ReleaseDC(NULL, screenDC);
+    int dpi = m_dpi;
     auto scale = [dpi](int v) { return MulDiv(v, dpi, 96); };
     int tick_len = scale(4);
     int tick_gap = scale(1);
@@ -763,179 +772,209 @@ void SpectrumCompareWindow::OnToggleTimeAxis(UINT uNotifyCode, int nID, CWindow 
     Invalidate();
 }
 
-// In-memory dialog for editing the title format string
-namespace {
-    // Dialog item IDs
-    enum { IDC_EDIT = 1000 };
+// ============================================================
+// Inline title-format editing
+// ------------------------------------------------------------
+// The "Edit format..." context menu entry historically used an in-memory
+// DLGTEMPLATE + DialogBoxIndirectParamW, which is very brittle and commonly
+// fails to show up because of subtle template layout / font issues.
+//
+// Replacement (per user request, "simpler approach that works"):
+//   * Double-click anywhere on the panel OR pick "Edit format..." from the
+//     context menu -> spawn a single-line EDIT control over the panel using
+//     the SAME layout rectangle as the first track's title label.
+//   * Enter -> commit; Esc -> discard; losing focus -> commit.
+//   * After commit we refresh the tracks so the new titleformat string is
+//     reflected in every label.
+// ============================================================
 
-    struct DialogData {
-        pfc::string8* result;
-        bool ok;
-    };
+LRESULT CALLBACK SpectrumCompareWindow::title_edit_subclass_proc(
+    HWND hWnd, UINT uMsg, WPARAM wParam, LPARAM lParam,
+    UINT_PTR uIdSubclass, DWORD_PTR dwRefData)
+{
+    (void)uIdSubclass;
+    SpectrumCompareWindow* self = (SpectrumCompareWindow*)dwRefData;
 
-    INT_PTR CALLBACK TitleFormatDlgProc(HWND hDlg, UINT msg, WPARAM wParam, LPARAM lParam) {
-        switch (msg) {
-        case WM_INITDIALOG: {
-            DialogData* data = (DialogData*)lParam;
-            SetWindowLongPtr(hDlg, GWLP_USERDATA, (LONG_PTR)data);
-            // Set initial text in edit control
-            pfc::stringcvt::string_wide_from_utf8 w(data->result->c_str());
-            SetDlgItemTextW(hDlg, IDC_EDIT, w);
-            // Select all text
-            SendDlgItemMessageW(hDlg, IDC_EDIT, EM_SETSEL, 0, -1);
-            SetFocus(GetDlgItem(hDlg, IDC_EDIT));
-            return FALSE; // we set focus
+    switch (uMsg) {
+    case WM_CHAR:
+        if (wParam == VK_RETURN) {
+            // Commit. Avoid ending inline during the keystroke itself; post
+            // a message so the edit control can process the key state cleanly.
+            self->PostMessage(WM_FINISH_EDIT_TITLE_FORMAT, TRUE, 0);
+            return 0;
         }
-        case WM_COMMAND:
-            switch (LOWORD(wParam)) {
-            case IDOK: {
-                DialogData* data = (DialogData*)GetWindowLongPtr(hDlg, GWLP_USERDATA);
-                HWND edit = GetDlgItem(hDlg, IDC_EDIT);
-                int len = GetWindowTextLengthW(edit);
-                pfc::array_t<wchar_t> buf;
-                buf.set_size(len + 1);
-                GetWindowTextW(edit, buf.get_ptr(), (int)buf.get_size());
-                *(data->result) = pfc::stringcvt::string_utf8_from_wide(buf.get_ptr());
-                data->ok = true;
-                EndDialog(hDlg, IDOK);
-                return TRUE;
-            }
-            case IDCANCEL:
-                EndDialog(hDlg, IDCANCEL);
-                return TRUE;
-            }
-            break;
+        if (wParam == VK_ESCAPE) {
+            self->PostMessage(WM_FINISH_EDIT_TITLE_FORMAT, FALSE, 0);
+            return 0;
         }
-        return FALSE;
+        break;
+    case WM_KILLFOCUS:
+        // If the window is still alive and focus is leaving to someone else,
+        // commit what the user typed. Skip when we are already in the middle
+        // of destroying the edit (m_hwnd_title_edit being cleared).
+        if (self->m_hwnd_title_edit == hWnd && (HWND)wParam != hWnd) {
+            self->PostMessage(WM_FINISH_EDIT_TITLE_FORMAT, TRUE, 0);
+        }
+        break;
+    case WM_NCDESTROY:
+        // Must remove the subclass before the HWND goes away.
+        RemoveWindowSubclass(hWnd, title_edit_subclass_proc, 1);
+        break;
+    }
+    return DefSubclassProc(hWnd, uMsg, wParam, lParam);
+}
+
+void SpectrumCompareWindow::begin_inline_title_format_edit() {
+    if (m_hWnd == NULL) return;
+    if (m_hwnd_title_edit != NULL) {
+        // Already editing: refocus and select all.
+        SetFocus(m_hwnd_title_edit);
+        SendMessage(m_hwnd_title_edit, EM_SETSEL, 0, -1);
+        return;
     }
 
-    // Build a DLGTEMPLATE in memory. All offsets must be DWORD-aligned.
-    // Returns the complete template buffer.
-    std::vector<BYTE> buildTitleFormatDialogTemplate() {
-        // Use DLGTEMPLATEEX format for better font support
-        // DLGTEMPLATEEX: signature(WORD=0xFFFF) dlgVer(WORD=1) helpID(DWORD) exStyle(DWORD) style(DWORD) cDlgItems(WORD) x,y,cx,cy(WORD each)
-        std::vector<BYTE> buf;
-        auto align = [&buf]() {
-            while (buf.size() % 4 != 0) buf.push_back(0);
-        };
-        // Helper lambdas. NOTE: we do NOT cross-call lambdas to avoid MSVC
-        // issues with lambda-variable capture inside another lambda.
-        auto pushWord = [&buf](WORD w) {
-            buf.push_back((BYTE)(w & 0xFF));
-            buf.push_back((BYTE)(w >> 8));
-        };
-        auto pushDWord = [&buf](DWORD dw) {
-            buf.push_back((BYTE)(dw & 0xFF));
-            buf.push_back((BYTE)((dw >> 8) & 0xFF));
-            buf.push_back((BYTE)((dw >> 16) & 0xFF));
-            buf.push_back((BYTE)((dw >> 24) & 0xFF));
-        };
-        auto pushWideStr = [&buf](const wchar_t* s) {
-            while (*s) {
-                WORD ch = (WORD)*s;
-                buf.push_back((BYTE)(ch & 0xFF));
-                buf.push_back((BYTE)(ch >> 8));
-                ++s;
-            }
-            // explicit null terminator (WORD 0)
-            buf.push_back(0);
-            buf.push_back(0);
-        };
-        auto pushWordZero = [&buf]() {
-            buf.push_back(0);
-            buf.push_back(0);
-        };
+    // Reproduce the label-rect layout from OnPaint so the edit sits exactly
+    // on top of the first track's title line, with left edge aligned to the
+    // spectrum (same fix that prevents overlap with the 22kHz axis).
+    CRect rc;
+    GetClientRect(&rc);
+    int dpi = m_dpi;
+    auto scale = [dpi](int v) -> int { return MulDiv(v, dpi, 96); };
 
-        align();
-        // DLGTEMPLATEEX header
-        pushWord(0xFFFF); // signature
-        pushWord(1);       // dlgVer
-        pushDWord(0);      // helpID
-        pushDWord(WS_EX_DLGMODALFRAME); // exStyle
-        pushDWord(WS_POPUP | WS_CAPTION | WS_SYSMENU | DS_MODALFRAME | DS_CENTER | DS_SETFONT); // style
-        pushWord(4);       // cDlgItems
-        pushWord(0); pushWord(0);   // x, y
-        pushWord(300); pushWord(180); // cx, cy
-        // menu, class (both 0)
-        pushWordZero(); pushWordZero();
-        // title
-        pushWideStr(L"Edit Title Format");
-        // font (DS_SETFONT): point size + face name
-        pushWord(9); // 9pt
-        pushWideStr(L"Segoe UI");
-
-        // Item 1: Static text (label)
-        align();
-        pushDWord(WS_CHILD | WS_VISIBLE | SS_LEFT); // style
-        pushDWord(0); // exStyle
-        pushWord(5); pushWord(5); pushWord(290); pushWord(10); // x,y,cx,cy
-        pushWord(0xFFFF); // class as atom
-        pushWord(0x0082); // Static atom
-        pushWideStr(L"Enter foobar2000 titleformat string:");
-        pushWordZero(); // extra count
-
-        // Item 2: Edit control (multiline)
-        align();
-        pushDWord(WS_CHILD | WS_VISIBLE | WS_BORDER | WS_TABSTOP | WS_VSCROLL | ES_MULTILINE | ES_AUTOVSCROLL);
-        pushDWord(WS_EX_CLIENTEDGE); // exStyle
-        pushWord(5); pushWord(20); pushWord(290); pushWord(120);
-        pushWord(IDC_EDIT);
-        pushWord(0xFFFF); // class as atom
-        pushWord(0x0081); // Edit atom
-        pushWordZero(); // empty title (wide null)
-        pushWordZero(); // extra count
-
-        // Item 3: OK button
-        align();
-        pushDWord(WS_CHILD | WS_VISIBLE | WS_TABSTOP | BS_DEFPUSHBUTTON);
-        pushDWord(0);
-        pushWord(190); pushWord(155); pushWord(50); pushWord(14);
-        pushWord(IDOK);
-        pushWord(0xFFFF);
-        pushWord(0x0080); // Button atom
-        pushWideStr(L"OK");
-        pushWordZero();
-
-        // Item 4: Cancel button
-        align();
-        pushDWord(WS_CHILD | WS_VISIBLE | WS_TABSTOP);
-        pushDWord(0);
-        pushWord(245); pushWord(155); pushWord(50); pushWord(14);
-        pushWord(IDCANCEL);
-        pushWord(0xFFFF);
-        pushWord(0x0080); // Button atom
-        pushWideStr(L"Cancel");
-        pushWordZero();
-
-        return buf;
+    const int padding_outer = scale(8);
+    const int label_height = scale(22);
+    const int freq_axis_width = m_show_freq_axis ? scale(48) : 0;
+    const int time_axis_height = m_show_time_axis ? scale(20) : 0;
+    // Track size mirror of OnPaint. If the track list is empty we still want
+    // an editing surface, so approximate with a single full-height track.
+    int track_count = 0;
+    {
+        std::lock_guard<std::mutex> lock(m_tracks_mutex);
+        track_count = (int)m_tracks.size();
+    }
+    if (track_count < 1) track_count = 1;
+    const int track_gap = scale(6);
+    int total_track_gap = track_gap * (track_count - 1);
+    int available_height = rc.Height() - 2 * padding_outer - total_track_gap;
+    int track_height = available_height / track_count;
+    if (track_height < label_height + time_axis_height + scale(20)) {
+        track_height = label_height + time_axis_height + scale(20);
     }
 
-    bool showTitleFormatDialog(HWND parent, pfc::string8& format) {
-        auto buf = buildTitleFormatDialogTemplate();
-        DialogData data{ &format, false };
-        INT_PTR ret = DialogBoxIndirectParamW(
-            core_api::get_my_instance(),
-            (LPCDLGTEMPLATEW)buf.data(),
-            parent,
-            TitleFormatDlgProc,
-            (LPARAM)&data
-        );
-        return ret == IDOK && data.ok;
+    int track_left = rc.left + padding_outer;
+    int track_right = rc.right - padding_outer;
+    int y = rc.top + padding_outer;
+    int spec_left = track_left + freq_axis_width;
+    // Keep the label within the panel (freq_axis_width may make spec_left too
+    // narrow on very small windows).
+    if (spec_left >= track_right) spec_left = track_left;
+
+    CRect edit_rc(spec_left, y, track_right, y + label_height);
+
+    DWORD style = WS_CHILD | WS_VISIBLE | WS_BORDER | WS_TABSTOP
+                | ES_AUTOHSCROLL | ES_NOHIDESEL;
+    DWORD exStyle = WS_EX_CLIENTEDGE;
+    HWND hedit = CreateWindowExW(
+        exStyle,
+        L"EDIT",
+        NULL,
+        style,
+        edit_rc.left, edit_rc.top, edit_rc.Width(), edit_rc.Height(),
+        m_hWnd,
+        (HMENU)IDC_INLINE_TITLE_EDIT,
+        core_api::get_my_instance(),
+        NULL
+    );
+    if (hedit == NULL) return;
+
+    // Use the same font the panel uses for its labels so sizing matches.
+    HFONT hFont = (HFONT)m_callback->query_font_ex(ui_font_default);
+    if (hFont == NULL) hFont = (HFONT)GetStockObject(DEFAULT_GUI_FONT);
+    SendMessage(hedit, WM_SETFONT, (WPARAM)hFont, TRUE);
+
+    pfc::stringcvt::string_wide_from_utf8 wtext(m_title_format.get_ptr());
+    SetWindowTextW(hedit, wtext);
+    SendMessage(hedit, EM_SETSEL, 0, -1);
+
+    // Install subclass to trap Enter/Esc/lose-focus.
+    SetWindowSubclass(hedit, title_edit_subclass_proc, 1, (DWORD_PTR)this);
+    m_hwnd_title_edit = hedit;
+    SetFocus(hedit);
+}
+
+void SpectrumCompareWindow::end_inline_title_format_edit(bool commit) {
+    if (m_hwnd_title_edit == NULL) return;
+    HWND hedit = m_hwnd_title_edit;
+
+    pfc::string8 newFormat;
+    if (commit) {
+        int len = GetWindowTextLengthW(hedit);
+        pfc::array_t<wchar_t> buf;
+        buf.set_size(len + 1);
+        GetWindowTextW(hedit, buf.get_ptr(), (int)buf.get_size());
+        newFormat = pfc::stringcvt::string_utf8_from_wide(buf.get_ptr());
+    }
+
+    // Remove subclass + destroy in a defined order to avoid re-entrance from
+    // the WM_KILLFOCUS handler posting another FINISH_EDIT message while we
+    // are mid-destruction.
+    m_hwnd_title_edit = NULL;
+    RemoveWindowSubclass(hedit, title_edit_subclass_proc, 1);
+    DestroyWindow(hedit);
+
+    if (commit) {
+        if (newFormat != m_title_format) {
+            m_title_format = newFormat;
+            g_cfg_title_format.set(m_title_format);
+            m_analyzer.set_title_format(m_title_format.c_str());
+            // Re-analyze tracks to refresh every label.
+            OnRefresh(0, IDM_REFRESH, nullptr);
+        } else {
+            Invalidate();
+        }
+    } else {
+        Invalidate();
+    }
+}
+
+LRESULT SpectrumCompareWindow::OnFinishEditTitleFormat(
+    UINT uMsg, WPARAM wParam, LPARAM lParam, BOOL& bHandled)
+{
+    (void)uMsg; (void)lParam;
+    bHandled = TRUE;
+    end_inline_title_format_edit(wParam ? true : false);
+    return 0;
+}
+
+void SpectrumCompareWindow::OnLButtonDblClk(UINT nFlags, CPoint point) {
+    (void)nFlags; (void)point;
+    // Double-click anywhere in the panel opens the inline title-format editor.
+    begin_inline_title_format_edit();
+}
+
+void SpectrumCompareWindow::OnSetFocus(CWindow wndOld) {
+    (void)wndOld;
+    // If we own an active inline edit, forward focus to it rather than
+    // stealing focus back to the parent (which would trigger KILLFOCUS commit
+    // loops).
+    if (m_hwnd_title_edit != NULL && ::IsWindow(m_hwnd_title_edit)) {
+        SetFocus(m_hwnd_title_edit);
     }
 }
 
 void SpectrumCompareWindow::OnEditTitleFormat(UINT uNotifyCode, int nID, CWindow wndCtl) {
-    pfc::string8 newFormat = m_title_format;
-    if (showTitleFormatDialog(m_hWnd, newFormat)) {
-        m_title_format = newFormat;
-        g_cfg_title_format.set(m_title_format);
-        m_analyzer.set_title_format(m_title_format.c_str());
-        // Re-analyze all tracks to update labels
-        OnRefresh(0, IDM_REFRESH, nullptr);
-    }
+    (void)uNotifyCode; (void)nID; (void)wndCtl;
+    // Same as double-click: open the inline editor on the label area.
+    begin_inline_title_format_edit();
 }
 
 void SpectrumCompareWindow::OnResetTitleFormat(UINT uNotifyCode, int nID, CWindow wndCtl) {
+    (void)uNotifyCode; (void)nID; (void)wndCtl;
+    // If the inline editor is currently open, close & discard first so the
+    // user isn't left looking at stale, uncommitted text on top of the reset.
+    if (m_hwnd_title_edit != NULL) {
+        end_inline_title_format_edit(false);
+    }
     m_title_format = DEFAULT_TITLE_FORMAT;
     g_cfg_title_format.set(m_title_format);
     m_analyzer.set_title_format(m_title_format.c_str());
@@ -947,13 +986,19 @@ void SpectrumCompareWindow::OnResetTitleFormat(UINT uNotifyCode, int nID, CWindo
 // ============================================================
 
 namespace {
-    // Custom ui_element_impl without KFlagHavePopupCommand to avoid foobar2000's
-    // built-in context menu (export settings, etc.) on the panel title bar.
+    // Custom ui_element_impl: enable KFlagHavePopupCommand so foobar2000's UI
+    // backend generates a menu entry under View → Utility that activates /
+    // pops up the panel. KFlagPopupCommandHidden makes this entry hidden by
+    // default; users must hold Shift while opening the menu to see it.
     class ui_element_spectrum_compare :
         public ui_element_impl<ImplementBumpableElem<SpectrumCompareWindow>, ui_element_v2>
     {
     public:
-        t_uint32 get_flags() override { return ui_element_v2::KFlagSupportsBump; }
+        t_uint32 get_flags() override {
+            return ui_element_v2::KFlagHavePopupCommand
+                 | ui_element_v2::KFlagPopupCommandHidden
+                 | ui_element_v2::KFlagSupportsBump;
+        }
         bool bump() override { return ImplementBumpableElem<SpectrumCompareWindow>::Bump(); }
     };
     static service_factory_single_t<ui_element_spectrum_compare> g_spectrum_compare_factory;

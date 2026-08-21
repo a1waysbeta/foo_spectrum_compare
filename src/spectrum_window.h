@@ -113,7 +113,10 @@ public:
         MSG_WM_SIZE(OnSize)
         MSG_WM_CONTEXTMENU(OnContextMenu)
         MSG_WM_TIMER(OnTimer)
+        MSG_WM_LBUTTONDBLCLK(OnLButtonDblClk)
+        MSG_WM_SETFOCUS(OnSetFocus)
         MESSAGE_HANDLER(WM_SPECTRUM_READY, OnSpectrumReady)
+        MESSAGE_HANDLER(WM_FINISH_EDIT_TITLE_FORMAT, OnFinishEditTitleFormat)
         COMMAND_ID_HANDLER_EX(IDM_SET_COUNT_1, OnSetCount)
         COMMAND_ID_HANDLER_EX(IDM_SET_COUNT_2, OnSetCount)
         COMMAND_ID_HANDLER_EX(IDM_SET_COUNT_3, OnSetCount)
@@ -137,6 +140,8 @@ private:
     void OnSize(UINT nType, CSize size);
     void OnContextMenu(CWindow wnd, CPoint point);
     void OnTimer(UINT_PTR nIDEvent);
+    void OnLButtonDblClk(UINT nFlags, CPoint point);
+    void OnSetFocus(CWindow wndOld);
 
     void OnSetCount(UINT uNotifyCode, int nID, CWindow wndCtl);
     void OnRefresh(UINT uNotifyCode, int nID, CWindow wndCtl);
@@ -145,6 +150,13 @@ private:
     void OnToggleTimeAxis(UINT uNotifyCode, int nID, CWindow wndCtl);
     void OnEditTitleFormat(UINT uNotifyCode, int nID, CWindow wndCtl);
     void OnResetTitleFormat(UINT uNotifyCode, int nID, CWindow wndCtl);
+
+    // Inline title-format editing helpers.
+    void begin_inline_title_format_edit();
+    void end_inline_title_format_edit(bool commit);
+    static LRESULT CALLBACK title_edit_subclass_proc(
+        HWND hWnd, UINT uMsg, WPARAM wParam, LPARAM lParam,
+        UINT_PTR uIdSubclass, DWORD_PTR dwRefData);
 
     // Spectrum rendering
     void render_spectrum(CDCHandle dc, const RECT& rc, const SpectrumData& data);
@@ -173,8 +185,17 @@ private:
 
     SpectrumAnalyzer m_analyzer;
 
+    // Cached system DPI so rendering helpers don't need to call GetDC repeatedly.
+    int m_dpi = 96;
+
+    // Inline edit control for title format (double-click / context menu).
+    HWND m_hwnd_title_edit = NULL;
+
     static const UINT_PTR TIMER_REPAINT = 1;
     static const UINT WM_SPECTRUM_READY = WM_USER + 100;
+    static const UINT WM_FINISH_EDIT_TITLE_FORMAT = WM_USER + 101;
+    static const UINT_PTR IDC_INLINE_TITLE_EDIT = 2001;
 
     LRESULT OnSpectrumReady(UINT uMsg, WPARAM wParam, LPARAM lParam, BOOL& bHandled);
+    LRESULT OnFinishEditTitleFormat(UINT uMsg, WPARAM wParam, LPARAM lParam, BOOL& bHandled);
 };
