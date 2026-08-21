@@ -42,7 +42,7 @@ SpectrumCompareWindow::~SpectrumCompareWindow() {
     // doesn't fire on a half-destroyed window.
     if (m_hwnd_title_edit != NULL) {
         RemoveWindowSubclass(m_hwnd_title_edit, title_edit_subclass_proc, 1);
-        DestroyWindow(m_hwnd_title_edit);
+        ::DestroyWindow(m_hwnd_title_edit);
         m_hwnd_title_edit = NULL;
     }
 
@@ -828,7 +828,7 @@ void SpectrumCompareWindow::begin_inline_title_format_edit() {
     if (m_hWnd == NULL) return;
     if (m_hwnd_title_edit != NULL) {
         // Already editing: refocus and select all.
-        SetFocus(m_hwnd_title_edit);
+        ::SetFocus(m_hwnd_title_edit);
         SendMessage(m_hwnd_title_edit, EM_SETSEL, 0, -1);
         return;
     }
@@ -893,13 +893,13 @@ void SpectrumCompareWindow::begin_inline_title_format_edit() {
     SendMessage(hedit, WM_SETFONT, (WPARAM)hFont, TRUE);
 
     pfc::stringcvt::string_wide_from_utf8 wtext(m_title_format.get_ptr());
-    SetWindowTextW(hedit, wtext);
+    ::SetWindowTextW(hedit, wtext);
     SendMessage(hedit, EM_SETSEL, 0, -1);
 
     // Install subclass to trap Enter/Esc/lose-focus.
     SetWindowSubclass(hedit, title_edit_subclass_proc, 1, (DWORD_PTR)this);
     m_hwnd_title_edit = hedit;
-    SetFocus(hedit);
+    ::SetFocus(hedit);
 }
 
 void SpectrumCompareWindow::end_inline_title_format_edit(bool commit) {
@@ -908,10 +908,10 @@ void SpectrumCompareWindow::end_inline_title_format_edit(bool commit) {
 
     pfc::string8 newFormat;
     if (commit) {
-        int len = GetWindowTextLengthW(hedit);
+        int len = ::GetWindowTextLengthW(hedit);
         pfc::array_t<wchar_t> buf;
         buf.set_size(len + 1);
-        GetWindowTextW(hedit, buf.get_ptr(), (int)buf.get_size());
+        ::GetWindowTextW(hedit, buf.get_ptr(), (int)buf.get_size());
         newFormat = pfc::stringcvt::string_utf8_from_wide(buf.get_ptr());
     }
 
@@ -920,7 +920,7 @@ void SpectrumCompareWindow::end_inline_title_format_edit(bool commit) {
     // are mid-destruction.
     m_hwnd_title_edit = NULL;
     RemoveWindowSubclass(hedit, title_edit_subclass_proc, 1);
-    DestroyWindow(hedit);
+    ::DestroyWindow(hedit);
 
     if (commit) {
         if (newFormat != m_title_format) {
@@ -958,7 +958,7 @@ void SpectrumCompareWindow::OnSetFocus(CWindow wndOld) {
     // stealing focus back to the parent (which would trigger KILLFOCUS commit
     // loops).
     if (m_hwnd_title_edit != NULL && ::IsWindow(m_hwnd_title_edit)) {
-        SetFocus(m_hwnd_title_edit);
+        ::SetFocus(m_hwnd_title_edit);
     }
 }
 
