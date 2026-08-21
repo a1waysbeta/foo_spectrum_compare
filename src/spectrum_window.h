@@ -113,7 +113,6 @@ public:
         MSG_WM_SIZE(OnSize)
         MSG_WM_CONTEXTMENU(OnContextMenu)
         MSG_WM_TIMER(OnTimer)
-        MSG_WM_LBUTTONDBLCLK(OnLButtonDblClk)
         MSG_WM_SETFOCUS(OnSetFocus)
         MESSAGE_HANDLER(WM_SPECTRUM_READY, OnSpectrumReady)
         MESSAGE_HANDLER(WM_FINISH_EDIT_TITLE_FORMAT, OnFinishEditTitleFormat)
@@ -140,7 +139,6 @@ private:
     void OnSize(UINT nType, CSize size);
     void OnContextMenu(CWindow wnd, CPoint point);
     void OnTimer(UINT_PTR nIDEvent);
-    void OnLButtonDblClk(UINT nFlags, CPoint point);
     void OnSetFocus(CWindow wndOld);
 
     void OnSetCount(UINT uNotifyCode, int nID, CWindow wndCtl);
@@ -151,7 +149,7 @@ private:
     void OnEditTitleFormat(UINT uNotifyCode, int nID, CWindow wndCtl);
     void OnResetTitleFormat(UINT uNotifyCode, int nID, CWindow wndCtl);
 
-    // Inline title-format editing helpers.
+    // Inline title-format editing helpers (right-click menu entry only).
     void begin_inline_title_format_edit();
     void end_inline_title_format_edit(bool commit);
     static LRESULT CALLBACK title_edit_subclass_proc(
@@ -188,8 +186,11 @@ private:
     // Cached system DPI so rendering helpers don't need to call GetDC repeatedly.
     int m_dpi = 96;
 
-    // Inline edit control for title format (double-click / context menu).
+    // Inline edit control for title format (right-click menu -> Edit format...).
     HWND m_hwnd_title_edit = NULL;
+
+    // Guard against double-finish when Enter/Esc and WM_KILLFOCUS race.
+    bool m_edit_finish_pending = false;
 
     static const UINT_PTR TIMER_REPAINT = 1;
     static const UINT WM_SPECTRUM_READY = WM_USER + 100;

@@ -773,19 +773,17 @@ void SpectrumCompareWindow::OnToggleTimeAxis(UINT uNotifyCode, int nID, CWindow 
 }
 
 // ============================================================
-// Inline title-format editing
+// Inline title-format editing (right-click menu only)
 // ------------------------------------------------------------
-// The "Edit format..." context menu entry historically used an in-memory
-// DLGTEMPLATE + DialogBoxIndirectParamW, which is very brittle and commonly
-// fails to show up because of subtle template layout / font issues.
-//
-// Replacement (per user request, "simpler approach that works"):
-//   * Double-click anywhere on the panel OR pick "Edit format..." from the
-//     context menu -> spawn a single-line EDIT control over the panel using
-//     the SAME layout rectangle as the first track's title label.
+// Entry point: right-click -> Title format -> Edit format...
+// Double-click was intentionally removed at user request so only the
+// explicit menu path creates the editor.
 //   * Enter -> commit; Esc -> discard; losing focus -> commit.
-//   * After commit we refresh the tracks so the new titleformat string is
-//     reflected in every label.
+//   * Enter/Esc is captured at BOTH the WM_KEYDOWN and WM_CHAR levels so
+//     message preprocessing / translation differences across foobar2000
+//     window host implementations can't drop the keystroke.
+//   * A per-instance `m_edit_finish_pending` flag turns the key capture and
+//     the subsequent WM_KILLFOCUS into a single finish action.
 // ============================================================
 
 LRESULT CALLBACK SpectrumCompareWindow::title_edit_subclass_proc(
@@ -796,29 +794,46 @@ LRESULT CALLBACK SpectrumCompareWindow::title_edit_subclass_proc(
     SpectrumCompareWindow* self = (SpectrumCompareWindow*)dwRefData;
 
     switch (uMsg) {
-    case WM_CHAR:
-        if (wParam == VK_RETURN) {
-            // Commit. Avoid ending inline during the keystroke itself; post
-            // a message so the edit control can process the key state cleanly.
-            self->PostMessage(WM_FINISH_EDIT_TITLE_FORMAT, TRUE, 0);
-            return 0;
+    case WM_KEYDOWN:
+    case WM_CHAR: {
+        bool commit = false;
+        bool cancel = false;
+        if (uMsg == WM_KEYDOWN) {
+            if (wParam == VK_RETURN) commit = true;
+            else if (wParam == VK_ESCAPE) cancel = true;
+        } else { // WM_CHAR
+            if (wParam == VK_RETURN) commit = true;
+            else if (wParam == VK_ESCAPE) cancel = true;
         }
-        if (wParam == VK_ESCAPE) {
-            self->PostMessage(WM_FINISH_EDIT_TITLE_FORMAT, FALSE, 0);
+        if (commit || cancel) {
+            if (self != NULL && !self->m_edit_finish_pending
+                && self->m_hwnd_title_edit == hWnd)
+            {
+                self->m_edit_finish_pending = true;
+                self->PostMessage(
+                    WM_FINISH_EDIT_TITLE_FORMAT, commit ? TRUE : FALSE, 0);
+            }
+            // Do NOT call DefSubclassProc for these keys. We don't want the
+            // EDIT to beep on Enter (ES_WANTRETURN is off by default) and we
+            // definitely don't want Esc to be re-processed after we've asked
+            // for the control to be torn down.
             return 0;
         }
         break;
-    case WM_KILLFOCUS:
-        // If the window is still alive and focus is leaving to someone else,
-        // commit what the user typed. Skip when we are already in the middle
-        // of destroying the edit (m_hwnd_title_edit being cleared).
-        if (self->m_hwnd_title_edit == hWnd && (HWND)wParam != hWnd) {
+    }
+    case WM_KILLFOCUS: {
+        HWND newFocus = (HWND)wParam;
+        if (self != NULL && self->m_hwnd_title_edit == hWnd
+            && !self->m_edit_finish_pending && newFocus != hWnd)
+        {
+            self->m_edit_finish_pending = true;
             self->PostMessage(WM_FINISH_EDIT_TITLE_FORMAT, TRUE, 0);
         }
         break;
+    }
     case WM_NCDESTROY:
         // Must remove the subclass before the HWND goes away.
-        RemoveWindowSubclass(hWnd, title_edit_subclass_proc, 1);
+        ::RemoveWindowSubclass(hWnd, title_edit_subclass_proc, 1);
         break;
     }
     return DefSubclassProc(hWnd, uMsg, wParam, lParam);
@@ -845,8 +860,7 @@ void SpectrumCompareWindow::begin_inline_title_format_edit() {
     const int label_height = scale(22);
     const int freq_axis_width = m_show_freq_axis ? scale(48) : 0;
     const int time_axis_height = m_show_time_axis ? scale(20) : 0;
-    // Track size mirror of OnPaint. If the track list is empty we still want
-    // an editing surface, so approximate with a single full-height track.
+
     int track_count = 0;
     {
         std::lock_guard<std::mutex> lock(m_tracks_mutex);
@@ -857,16 +871,13 @@ void SpectrumCompareWindow::begin_inline_title_format_edit() {
     int total_track_gap = track_gap * (track_count - 1);
     int available_height = rc.Height() - 2 * padding_outer - total_track_gap;
     int track_height = available_height / track_count;
-    if (track_height < label_height + time_axis_height + scale(20)) {
-        track_height = label_height + time_axis_height + scale(20);
-    }
+    const int min_track_height = label_height + time_axis_height + scale(20);
+    if (track_height < min_track_height) track_height = min_track_height;
 
     int track_left = rc.left + padding_outer;
     int track_right = rc.right - padding_outer;
     int y = rc.top + padding_outer;
     int spec_left = track_left + freq_axis_width;
-    // Keep the label within the panel (freq_axis_width may make spec_left too
-    // narrow on very small windows).
     if (spec_left >= track_right) spec_left = track_left;
 
     CRect edit_rc(spec_left, y, track_right, y + label_height);
@@ -887,7 +898,6 @@ void SpectrumCompareWindow::begin_inline_title_format_edit() {
     );
     if (hedit == NULL) return;
 
-    // Use the same font the panel uses for its labels so sizing matches.
     HFONT hFont = (HFONT)m_callback->query_font_ex(ui_font_default);
     if (hFont == NULL) hFont = (HFONT)GetStockObject(DEFAULT_GUI_FONT);
     SendMessage(hedit, WM_SETFONT, (WPARAM)hFont, TRUE);
@@ -896,14 +906,17 @@ void SpectrumCompareWindow::begin_inline_title_format_edit() {
     ::SetWindowTextW(hedit, wtext);
     SendMessage(hedit, EM_SETSEL, 0, -1);
 
-    // Install subclass to trap Enter/Esc/lose-focus.
-    SetWindowSubclass(hedit, title_edit_subclass_proc, 1, (DWORD_PTR)this);
+    m_edit_finish_pending = false;
+    ::SetWindowSubclass(hedit, title_edit_subclass_proc, 1, (DWORD_PTR)this);
     m_hwnd_title_edit = hedit;
     ::SetFocus(hedit);
 }
 
 void SpectrumCompareWindow::end_inline_title_format_edit(bool commit) {
-    if (m_hwnd_title_edit == NULL) return;
+    if (m_hwnd_title_edit == NULL) {
+        m_edit_finish_pending = false;
+        return;
+    }
     HWND hedit = m_hwnd_title_edit;
 
     pfc::string8 newFormat;
@@ -915,11 +928,13 @@ void SpectrumCompareWindow::end_inline_title_format_edit(bool commit) {
         newFormat = pfc::stringcvt::string_utf8_from_wide(buf.get_ptr());
     }
 
-    // Remove subclass + destroy in a defined order to avoid re-entrance from
-    // the WM_KILLFOCUS handler posting another FINISH_EDIT message while we
-    // are mid-destruction.
+    // Tear down in a defined order. Setting m_hwnd_title_edit to NULL first
+    // stops the KILLFOCUS path in the subclass from firing re-entrantly, and
+    // the separate pending-flag means WM_KILLFOCUS + a key handler in flight
+    // can't cause double-teardown either.
     m_hwnd_title_edit = NULL;
-    RemoveWindowSubclass(hedit, title_edit_subclass_proc, 1);
+    m_edit_finish_pending = false;
+    ::RemoveWindowSubclass(hedit, title_edit_subclass_proc, 1);
     ::DestroyWindow(hedit);
 
     if (commit) {
@@ -927,7 +942,6 @@ void SpectrumCompareWindow::end_inline_title_format_edit(bool commit) {
             m_title_format = newFormat;
             g_cfg_title_format.set(m_title_format);
             m_analyzer.set_title_format(m_title_format.c_str());
-            // Re-analyze tracks to refresh every label.
             OnRefresh(0, IDM_REFRESH, nullptr);
         } else {
             Invalidate();
@@ -946,17 +960,11 @@ LRESULT SpectrumCompareWindow::OnFinishEditTitleFormat(
     return 0;
 }
 
-void SpectrumCompareWindow::OnLButtonDblClk(UINT nFlags, CPoint point) {
-    (void)nFlags; (void)point;
-    // Double-click anywhere in the panel opens the inline title-format editor.
-    begin_inline_title_format_edit();
-}
-
 void SpectrumCompareWindow::OnSetFocus(CWindow wndOld) {
     (void)wndOld;
-    // If we own an active inline edit, forward focus to it rather than
-    // stealing focus back to the parent (which would trigger KILLFOCUS commit
-    // loops).
+    // If an inline editor is alive, forward focus to it. This also avoids a
+    // WM_KILLFOCUS -> commit cascade when foobar2000's host re-focuses the
+    // parent panel during a layout pass.
     if (m_hwnd_title_edit != NULL && ::IsWindow(m_hwnd_title_edit)) {
         ::SetFocus(m_hwnd_title_edit);
     }
@@ -964,14 +972,13 @@ void SpectrumCompareWindow::OnSetFocus(CWindow wndOld) {
 
 void SpectrumCompareWindow::OnEditTitleFormat(UINT uNotifyCode, int nID, CWindow wndCtl) {
     (void)uNotifyCode; (void)nID; (void)wndCtl;
-    // Same as double-click: open the inline editor on the label area.
     begin_inline_title_format_edit();
 }
 
 void SpectrumCompareWindow::OnResetTitleFormat(UINT uNotifyCode, int nID, CWindow wndCtl) {
     (void)uNotifyCode; (void)nID; (void)wndCtl;
-    // If the inline editor is currently open, close & discard first so the
-    // user isn't left looking at stale, uncommitted text on top of the reset.
+    // Close any open inline editor first (discard its text) so uncommitted
+    // edits never appear to outlive a "reset to default" action.
     if (m_hwnd_title_edit != NULL) {
         end_inline_title_format_edit(false);
     }
