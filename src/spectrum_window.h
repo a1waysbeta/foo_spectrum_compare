@@ -115,7 +115,6 @@ public:
         MSG_WM_TIMER(OnTimer)
         MSG_WM_SETFOCUS(OnSetFocus)
         MESSAGE_HANDLER(WM_SPECTRUM_READY, OnSpectrumReady)
-        MESSAGE_HANDLER(WM_FINISH_EDIT_TITLE_FORMAT, OnFinishEditTitleFormat)
         COMMAND_ID_HANDLER_EX(IDM_SET_COUNT_1, OnSetCount)
         COMMAND_ID_HANDLER_EX(IDM_SET_COUNT_2, OnSetCount)
         COMMAND_ID_HANDLER_EX(IDM_SET_COUNT_3, OnSetCount)
@@ -156,6 +155,13 @@ private:
         HWND hWnd, UINT uMsg, WPARAM wParam, LPARAM lParam,
         UINT_PTR uIdSubclass, DWORD_PTR dwRefData);
 
+    // Parent (popup host) subclass to suppress the "Export settings" etc.
+    // items that foobar2000's popup host adds to the system menu.
+    void subclass_parent_window();
+    static LRESULT CALLBACK parent_subclass_proc(
+        HWND hWnd, UINT uMsg, WPARAM wParam, LPARAM lParam,
+        UINT_PTR uIdSubclass, DWORD_PTR dwRefData);
+
     // Spectrum rendering
     void render_spectrum(CDCHandle dc, const RECT& rc, const SpectrumData& data);
     void render_track_label(CDCHandle dc, const RECT& rc, const TrackSpectrum& track);
@@ -191,12 +197,16 @@ private:
 
     // Guard against double-finish when Enter/Esc and WM_KILLFOCUS race.
     bool m_edit_finish_pending = false;
+    bool m_edit_commit = false;
+
+    // Parent (popup host) window handle — subclassed to clean its system menu.
+    HWND m_hwnd_parent = NULL;
 
     static const UINT_PTR TIMER_REPAINT = 1;
+    static const UINT_PTR TIMER_END_EDIT = 2;
     static const UINT WM_SPECTRUM_READY = WM_USER + 100;
-    static const UINT WM_FINISH_EDIT_TITLE_FORMAT = WM_USER + 101;
     static const UINT_PTR IDC_INLINE_TITLE_EDIT = 2001;
+    static const UINT_PTR IDC_PARENT_SUBCLASS = 3;
 
     LRESULT OnSpectrumReady(UINT uMsg, WPARAM wParam, LPARAM lParam, BOOL& bHandled);
-    LRESULT OnFinishEditTitleFormat(UINT uMsg, WPARAM wParam, LPARAM lParam, BOOL& bHandled);
 };

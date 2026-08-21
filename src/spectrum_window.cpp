@@ -41,9 +41,15 @@ SpectrumCompareWindow::~SpectrumCompareWindow() {
     // Destroy any lingering inline edit control so its subclass callback
     // doesn't fire on a half-destroyed window.
     if (m_hwnd_title_edit != NULL) {
-        RemoveWindowSubclass(m_hwnd_title_edit, title_edit_subclass_proc, 1);
+        ::RemoveWindowSubclass(m_hwnd_title_edit, title_edit_subclass_proc, 1);
         ::DestroyWindow(m_hwnd_title_edit);
         m_hwnd_title_edit = NULL;
+    }
+
+    // Remove the parent (popup host) subclass.
+    if (m_hwnd_parent != NULL && ::IsWindow(m_hwnd_parent)) {
+        ::RemoveWindowSubclass(m_hwnd_parent, parent_subclass_proc, IDC_PARENT_SUBCLASS);
+        m_hwnd_parent = NULL;
     }
 
     // Abort all in-flight analyses so worker threads exit promptly.
@@ -56,8 +62,11 @@ SpectrumCompareWindow::~SpectrumCompareWindow() {
         }
     }
 
-    // Stop timer
-    if (m_hWnd) KillTimer(TIMER_REPAINT);
+    // Stop timers
+    if (m_hWnd) {
+        KillTimer(TIMER_REPAINT);
+        KillTimer(TIMER_END_EDIT);
+    }
 
     // Unregister playlist callback
     try {
@@ -93,6 +102,10 @@ void SpectrumCompareWindow::initialize_window(HWND parent) {
 
     // Start repaint timer for progressive rendering
     SetTimer(TIMER_REPAINT, 200, NULL);
+
+    // Subclass the popup host (parent) window to strip "Export settings" etc.
+    // from its system menu. This runs after Create(parent) so m_hWnd is valid.
+    subclass_parent_window();
 
     // Initial selection update
     update_selection();
@@ -602,6 +615,18 @@ void SpectrumCompareWindow::OnSize(UINT nType, CSize size) {
 }
 
 void SpectrumCompareWindow::OnTimer(UINT_PTR nIDEvent) {
+    if (nIDEvent == TIMER_END_EDIT) {
+        // Fire-and-forget timer: the subclass proc set m_edit_commit and
+        // started this timer to defer end_inline_title_format_edit() out of
+        // the EDIT control's own message processing. Using WM_TIMER (instead
+        // of PostMessage with WM_USER) guarantees delivery because WM_TIMER
+        // always goes through the standard DispatchMessage path.
+        KillTimer(TIMER_END_EDIT);
+        bool commit = m_edit_commit;
+        m_edit_finish_pending = false;
+        end_inline_title_format_edit(commit);
+        return;
+    }
     if (nIDEvent == TIMER_REPAINT) {
         // Check if any track needs repaint
         bool need = false;
@@ -810,8 +835,13 @@ LRESULT CALLBACK SpectrumCompareWindow::title_edit_subclass_proc(
                 && self->m_hwnd_title_edit == hWnd)
             {
                 self->m_edit_finish_pending = true;
-                self->PostMessage(
-                    WM_FINISH_EDIT_TITLE_FORMAT, commit ? TRUE : FALSE, 0);
+                self->m_edit_commit = commit;
+                // Use a timer instead of PostMessage to avoid the foobar2000
+                // host's pretranslate_message layer intercepting WM_USER
+                // messages (which is why Enter previously did nothing).
+                // WM_TIMER goes through the standard dispatch path and is
+                // already in the message map.
+                self->SetTimer(self->TIMER_END_EDIT, 10, nullptr);
             }
             // Do NOT call DefSubclassProc for these keys. We don't want the
             // EDIT to beep on Enter (ES_WANTRETURN is off by default) and we
@@ -827,7 +857,8 @@ LRESULT CALLBACK SpectrumCompareWindow::title_edit_subclass_proc(
             && !self->m_edit_finish_pending && newFocus != hWnd)
         {
             self->m_edit_finish_pending = true;
-            self->PostMessage(WM_FINISH_EDIT_TITLE_FORMAT, TRUE, 0);
+            self->m_edit_commit = true; // commit on focus loss
+            self->SetTimer(self->TIMER_END_EDIT, 10, nullptr);
         }
         break;
     }
@@ -951,15 +982,6 @@ void SpectrumCompareWindow::end_inline_title_format_edit(bool commit) {
     }
 }
 
-LRESULT SpectrumCompareWindow::OnFinishEditTitleFormat(
-    UINT uMsg, WPARAM wParam, LPARAM lParam, BOOL& bHandled)
-{
-    (void)uMsg; (void)lParam;
-    bHandled = TRUE;
-    end_inline_title_format_edit(wParam ? true : false);
-    return 0;
-}
-
 void SpectrumCompareWindow::OnSetFocus(CWindow wndOld) {
     (void)wndOld;
     // If an inline editor is alive, forward focus to it. This also avoids a
@@ -989,6 +1011,70 @@ void SpectrumCompareWindow::OnResetTitleFormat(UINT uNotifyCode, int nID, CWindo
 }
 
 // ============================================================
+// Parent (popup host) subclass
+// ------------------------------------------------------------
+// When KFlagHavePopupCommand is set, foobar2000 wraps our element in a
+// popup host window. That host adds "Export settings", "Configure" etc.
+// to the system menu (title bar right-click). We subclass the parent
+// to intercept WM_INITMENUPOPUP and strip non-standard items so the
+// title bar right-click only shows Move / Size / Close etc.
+// ============================================================
+
+void SpectrumCompareWindow::subclass_parent_window() {
+    if (m_hWnd == NULL) return;
+    HWND parent = ::GetParent(m_hWnd);
+    if (parent == NULL || parent == m_hWnd) return;
+
+    // Avoid double-subclassing if initialize_window is called again.
+    if (m_hwnd_parent == parent) return;
+
+    // If we previously subclassed a different parent, clean it up.
+    if (m_hwnd_parent != NULL && ::IsWindow(m_hwnd_parent)) {
+        ::RemoveWindowSubclass(m_hwnd_parent, parent_subclass_proc, IDC_PARENT_SUBCLASS);
+    }
+
+    m_hwnd_parent = parent;
+    ::SetWindowSubclass(parent, parent_subclass_proc, IDC_PARENT_SUBCLASS, (DWORD_PTR)this);
+}
+
+LRESULT CALLBACK SpectrumCompareWindow::parent_subclass_proc(
+    HWND hWnd, UINT uMsg, WPARAM wParam, LPARAM lParam,
+    UINT_PTR uIdSubclass, DWORD_PTR dwRefData)
+{
+    (void)uIdSubclass;
+    SpectrumCompareWindow* self = (SpectrumCompareWindow*)dwRefData;
+
+    switch (uMsg) {
+    case WM_INITMENUPOPUP: {
+        HMENU menu = (HMENU)wParam;
+        BOOL is_sys_menu = (BOOL)HIWORD(lParam);
+        if (is_sys_menu && menu != NULL) {
+            // Walk the menu backwards and remove every item whose ID is NOT
+            // one of the standard system menu commands.  foobar2000's popup
+            // host inserts "Export settings", "Configure" etc. with custom IDs
+            // outside the SC_* range (0xF000+).
+            int count = ::GetMenuItemCount(menu);
+            for (int i = count - 1; i >= 0; --i) {
+                UINT id = ::GetMenuItemID(menu, i);
+                // 0xFFFFFFFF = submenu placeholder or separator — keep.
+                if (id == 0xFFFFFFFF) continue;
+                // Keep only standard SC_* system menu items.
+                if (id >= 0xF000 && id <= 0xFFF0) continue;
+                ::DeleteMenu(menu, i, MF_BYPOSITION);
+            }
+        }
+        break;
+    }
+    case WM_NCDESTROY:
+        // Remove subclass before the HWND is destroyed.
+        ::RemoveWindowSubclass(hWnd, parent_subclass_proc, IDC_PARENT_SUBCLASS);
+        if (self != NULL) self->m_hwnd_parent = NULL;
+        break;
+    }
+    return ::DefSubclassProc(hWnd, uMsg, wParam, lParam);
+}
+
+// ============================================================
 // Component registration
 // ============================================================
 
@@ -997,6 +1083,8 @@ namespace {
     // backend generates a menu entry under View → Utility that activates /
     // pops up the panel. KFlagPopupCommandHidden makes this entry hidden by
     // default; users must hold Shift while opening the menu to see it.
+    // The popup host's system menu is cleaned up via subclass_parent_window()
+    // to remove "Export settings" etc. that the host adds by default.
     class ui_element_spectrum_compare :
         public ui_element_impl<ImplementBumpableElem<SpectrumCompareWindow>, ui_element_v2>
     {
