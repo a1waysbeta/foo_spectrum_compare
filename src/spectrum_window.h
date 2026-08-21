@@ -28,6 +28,7 @@ struct TrackSpectrum {
     SpectrumData data;
     std::atomic<bool> analyzing{ false };
     std::atomic<bool> needs_repaint{ false };
+    abort_callback_impl abort; // per-track abort, triggered when track is removed or component shuts down
 };
 
 // Main UI element window
@@ -115,7 +116,7 @@ private:
     // Selection management
     void update_selection();
     void start_analysis_for_track(size_t index);
-    void analysis_worker(size_t index, metadb_handle_ptr handle);
+    void analysis_worker(metadb_handle_ptr handle, std::shared_ptr<TrackSpectrum> target);
 
     // Config
     int m_max_tracks = 4;
@@ -124,7 +125,7 @@ private:
     ui_element_config::ptr m_config;
     const ui_element_instance_callback_ptr m_callback;
 
-    std::vector<std::unique_ptr<TrackSpectrum>> m_tracks;
+    std::vector<std::shared_ptr<TrackSpectrum>> m_tracks;
     std::mutex m_tracks_mutex;
     std::atomic<bool> m_shutdown{ false };
 

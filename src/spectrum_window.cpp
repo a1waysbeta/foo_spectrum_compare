@@ -15,6 +15,16 @@ SpectrumCompareWindow::SpectrumCompareWindow(
 SpectrumCompareWindow::~SpectrumCompareWindow() {
     m_shutdown = true;
 
+    // Abort all in-flight analyses so worker threads exit promptly.
+    {
+        std::lock_guard<std::mutex> lock(m_tracks_mutex);
+        for (auto& t : m_tracks) {
+            if (t->analyzing) {
+                try { t->abort.abort(); } catch (...) {}
+            }
+        }
+    }
+
     // Stop timer
     if (m_hWnd) KillTimer(TIMER_REPAINT);
 
@@ -23,9 +33,19 @@ SpectrumCompareWindow::~SpectrumCompareWindow() {
         static_api_ptr_t<playlist_manager>()->unregister_callback(this);
     } catch (...) {}
 
-    // Wait briefly for analysis threads to notice shutdown
-    // (they check m_shutdown and will exit early)
-    Sleep(50);
+    // Wait for analysis threads to notice abort and exit.
+    // analyze() catches abort_exception via catch(...) and marks analyzing=false.
+    for (int i = 0; i < 200; i++) {
+        bool any_running = false;
+        {
+            std::lock_guard<std::mutex> lock(m_tracks_mutex);
+            for (auto& t : m_tracks) {
+                if (t->analyzing) { any_running = true; break; }
+            }
+        }
+        if (!any_running) break;
+        Sleep(10);
+    }
 }
 
 void SpectrumCompareWindow::initialize_window(HWND parent) {
@@ -107,38 +127,63 @@ void SpectrumCompareWindow::update_selection() {
     metadb_handle_list selected;
     static_api_ptr_t<playlist_manager>()->activeplaylist_get_selected_items(selected);
 
-    std::lock_guard<std::mutex> lock(m_tracks_mutex);
-
     // Determine how many tracks to display
     size_t display_count = (std::min)((size_t)m_max_tracks, selected.get_size());
 
     // Build new track list, reusing existing data where possible
-    std::vector<std::unique_ptr<TrackSpectrum>> new_tracks;
+    std::vector<std::shared_ptr<TrackSpectrum>> new_tracks;
     for (size_t i = 0; i < display_count; i++) {
         auto handle = selected[i];
 
-        // Check if we already have this track analyzed
         bool found = false;
-        for (auto& existing : m_tracks) {
-            if (existing->handle == handle) {
-                new_tracks.push_back(std::move(existing));
-                found = true;
-                break;
+        {
+            std::lock_guard<std::mutex> lock(m_tracks_mutex);
+            for (auto& existing : m_tracks) {
+                if (existing->handle == handle) {
+                    new_tracks.push_back(existing);
+                    found = true;
+                    break;
+                }
             }
         }
 
         if (!found) {
-            auto track = std::make_unique<TrackSpectrum>();
+            auto track = std::make_shared<TrackSpectrum>();
             track->handle = handle;
-            new_tracks.push_back(std::move(track));
+            new_tracks.push_back(track);
         }
     }
 
-    m_tracks = std::move(new_tracks);
+    // Abort analysis for tracks that are no longer selected.
+    // The shared_ptr keeps the TrackSpectrum alive until the worker thread exits.
+    std::vector<std::shared_ptr<TrackSpectrum>> old_tracks;
+    {
+        std::lock_guard<std::mutex> lock(m_tracks_mutex);
+        old_tracks = std::move(m_tracks);
+        m_tracks = std::move(new_tracks);
+    }
 
-    // Start analysis for tracks that need it
+    // For each old track not in the new list, abort its analysis so the worker exits quickly.
+    for (auto& old_t : old_tracks) {
+        bool still_selected = false;
+        for (auto& new_t : m_tracks) {
+            if (new_t == old_t) { still_selected = true; break; }
+        }
+        if (!still_selected && old_t->analyzing) {
+            old_t->abort.abort();
+        }
+    }
+
+    // Start analysis for new tracks that need it (outside lock to avoid deadlock)
     for (size_t i = 0; i < m_tracks.size(); i++) {
-        if (!m_tracks[i]->data.ready && !m_tracks[i]->analyzing) {
+        bool need_start = false;
+        {
+            std::lock_guard<std::mutex> lock(m_tracks_mutex);
+            if (!m_tracks[i]->data.ready && !m_tracks[i]->analyzing) {
+                need_start = true;
+            }
+        }
+        if (need_start) {
             start_analysis_for_track(i);
         }
     }
@@ -147,37 +192,40 @@ void SpectrumCompareWindow::update_selection() {
 }
 
 void SpectrumCompareWindow::start_analysis_for_track(size_t index) {
-    if (index >= m_tracks.size()) return;
-    auto& track = m_tracks[index];
-    if (track->analyzing) return;
+    metadb_handle_ptr handle;
+    std::shared_ptr<TrackSpectrum> trackPtr;
+    {
+        std::lock_guard<std::mutex> lock(m_tracks_mutex);
+        if (index >= m_tracks.size()) return;
+        if (m_tracks[index]->analyzing) return;
+        m_tracks[index]->analyzing = true;
+        handle = m_tracks[index]->handle;
+        trackPtr = m_tracks[index];
+    }
 
-    track->analyzing = true;
-    metadb_handle_ptr handle = track->handle;
-
-    std::thread([this, index, handle]() {
-        analysis_worker(index, handle);
+    // Capture shared_ptr to keep the TrackSpectrum alive even if removed from m_tracks.
+    std::thread([this, handle, trackPtr]() {
+        analysis_worker(handle, trackPtr);
     }).detach();
 }
 
-void SpectrumCompareWindow::analysis_worker(size_t index, metadb_handle_ptr handle) {
+void SpectrumCompareWindow::analysis_worker(metadb_handle_ptr handle, std::shared_ptr<TrackSpectrum> target) {
     if (m_shutdown) return;
 
-    abort_callback_impl abort;
-
-    // Find the track in the list (it might have been moved)
-    TrackSpectrum* target = nullptr;
-    {
-        std::lock_guard<std::mutex> lock(m_tracks_mutex);
-        if (m_shutdown) return;
-        if (index < m_tracks.size() && m_tracks[index]->handle == handle) {
-            target = m_tracks[index].get();
-        }
-    }
-
-    if (!target || m_shutdown) return;
-
     SpectrumData data;
-    m_analyzer.analyze(handle, data, abort);
+    try {
+        m_analyzer.analyze(handle, data, target->abort);
+    } catch (...) {
+        // aborted or failed; mark as done so destructor/selection update can proceed
+        std::lock_guard<std::mutex> lock(m_tracks_mutex);
+        for (auto& t : m_tracks) {
+            if (t->handle == handle) {
+                t->analyzing = false;
+                break;
+            }
+        }
+        return;
+    }
 
     if (m_shutdown) return;
 
@@ -476,12 +524,48 @@ void SpectrumCompareWindow::OnSetCount(UINT uNotifyCode, int nID, CWindow wndCtl
 }
 
 void SpectrumCompareWindow::OnRefresh(UINT uNotifyCode, int nID, CWindow wndCtl) {
-    std::lock_guard<std::mutex> lock(m_tracks_mutex);
-    for (auto& t : m_tracks) {
-        t->data.ready = false;
-        t->data.error = false;
+    // Mark all tracks as needing re-analysis
+    {
+        std::lock_guard<std::mutex> lock(m_tracks_mutex);
+        for (auto& t : m_tracks) {
+            // Abort any in-flight analysis so we can restart
+            if (t->analyzing) {
+                try { t->abort.abort(); } catch (...) {}
+            }
+            t->data.ready = false;
+            t->data.error = false;
+        }
     }
-    for (size_t i = 0; i < m_tracks.size(); i++) {
+    // Brief wait for in-flight threads to observe abort and mark analyzing=false.
+    // Then reset the abort state by creating new TrackSpectrum entries is overkill;
+    // instead we just wait for analyzing to clear.
+    for (int i = 0; i < 100; i++) {
+        bool any_running = false;
+        {
+            std::lock_guard<std::mutex> lock(m_tracks_mutex);
+            for (auto& t : m_tracks) {
+                if (t->analyzing) { any_running = true; break; }
+            }
+        }
+        if (!any_running) break;
+        Sleep(10);
+    }
+    // Now we cannot reuse the aborted abort_callback_impl (it's permanently aborted).
+    // Rebuild the track list with fresh TrackSpectrum objects so abort state is clean.
+    {
+        std::lock_guard<std::mutex> lock(m_tracks_mutex);
+        std::vector<std::shared_ptr<TrackSpectrum>> fresh;
+        for (auto& t : m_tracks) {
+            auto nt = std::make_shared<TrackSpectrum>();
+            nt->handle = t->handle;
+            // Preserve already-loaded data? No, refresh means re-analyze.
+            fresh.push_back(nt);
+        }
+        m_tracks = std::move(fresh);
+    }
+    // Start analysis (outside lock; start_analysis_for_track takes the lock itself)
+    size_t n = m_tracks.size();
+    for (size_t i = 0; i < n; i++) {
         start_analysis_for_track(i);
     }
     Invalidate();

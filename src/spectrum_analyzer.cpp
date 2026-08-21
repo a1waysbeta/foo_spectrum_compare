@@ -38,28 +38,43 @@ void SpectrumAnalyzer::apply_window(float* data, int n, window_function_t w) {
 bool SpectrumAnalyzer::analyze(metadb_handle_ptr track, SpectrumData& out, abort_callback& abort) {
     out.ready = false;
     out.error = false;
-    out.track_path = track->get_path();
 
-    // Get track info
+    // Capture path string immediately (the pointer from get_path() may be invalidated)
+    pfc::string8 pathStr = track->get_path();
+    out.track_path = pathStr.c_str();
+
+    // Get track info (get_info_async is safe across threads, locks metadb temporarily)
     file_info_impl info;
-    if (track->get_info_async(info)) {
+    bool got_info = false;
+    try {
+        got_info = track->get_info_async(info);
+    } catch (...) {
+        got_info = false;
+    }
+
+    if (got_info) {
         out.sample_rate = (int)info.info_get_int("samplerate");
         out.channels = (int)info.info_get_int("channels");
         out.duration = info.get_length();
     }
 
-    // Get title (format_title requires pfc::string_base&, not std::string)
+    // Get title using format_title_from_external_info with already-fetched info
+    // This avoids locking issues that format_title() may have across threads
     try {
         titleformat_hook* hook = NULL;
         service_ptr_t<titleformat_object> obj;
         static_api_ptr_t<titleformat_compiler>()->compile_safe(obj, "%title%");
         pfc::string8 title_tmp;
-        track->format_title(hook, title_tmp, obj, NULL);
+        if (got_info) {
+            track->format_title_from_external_info(info, hook, title_tmp, obj, NULL);
+        } else {
+            track->format_title(hook, title_tmp, obj, NULL);
+        }
         out.title = title_tmp.c_str();
     } catch (...) {
-        out.title = track->get_path();
+        out.title = pathStr.c_str();
     }
-    if (out.title.empty()) out.title = track->get_path();
+    if (out.title.empty()) out.title = pathStr.c_str();
 
     try {
         const t_uint32 decode_flags = input_flag_no_seeking | input_flag_no_looping;
