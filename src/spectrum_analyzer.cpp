@@ -43,17 +43,19 @@ bool SpectrumAnalyzer::analyze(metadb_handle_ptr track, SpectrumData& out, abort
     // Get track info
     file_info_impl info;
     if (track->get_info_async(info)) {
-        out.sample_rate = info.get_sample_rate();
-        out.channels = info.get_channels();
+        out.sample_rate = (int)info.info_get_int("samplerate");
+        out.channels = (int)info.info_get_int("channels");
         out.duration = info.get_length();
     }
 
-    // Get title
+    // Get title (format_title requires pfc::string_base&, not std::string)
     try {
         titleformat_hook* hook = NULL;
         service_ptr_t<titleformat_object> obj;
         static_api_ptr_t<titleformat_compiler>()->compile_safe(obj, "%title%");
-        track->format_title(hook, out.title, obj, NULL);
+        pfc::string8 title_tmp;
+        track->format_title(hook, title_tmp, obj, NULL);
+        out.title = title_tmp.c_str();
     } catch (...) {
         out.title = track->get_path();
     }

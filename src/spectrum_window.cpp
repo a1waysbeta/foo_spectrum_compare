@@ -110,7 +110,7 @@ void SpectrumCompareWindow::update_selection() {
     std::lock_guard<std::mutex> lock(m_tracks_mutex);
 
     // Determine how many tracks to display
-    size_t display_count = std::min((size_t)m_max_tracks, selected.get_size());
+    size_t display_count = (std::min)((size_t)m_max_tracks, selected.get_size());
 
     // Build new track list, reusing existing data where possible
     std::vector<std::unique_ptr<TrackSpectrum>> new_tracks;
@@ -195,7 +195,7 @@ void SpectrumCompareWindow::analysis_worker(size_t index, metadb_handle_ptr hand
         }
     }
 
-    if (!m_shutdown && m_hWnd && IsWindow(m_hWnd)) {
+    if (!m_shutdown && m_hWnd && IsWindow()) {
         PostMessage(WM_SPECTRUM_READY, 0, 0);
     }
 }
@@ -246,18 +246,18 @@ void SpectrumCompareWindow::OnPaint(CDCHandle) {
 
         // Draw label area
         CRect label_rc(track_rc.left, track_rc.top, track_rc.right, track_rc.top + label_height);
-        render_track_label(dc, label_rc, *m_tracks[i]);
+        render_track_label(dc.m_hDC, label_rc, *m_tracks[i]);
 
         // Draw spectrum area
         CRect spec_rc(track_rc.left, track_rc.top + label_height, track_rc.right, track_rc.bottom);
         if (m_tracks[i]->data.ready && !m_tracks[i]->data.error) {
-            render_spectrum(dc, spec_rc, m_tracks[i]->data);
+            render_spectrum(dc.m_hDC, spec_rc, m_tracks[i]->data);
         } else if (m_tracks[i]->data.error) {
             dc.SetTextColor(RGB(255, 80, 80));
             dc.SetBkMode(TRANSPARENT);
             SelectObjectScope fontScope(dc, (HGDIOBJ)m_callback->query_font_ex(ui_font_default));
             pfc::string8 err;
-            err << "Error: " << m_tracks[i]->data.error_msg;
+            err << "Error: " << m_tracks[i]->data.error_msg.c_str();
             pfc::stringcvt::string_wide_from_utf8 err_w(err);
             dc.DrawText(err_w, -1, &spec_rc, DT_NOPREFIX | DT_CENTER | DT_VCENTER | DT_SINGLELINE);
         } else if (m_tracks[i]->analyzing) {
@@ -282,7 +282,7 @@ void SpectrumCompareWindow::render_track_label(CDCHandle dc, const RECT& rc, con
     SelectObjectScope fontScope(dc, (HGDIOBJ)m_callback->query_font_ex(ui_font_default));
 
     pfc::string8 label;
-    label << track.data.title;
+    label << track.data.title.c_str();
     if (track.data.sample_rate > 0) {
         label << "  [" << track.data.sample_rate << " Hz";
         if (track.data.channels > 0) label << ", " << track.data.channels << "ch";
