@@ -32,20 +32,25 @@ jobs:
     - name: Add MSBuild to PATH
       uses: microsoft/setup-msbuild@v2
 
-    - name: Download WTL headers
-      # WTL (atlapp.h / atlcrack.h / atlctrls.h) is NOT shipped with Visual Studio.
-      # The foobar2000 SDK helpers include <atlapp.h> via foobar2000-lite+atl.h.
-      # We clone the official WTL mirror and expose it to ALL cl.exe invocations
-      # through the CL environment variable (prepended to every compile).
+    - name: Download WTL 10.0.10320 headers
+      # foobar2000 SDK requires WTL 10.0.10320 (NOT the WTL 9.x in the repo root).
+      # The official WTL 10 release zip lives in the Releases/ directory of the
+      # Win32-WTL/WTL GitHub repo. We download it, extract, and expose the Include
+      # folder to ALL cl.exe invocations through the CL environment variable.
       shell: pwsh
       run: |
-        git clone --depth 1 https://github.com/Win32-WTL/WTL.git C:\WTL
-        if (-not (Test-Path "C:\WTL\Include\atlapp.h")) {
-          Write-Host "::error::WTL atlapp.h not found at C:\WTL\Include"
+        $url = "https://raw.githubusercontent.com/Win32-WTL/WTL/main/Releases/WTL10_10320_Final.zip"
+        $zip = "$env:TEMP\WTL10_10320_Final.zip"
+        $dest = "C:\WTL10"
+        Invoke-WebRequest -Uri $url -OutFile $zip
+        Expand-Archive -Path $zip -DestinationPath $dest -Force
+        $includePath = Get-ChildItem -Path $dest -Recurse -Directory -Filter "Include" | Select-Object -First 1 -ExpandProperty FullName
+        if (-not $includePath -or -not (Test-Path "$includePath\atlapp.h")) {
+          Write-Host "::error::WTL 10 atlapp.h not found under $dest"
           exit 1
         }
-        Write-Host "WTL headers available at C:\WTL\Include"
-        echo "CL=/I`"C:\WTL\Include`"" >> $env:GITHUB_ENV
+        Write-Host "WTL 10 headers available at $includePath"
+        echo "CL=/I`"$includePath`"" >> $env:GITHUB_ENV
 
     - name: Restore NuGet packages (if any)
       working-directory: ${{env.GITHUB_WORKSPACE}}
