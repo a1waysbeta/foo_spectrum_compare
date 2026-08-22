@@ -663,11 +663,13 @@ LRESULT SpectrumCompareWindow::OnSpectrumReady(UINT uMsg, WPARAM wParam, LPARAM 
 namespace {
     // Private command IDs for the edit-mode menu. They live in a different
     // range than the IDM_* settings IDs so the two menus never collide.
+    // NOTE: do NOT use names like ID_EDIT_* — those are WTL macros defined
+    // in atlres.h and would expand to integer literals here.
     enum {
-        ID_EDIT_REPLACE = 5001,
-        ID_EDIT_CUT     = 5002,
-        ID_EDIT_COPY    = 5003,
-        ID_EDIT_PASTE   = 5004
+        kEditReplace = 5001,
+        kEditCut     = 5002,
+        kEditCopy    = 5003,
+        kEditPaste   = 5004
     };
 }
 
@@ -716,13 +718,13 @@ void SpectrumCompareWindow::OnContextMenu(CWindow wnd, CPoint point) {
             pfc::stringcvt::string_os_from_utf8(elemName)));
         WIN32_OP_D(menu.AppendMenu(MF_SEPARATOR, 0, _T("")));
 
-        WIN32_OP_D(menu.AppendMenu(MF_STRING, ID_EDIT_REPLACE, _T("Replace UI Element")));
+        WIN32_OP_D(menu.AppendMenu(MF_STRING, kEditReplace, _T("Replace UI Element")));
         WIN32_OP_D(menu.AppendMenu(MF_SEPARATOR, 0, _T("")));
-        WIN32_OP_D(menu.AppendMenu(MF_STRING, ID_EDIT_CUT,   _T("Cut UI Element")));
-        WIN32_OP_D(menu.AppendMenu(MF_STRING, ID_EDIT_COPY,  _T("Copy UI Element")));
+        WIN32_OP_D(menu.AppendMenu(MF_STRING, kEditCut,   _T("Cut UI Element")));
+        WIN32_OP_D(menu.AppendMenu(MF_STRING, kEditCopy,  _T("Copy UI Element")));
         WIN32_OP_D(menu.AppendMenu(
             MF_STRING | (canPaste ? 0 : (MF_DISABLED | MF_GRAYED)),
-            ID_EDIT_PASTE, _T("Paste UI Element")));
+            kEditPaste, _T("Paste UI Element")));
 
         int cmd = 0;
         {
@@ -745,7 +747,7 @@ void SpectrumCompareWindow::OnContextMenu(CWindow wnd, CPoint point) {
         }
 
         switch (cmd) {
-        case ID_EDIT_REPLACE: {
+        case kEditReplace: {
             // Spawn the core "Replace UI Element" modal dialog (v3 API).
             // The dialog wires the replacement straight into the host, so we
             // just hand it our element GUID + a no-op notify callback.
@@ -754,11 +756,11 @@ void SpectrumCompareWindow::OnContextMenu(CWindow wnd, CPoint point) {
             cm3->replace_element_dialog_start(m_hWnd, guid_spectrum_compare, notify);
             break;
         }
-        case ID_EDIT_COPY: {
+        case kEditCopy: {
             cm->copy(get_configuration());
             break;
         }
-        case ID_EDIT_CUT: {
+        case kEditCut: {
             // Match ui_element_edit_tools::standard_edit_context_menu:
             //   copy(instance); release(instance); host_replace_with_guid_null
             // The cut() API encapsulates exactly that. It releases the
@@ -770,7 +772,7 @@ void SpectrumCompareWindow::OnContextMenu(CWindow wnd, CPoint point) {
             // tmp is now empty and our own refcount remains intact.
             break;
         }
-        case ID_EDIT_PASTE: {
+        case kEditPaste: {
             // paste(instance_ptr&, hwnd, callback) will replace the content
             // of the passed instance_ptr in-place (removing us and inserting
             // whatever was copied). Same as Cut — always use a tmp copy.
