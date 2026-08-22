@@ -26,6 +26,7 @@ enum strid_t {
     S_SPECTRUM,              // 3 palette names
     S_SOX,
     S_MONO,
+    S_INTENSITY,             // 4th palette: intensity (热力加强)
     S_AXES,                  // submenu title
     S_FREQ_AXIS,             // 2 axis toggles
     S_TIME_AXIS,
