@@ -116,29 +116,38 @@ bool SpectrumAnalyzer::analyze(metadb_handle_ptr track, SpectrumData& out, abort
         // don't exceed the realistic total_hops we can actually produce
         // (so short clips don't get upscaled blanks).
         //
-        // NOTE: Wrapping std::min / std::max in extra parentheses
-        //   e.g. (std::min)<T>(a, b)
-        // is the standard idiom to survive <windows.h> #define min/max
-        // macros.  Without it MSVC expands `std::max(1, x)` into
-        // `std:: (((1) > (x) ? (1) : (x)))` → C2589 "illegal token on
-        // right side of '::'".  The SDK/libPPUI headers pull Windows.h
-        // indirectly and sometimes don't set NOMINMAX globally, so we
-        // cannot rely on that.  Using pfc::min_t / pfc::max_t would
-        // also work but the (std::xxx) parens are more self-documenting.
+        // NOTE: We intentionally use pfc::min_t<T> / pfc::max_t<T> here
+        // instead of std::min / std::max.  The SDK PFC headers we pull
+        // in (via stdafx.h → foobar2000 SDK → libPPUI → Windows.h) can
+        // expose the <windows.h> object-like macros:
+        //   #define min(a,b) (((a)<(b))?(a):(b))
+        //   #define max(a,b) (((a)>(b))?(a):(b))
+        // When those macros are live, writing `std::max(1, x)` gets
+        // textually expanded by the preprocessor before the compiler
+        // ever sees it, producing C2589 / C2664 on the `::` token.
+        // The classic "wrap the qualified name in parens" workaround
+        // (std::max)<T>(a,b) compiles with some MSVC frontends but not
+        // reliably with /permissive- + /std:c++17 (it can produce
+        // C2440: cannot convert from 'overloaded-function' to int).
+        // pfc::min_t/max_t live in a PFC-namespaced template, their
+        // names do NOT collide with the object-like max(a,b) macros
+        // (different arity + qualified namespace → macro pattern
+        // doesn't match), so they're 100 % safe regardless of
+        // NOMINMAX / permissive mode / language version.
         int target_cols = m_target_frames > 0 ? m_target_frames : 800;
-        int columns = (int)(std::min)<int64_t>(
+        int columns = (int)pfc::min_t<int64_t>(
             (int64_t)target_cols,
-            (std::max)<int64_t>(1, total_hops_i64));
+            pfc::max_t<int64_t>(1, total_hops_i64));
         // Bucket = how many consecutive FFTs we average per displayed column.
         // Minimum 1 so we never divide by zero.
-        int ffts_per_col = (int)(std::max)<int64_t>(
+        int ffts_per_col = (int)pfc::max_t<int64_t>(
             1,
-            total_hops_i64 / (std::max)<int64_t>(1, (int64_t)columns));
+            total_hops_i64 / pfc::max_t<int64_t>(1, (int64_t)columns));
         // Re-derive columns so the last bucket has full count too (avoids a
         // tiny final column whose average would be noisier).
-        columns = (int)(std::max)<int64_t>(
+        columns = (int)pfc::max_t<int64_t>(
             1,
-            total_hops_i64 / (std::max)<int64_t>(1, (int64_t)ffts_per_col));
+            total_hops_i64 / pfc::max_t<int64_t>(1, (int64_t)ffts_per_col));
 
         // Ring buffer for audio samples (mono mixed down)
         std::vector<float> buffer(nfft * 4, 0.0f);
