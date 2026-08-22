@@ -661,6 +661,15 @@ LRESULT SpectrumCompareWindow::OnSpectrumReady(UINT uMsg, WPARAM wParam, LPARAM 
 // ============================================================
 
 namespace {
+    // Single private command ID used by the minimal "Copy only" fallback
+    // menu shown when no layout container parent can be found (extremely
+    // rare). Replace / Cut / Paste are intentionally NOT emulated here,
+    // as they require access to the host's internal slot (p_id) which we
+    // don't have without a real ui_element_instance_host_base.
+    // NOTE: keep names with a "k" prefix — ID_EDIT_* are predefined WTL
+    // resource macros (atlres.h) and would expand to integer literals.
+    enum { kEditCopy = 5003 };
+
     // ------------------------------------------------------------------
     // Walk up the parent chain of an element window looking for the
     // "closest non-leaf container" that really hosts the layout slot.
