@@ -5,9 +5,9 @@
 # foo_spectrum_compare
 
 <p align="center">
-  <a href="../../releases"><img src="https://img.shields.io/github/v/release/a1waysbeta/foo_spectrum_compare?style=flat-square&label=最新版本&color=blue" alt="最新版本"></a>
-  <a href="../../releases"><img src="https://img.shields.io/github/downloads/a1waysbeta/foo_spectrum_compare/total?style=flat-square&label=下载次数&color=success" alt="下载次数"></a>
-  <a href="../../actions"><img src="https://img.shields.io/github/actions/workflow/status/a1waysbeta/foo_spectrum_compare/build.yml?style=flat-square&label=编译状态&color=blue" alt="编译状态"></a>
+  <a href="../../releases"><img src="https://img.shields.io/github/v/release/a1waysbeta/foo_spectrum_compare?style=flat-square&label=Release&color=blue" alt="最新版本"></a>
+  <a href="../../releases"><img src="https://img.shields.io/github/downloads/a1waysbeta/foo_spectrum_compare/total?style=flat-square&label=Downloads&color=success" alt="下载次数"></a>
+  <a href="../../actions"><img src="https://img.shields.io/github/actions/workflow/status/a1waysbeta/foo_spectrum_compare/build.yml?style=flat-square&label=Build&color=blue" alt="编译状态"></a>
 </p>
 
 一个为 foobar2000 设计的垂直多轨频谱对比面板组件，适用于默认界面（Default UI）。
