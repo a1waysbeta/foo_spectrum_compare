@@ -19,45 +19,37 @@
 
 static uint32_t spectrum(double level)
 {
-    // Modified version of Dan Bruton's algorithm:
-    // http://www.physics.sfasu.edu/astro/color/spectra.html
-    level *= 0.6625;
-    double r = 0.0, g = 0.0, b = 0.0;
-    if (level >= 0 && level < 0.15) {
-        r = (0.15 - level) / (0.15 + 0.075);
-        g = 0.0;
-        b = 1.0;
-    } else if (level >= 0.15 && level < 0.275) {
-        r = 0.0;
-        g = (level - 0.15) / (0.275 - 0.15);
-        b = 1.0;
-    } else if (level >= 0.275 && level < 0.325) {
-        r = 0.0;
-        g = 1.0;
-        b = (0.325 - level) / (0.325 - 0.275);
-    } else if (level >= 0.325 && level < 0.5) {
-        r = (level - 0.325) / (0.5 - 0.325);
-        g = 1.0;
-        b = 0.0;
-    } else if (level >= 0.5 && level < 0.6625) {
-        r = 1.0;
-        g = (0.6625 - level) / (0.6625 - 0.5);
-        b = 0.0;
-    }
+    // 8-stop linear gradient palette (user-specified colors).
+    // level 0.0 → silence (black), 1.0 → peak (yellow).
+    struct Stop { double pos; uint8_t r, g, b; };
+    static const Stop stops[] = {
+        { 0.00,   0,   0,   0 },  // #000000
+        { 0.1429, 0,   0,  79 },  // #00004F
+        { 0.2857, 80,  0, 123 },  // #50007B
+        { 0.4286, 153, 0, 118 },  // #990076
+        { 0.5714, 210, 0,  64 },  // #D20040
+        { 0.7143, 245, 31,  0 },  // #F51F00
+        { 0.8571, 255,174,  0 },  // #FFAE00
+        { 1.00,   255,250,107 },  // #FFFA6B
+    };
+    const int n = sizeof(stops) / sizeof(stops[0]);
+    if (level <= 0.0) return 0;
+    if (level >= 1.0) return (255u << 16) | (250u << 8) | 107u;
 
-    // Intensity correction — linear black-ramp for level < 0.1 so the
-    // very quiet noise floor drifts smoothly to pure black instead of
-    // getting stuck on the darkest available blue (which otherwise
-    // produces a "spurious blue band" at the bottom of every track).
-    double cf = 1.0;
-    if (level >= 0.0 && level < 0.1) {
-        cf = level / 0.1;
-    }
-    cf *= 255.0;
+    // Find segment
+    int i = 0;
+    while (i < n - 2 && level > stops[i + 1].pos) i++;
+    double t = (level - stops[i].pos) / (stops[i + 1].pos - stops[i].pos);
+    if (t < 0) t = 0;
+    if (t > 1) t = 1;
 
-    uint32_t rr = (uint32_t)(r * cf + 0.5);
-    uint32_t gg = (uint32_t)(g * cf + 0.5);
-    uint32_t bb = (uint32_t)(b * cf + 0.5);
+    double r = stops[i].r + (stops[i + 1].r - stops[i].r) * t;
+    double g = stops[i].g + (stops[i + 1].g - stops[i].g) * t;
+    double b = stops[i].b + (stops[i + 1].b - stops[i].b) * t;
+
+    uint32_t rr = (uint32_t)(r + 0.5);
+    uint32_t gg = (uint32_t)(g + 0.5);
+    uint32_t bb = (uint32_t)(b + 0.5);
     return (rr << 16) | (gg << 8) | bb;
 }
 
