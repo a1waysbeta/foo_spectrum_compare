@@ -683,22 +683,18 @@ void SpectrumCompareWindow::render_spectrum(CDCHandle dc, const RECT& rc, const 
 
     uint32_t* pixel_data = (uint32_t*)pixels;
 
-    // Dynamic range for dB scaling.
-    // 80 dB is the sweet spot: music content typically lives at -40~-60 dB,
-    // which maps to level 0.25-0.50 — right in the warm color zone (red/orange)
-    // after gamma correction in the palette function.
-    //
-    // Previous 120 dB was too wide: -60 dB → level 0.50, but after gamma 0.4
-    // → 0.76 which sounds OK on paper, yet real-world FFT magnitudes have a
-    // much wider distribution than idealized sine waves, so most bins ended
-    // up at -80~-100 dB → level 0.17-0.33 → still blue/purple.
-    //
-    // The old "blue band" issue (noise floor visible as solid blue strip at
-    // the bottom) does NOT recur at 80 dB because the new gradient palette
-    // maps level 0.0 to pure #000000 (the old spectrum() function had a
-    // built-in blue ramp for level < 0.1 that caused the band).
-    const float dyn_range = 80.0f; // dB
-    const float floor_db = -80.0f;
+    // Dynamic range for dB scaling — matches Spek upstream default:
+    //   spek-spectrogram.cc  LRANGE=-120, URANGE=0  → range=120 dB
+    // Previous versions used 80 dB, which compressed anything quieter
+    // than -80 dBFS into palette level 0.0 (→ deep blue of spectrum()),
+    // producing the user-reported "蓝色带" at the bottom of every track.
+    // At 120 dB we give ~40 dB more headroom: the noise floor at ~-96
+    // dBFS lands at palette level 0.20 (green begins to fade into blue)
+    // instead of 0.0 (solid spectrum() dark blue).  Together
+    // with spectrum()'s built-in cf ramp for level<0.1 we get clean
+    // black for absolute silence but NOT a fake blue band on noise.
+    const float dyn_range = 120.0f; // dB
+    const float floor_db = -120.0f;
     float ref_level = data.max_level > 0 ? data.max_level : 1.0f;
 
     // Map spectrum data to pixels.
