@@ -28,6 +28,8 @@ static const GUID guid_cfg_max_tracks =
     { 0x4d5e6f70, 0x8192, 0xa3b4, { 0xc5, 0xd6, 0xe7, 0xf8, 0x09, 0x1a, 0x2b, 0x3c } };
 static const GUID guid_cfg_palette =
     { 0x5e6f7081, 0x92a3, 0xb4c5, { 0xd6, 0xe7, 0xf8, 0x09, 0x1a, 0x2b, 0x3c, 0x4d } };
+static const GUID guid_cfg_fft_bits =
+    { 0x6f708192, 0xa3b4, 0xc5d6, { 0xe7, 0xf8, 0x09, 0x1a, 0x2b, 0x3c, 0x4d, 0x5e } };
 
 // Persistent config storage (static globals, registered once at startup)
 // Defined as static so they persist across window creation/destruction.
@@ -36,6 +38,7 @@ extern cfg_bool g_cfg_show_time_axis;
 extern cfg_string g_cfg_title_format;
 extern cfg_int g_cfg_max_tracks;
 extern cfg_int g_cfg_palette;
+extern cfg_int g_cfg_fft_bits;
 
 // Menu command IDs
 #define IDM_SET_COUNT_1  1001
@@ -48,6 +51,11 @@ extern cfg_int g_cfg_palette;
 #define IDM_PALETTE_MONO     1012
 #define IDM_PALETTE_SPEK     1013
 #define IDM_PALETTE_SPEKX    1014
+#define IDM_FFT_1024    1030
+#define IDM_FFT_2048    1031
+#define IDM_FFT_4096    1032
+#define IDM_FFT_8192    1033
+#define IDM_FFT_16384   1034
 #define IDM_TOGGLE_FREQ_AXIS 1020
 #define IDM_TOGGLE_TIME_AXIS 1021
 #define IDM_EDIT_TITLE_FORMAT 1022
@@ -167,6 +175,11 @@ public:
         COMMAND_ID_HANDLER_EX(IDM_PALETTE_MONO, OnPalette)
         COMMAND_ID_HANDLER_EX(IDM_PALETTE_SPEK, OnPalette)
         COMMAND_ID_HANDLER_EX(IDM_PALETTE_SPEKX, OnPalette)
+        COMMAND_ID_HANDLER_EX(IDM_FFT_1024, OnFFTSize)
+        COMMAND_ID_HANDLER_EX(IDM_FFT_2048, OnFFTSize)
+        COMMAND_ID_HANDLER_EX(IDM_FFT_4096, OnFFTSize)
+        COMMAND_ID_HANDLER_EX(IDM_FFT_8192, OnFFTSize)
+        COMMAND_ID_HANDLER_EX(IDM_FFT_16384, OnFFTSize)
         COMMAND_ID_HANDLER_EX(IDM_TOGGLE_FREQ_AXIS, OnToggleFreqAxis)
         COMMAND_ID_HANDLER_EX(IDM_TOGGLE_TIME_AXIS, OnToggleTimeAxis)
         COMMAND_ID_HANDLER_EX(IDM_EDIT_TITLE_FORMAT, OnEditTitleFormat)
@@ -187,6 +200,7 @@ private:
     void OnSetCount(UINT uNotifyCode, int nID, CWindow wndCtl);
     void OnRefresh(UINT uNotifyCode, int nID, CWindow wndCtl);
     void OnPalette(UINT uNotifyCode, int nID, CWindow wndCtl);
+    void OnFFTSize(UINT uNotifyCode, int nID, CWindow wndCtl);
     void OnToggleFreqAxis(UINT uNotifyCode, int nID, CWindow wndCtl);
     void OnToggleTimeAxis(UINT uNotifyCode, int nID, CWindow wndCtl);
     void OnEditTitleFormat(UINT uNotifyCode, int nID, CWindow wndCtl);
@@ -220,6 +234,7 @@ private:
     // Runtime config (mirrors of cfg vars for fast access)
     int m_max_tracks = 4;
     palette_t m_palette = PALETTE_SPECTRUM;
+    int m_fft_bits = 11;   // 2^11 = 2048-point FFT (Spek's default)
     bool m_show_freq_axis = true;
     bool m_show_time_axis = true;
     pfc::string8 m_title_format = DEFAULT_TITLE_FORMAT;

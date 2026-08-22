@@ -11,6 +11,7 @@ cfg_bool g_cfg_show_time_axis(guid_cfg_show_time_axis, true);
 cfg_string g_cfg_title_format(guid_cfg_title_format, DEFAULT_TITLE_FORMAT);
 cfg_int g_cfg_max_tracks(guid_cfg_max_tracks, 4);
 cfg_int g_cfg_palette(guid_cfg_palette, (int)PALETTE_SPECTRUM);
+cfg_int g_cfg_fft_bits(guid_cfg_fft_bits, 11); // default 2048, matches Spek's FFT_BITS default
 
 SpectrumCompareWindow::SpectrumCompareWindow(
     ui_element_config::ptr config,
@@ -34,9 +35,16 @@ SpectrumCompareWindow::SpectrumCompareWindow(
     m_title_format = g_cfg_title_format.get();
     m_max_tracks = (int)g_cfg_max_tracks;
     m_palette = (palette_t)(int)g_cfg_palette;
+    m_fft_bits = (int)g_cfg_fft_bits;
+    // Clamp to the same [MIN..MAX] range that Spek uses (8..14), mirroring
+    //   spek-master/src/spek-spectrogram.cc:
+    //     MIN_FFT_BITS = 8, MAX_FFT_BITS = 14
+    if (m_fft_bits < 8)  m_fft_bits = 8;
+    if (m_fft_bits > 14) m_fft_bits = 14;
 
     // Apply to analyzer
     m_analyzer.set_title_format(m_title_format.c_str());
+    m_analyzer.set_fft_bits(m_fft_bits);
 
     // Apply the serialized instance configuration if present.
     set_configuration(std::move(config));
@@ -124,23 +132,28 @@ void SpectrumCompareWindow::initialize_window(HWND parent) {
 // Binary layout of the ui_element_config payload we write / read.
 // Versioned so we can append fields without breaking old .fth files.
 //
-//   uint32_t version         ; currently 1
+//   uint32_t version         ; 1 or 2
 //   uint32_t max_tracks      ; 1..4
 //   uint32_t palette         ; palette_t (0..PALETTE_COUNT-1)
 //   uint8_t  show_freq_axis  ; 0 / 1
 //   uint8_t  show_time_axis  ; 0 / 1
 //   string8  title_format    ; raw bytes (UTF-8 titleformat expression)
+//   uint32_t fft_bits        ; 8..14 (only present when version >= 2)
 //
-// Anything past the string is intentionally ignored on read so future
-// fields can be appended.
+// Anything past the above fields is intentionally ignored on read so
+// future versions can be appended.
 // ============================================================
-static constexpr uint32_t kConfigMagicVersion = 1u;
+static constexpr uint32_t kConfigMagicVersion = 2u;
 static constexpr int        kMinMaxTracks = 1;
 static constexpr int        kMaxMaxTracks = 4;
+static constexpr int        kMinFFTBits   = 8;   // Spek: MIN_FFT_BITS
+static constexpr int        kMaxFFTBits   = 14;  // Spek: MAX_FFT_BITS
+static constexpr int        kDefaultFFTBits = 11; // Spek: FFT_BITS default
 
 static ui_element_config::ptr build_instance_config(
     int max_tracks,
     palette_t palette,
+    int fft_bits,
     bool show_freq_axis,
     bool show_time_axis,
     const char* title_format)
@@ -154,12 +167,13 @@ static ui_element_config::ptr build_instance_config(
     b << (uint8_t)(show_freq_axis ? 1u : 0u);
     b << (uint8_t)(show_time_axis ? 1u : 0u);
     {
-        // pfc::string8 / pfc::string_base have dedicated << overloads which
-        // write uint32 length + raw bytes. Make sure we serialize a valid
-        // string even if the caller passes NULL.
         pfc::string8 tf(title_format ? title_format : "");
         b << tf;
     }
+    // Added in version 2: FFT size.  Old readers with version == 1 code
+    // simply won't see this field because they stop parsing after title_format.
+    b << pfc::downcast_guarded<uint32_t>(
+        pfc::clip_t<int>(fft_bits, kMinFFTBits, kMaxFFTBits));
     return b.finish(SpectrumCompareWindow::g_get_guid());
 }
 
@@ -171,6 +185,7 @@ void SpectrumCompareWindow::set_configuration(ui_element_config::ptr config) {
     bool changed_something = false;
     int new_max_tracks = m_max_tracks;
     palette_t new_palette = m_palette;
+    int new_fft_bits = m_fft_bits;    // if missing from payload, stay at cfg value
     bool new_show_freq = m_show_freq_axis;
     bool new_show_time = m_show_time_axis;
     pfc::string8 new_title = m_title_format;
@@ -194,30 +209,40 @@ void SpectrumCompareWindow::set_configuration(ui_element_config::ptr config) {
                 new_show_time = (st != 0);
                 if (tf.length() > 0) new_title = tf;
             }
-            // Future versions will have more trailing bytes. We simply stop
-            // parsing here — ui_element_config_parser::get_remaining() is
-            // intentionally not drained so host-side opaque round-tripping
-            // via m_config stays intact.
+            // Added in v2 payloads.  Old v1 .fth files don't have this
+            // field → new_fft_bits keeps the value already initialised from
+            // g_cfg_fft_bits (Spek's default 11 / 2048-point FFT).
+            if (version >= 2u) {
+                uint32_t fb = 0;
+                parser >> fb;
+                new_fft_bits = (int)pfc::clip_t<uint32_t>(
+                    fb, (uint32_t)kMinFFTBits, (uint32_t)kMaxFFTBits);
+            }
         } catch (...) {
-            // Malformed payload from a weird .fth file: fall through,
-            // keeping the cfg_* defaults already loaded at construction.
+            // Malformed payload → keep cfg defaults already loaded.
         }
     }
 
-    // Commit parsed values to runtime members. Use equality checks so we
-    // don't trigger unnecessary redraws / snapshot invalidations when the
-    // host hands us back our own identical blob.
+    // Commit parsed values to runtime members, mirror changes to cfg_*
+    // storage, and invalidate any cached state that depends on them.
     if (new_max_tracks != m_max_tracks) {
         m_max_tracks = new_max_tracks;
         g_cfg_max_tracks = (int64_t)new_max_tracks;
-        // The effective cap changed — the cached selection snapshot is no
-        // longer comparable, so the next update_selection() must re-verify.
         m_last_selection = last_selection_key{};
         changed_something = true;
     }
     if (new_palette != m_palette) {
         m_palette = new_palette;
         g_cfg_palette = (int64_t)new_palette;
+        changed_something = true;
+    }
+    if (new_fft_bits != m_fft_bits) {
+        m_fft_bits = new_fft_bits;
+        g_cfg_fft_bits = (int64_t)new_fft_bits;
+        m_analyzer.set_fft_bits(new_fft_bits);
+        // FFT size changes affect the analysis output — force a full
+        // re-analysis by wiping the selection-snapshot.
+        m_last_selection = last_selection_key{};
         changed_something = true;
     }
     if (new_show_freq != m_show_freq_axis) {
@@ -234,9 +259,6 @@ void SpectrumCompareWindow::set_configuration(ui_element_config::ptr config) {
         m_title_format = new_title;
         g_cfg_title_format.set(new_title);
         m_analyzer.set_title_format(new_title.get_ptr());
-        // Cached formatted labels inside TrackSpectrum are stale. Simplest
-        // safe fix: blow away selection snapshot so next update_selection
-        // rebuilds labels from the fresh titleformat string.
         m_last_selection = last_selection_key{};
         changed_something = true;
     }
@@ -248,29 +270,21 @@ void SpectrumCompareWindow::set_configuration(ui_element_config::ptr config) {
 }
 
 ui_element_config::ptr SpectrumCompareWindow::get_configuration() {
-    // Build a FRESH config blob from the CURRENT runtime settings. This is
-    // what makes "Export settings / Copy settings / Scratchbox save .fth"
-    // actually include the user's real choices instead of the empty blob we
-    // started from. The previous code just returned m_config unchanged, so
-    // every export was an empty 0-byte payload -> imports did nothing.
     ui_element_config::ptr fresh = build_instance_config(
-        m_max_tracks, m_palette,
+        m_max_tracks, m_palette, m_fft_bits,
         m_show_freq_axis, m_show_time_axis,
         m_title_format.get_ptr());
-    // Keep a copy so a subsequent set_configuration(get_configuration())
-    // roundtrip — which the host may do — is a proper no-op.
     m_config = fresh;
     return fresh;
 }
 
 ui_element_config::ptr SpectrumCompareWindow::g_get_default_configuration() {
-    // The "default" instance config (used by Scratchbox's reset, layout
-    // reset, and newly created slots that have nothing stored) should
-    // match the cfg_* defaults exactly so the panel behaves identically
-    // whether it's first created or wiped to defaults.
     return build_instance_config(
-        (int)g_cfg_max_tracks, (palette_t)(int)g_cfg_palette,
-        (bool)g_cfg_show_freq_axis, (bool)g_cfg_show_time_axis,
+        (int)g_cfg_max_tracks,
+        (palette_t)(int)g_cfg_palette,
+        (int)g_cfg_fft_bits,
+        (bool)g_cfg_show_freq_axis,
+        (bool)g_cfg_show_time_axis,
         g_cfg_title_format.get_ptr());
 }
 
@@ -635,44 +649,97 @@ void SpectrumCompareWindow::render_spectrum(CDCHandle dc, const RECT& rc, const 
 
     uint32_t* pixel_data = (uint32_t*)pixels;
 
-    // Dynamic range for dB scaling
-    float dyn_range = 80.0f; // dB
+    // Dynamic range for dB scaling — matches Spek upstream default:
+    //   spek-spectrogram.cc  LRANGE=-120, URANGE=0  → range=120 dB
+    // Previous versions used 80 dB, which compressed anything quieter
+    // than -80 dBFS into palette level 0.0 (→ deep blue of spectrum()),
+    // producing the user-reported "蓝色带" at the bottom of every track.
+    // At 120 dB we give ~40 dB more headroom: the noise floor at ~-96
+    // dBFS lands at palette level 0.20 (green begins to fade into blue)
+    // instead of 0.0 (solid spek_orig_spectrum dark blue).  Together
+    // with spectrum()'s built-in cf ramp for level<0.1 we get clean
+    // black for absolute silence but NOT a fake blue band on noise.
+    const float dyn_range = 120.0f; // dB
+    const float floor_db = -120.0f;
     float ref_level = data.max_level > 0 ? data.max_level : 1.0f;
 
-    // Map spectrum data to pixels
-    // X axis: time (left = start, right = end)
-    // Y axis: frequency (bottom = low freq, top = high freq) - inverted because top-down DIB
+    // Map spectrum data to pixels.
+    //
+    // X axis: time  (left = start, right = end).
+    // Y axis: freq  (bottom = 0 Hz, top = Nyquist).  We use LINEAR mapping,
+    //         which matches Spek/Spek-X exactly:
+    //
+    //   fft_bins[]        ——  index 0 = DC, index (fft_bins-1) ≈ Nyquist/2
+    //   pixel row py      ——  py=height-1 (bottom of rect) → DC,
+    //                          py=0 (top of rect) → Nyquist.
+    //
+    // Thus fbin_idx = (1 - py/(H-1)) * (fft_bins - 1)  (linear, no curve).
+    //
+    // 注意：前一版使用 powf(freq_norm, 1.5f) "类对数压缩"，使得频率轴
+    // 的 0-5kHz 被人为拉伸超过 5-10kHz 的距离，造成截图中看到的
+    // "刻度不均匀"。现已去掉该曲线，render_freq_axis 也做了对应调整，
+    // 两者保持一致 → 0/5/10/15/20/22kHz 每段间距完全相等。
+    //
+    // To avoid the "staircase blocky look" that appears when
+    // bins > panel_height (we're now using linear mapping, so a 1025-bin
+    // spectrum displayed in a 500px rect would otherwise show every 2nd
+    // bin as a 2px row), we do bilinear interpolation both vertically
+    // (between bin i and bin i+1) and horizontally (between time frame
+    // t and frame t+1).  This is exactly what Spek does when it calls
+    // image.Scale(W,H) on the wxImage before blitting (wx uses bilinear
+    // by default).  It adds ~5% CPU but materially improves "细腻度".
     for (int py = 0; py < height; py++) {
-        // Frequency bin: py=0 (top) = high freq, py=height-1 (bottom) = low freq
-        float freq_norm = 1.0f - (float)py / (height - 1);
-        // Use log frequency scale for better display
-        float log_freq = powf(freq_norm, 1.5f); // slight log-like compression
-        int fbin = (int)(log_freq * (data.fft_bins - 1));
-        if (fbin < 0) fbin = 0;
-        if (fbin >= data.fft_bins) fbin = data.fft_bins - 1;
+        // Vertical (frequency) sample position — float so we can lerp
+        float freq_f = (1.0f - (float)py / (height - 1)) * (data.fft_bins - 1);
+        if (freq_f < 0) freq_f = 0;
+        if (freq_f > (data.fft_bins - 1)) freq_f = (float)(data.fft_bins - 1);
+        int fi = (int)floor(freq_f);
+        float ff = freq_f - (float)fi;
+        int fi2 = (fi + 1 < data.fft_bins) ? fi + 1 : fi;
+        // (spectrum values are stored bin0=DC; our data layout matches)
 
         for (int px = 0; px < width; px++) {
-            int tframe = (int)((float)px / width * (data.time_frames - 1));
-            if (tframe < 0) tframe = 0;
-            if (tframe >= data.time_frames) tframe = data.time_frames - 1;
+            // Horizontal (time) sample position
+            float time_f = (float)px / width * (data.time_frames - 1);
+            if (time_f < 0) time_f = 0;
+            if (time_f > (data.time_frames - 1)) time_f = (float)(data.time_frames - 1);
+            int ti = (int)floor(time_f);
+            float tf = time_f - (float)ti;
+            int ti2 = (ti + 1 < data.time_frames) ? ti + 1 : ti;
 
-            float val = data.get(tframe, fbin);
+            // Four neighbours for bilinear
+            float v00 = data.get(ti,  fi);
+            float v10 = data.get(ti,  fi2);
+            float v01 = data.get(ti2, fi);
+            float v11 = data.get(ti2, fi2);
 
-            // Convert to dB scale
-            float level_db = 0;
+            float v0 = v00 + (v01 - v00) * tf;  // top edge (freq fi → fi+1), at time ti+tf  in ti
+            float v1 = v10 + (v11 - v10) * tf;  // bottom edge
+            float val = v0 + (v1 - v0) * ff;    // then lerp vertically
+
+            // Convert to dBFS relative to track peak, then clamp to
+            // [floor_db, 0] exactly like Spek's:
+            //   value = fmin(urange, fmax(lrange, values[y]))
+            //   level = (value - lrange) / (urange - lrange)
+            // where urange=0, lrange=-120.  Clamping keeps palette
+            // input within [0,1] and lets the cf black-ramp in
+            // spek_orig_spectrum() do its job cleanly.
+            float level_db = floor_db;
             if (val > 0 && ref_level > 0) {
                 level_db = 20.0f * log10f(val / ref_level);
             }
-            // Normalize to 0..1
-            float level_norm = (level_db + dyn_range) / dyn_range;
+            if (level_db > 0) level_db = 0;
+            if (level_db < floor_db) level_db = floor_db;
+            // Normalize to 0..1 over our dyn_range display range.
+            float level_norm = (level_db - floor_db) / dyn_range;
             if (level_norm < 0) level_norm = 0;
             if (level_norm > 1) level_norm = 1;
 
             uint32_t color = spek_palette(m_palette, level_norm);
-            // Convert 0xRRGGBB to BGRA for DIB
+            // Convert 0xRRGGBB → BGRA for top-down 32-bit DIB
             uint8_t r = (color >> 16) & 0xFF;
             uint8_t g = (color >> 8) & 0xFF;
-            uint8_t b = color & 0xFF;
+            uint8_t b =  color        & 0xFF;
             pixel_data[py * width + px] = (b << 16) | (g << 8) | r;
         }
     }
@@ -726,10 +793,13 @@ void SpectrumCompareWindow::render_freq_axis(CDCHandle dc, const RECT& rc, int s
         int freq_hz = khz * 1000;
         if (freq_hz > nyquist) continue;
 
-        // Map frequency to y position (matching spectrum's pow(1.5) compression)
-        float freq_ratio = (float)freq_hz / nyquist;
-        float freq_norm = powf(freq_ratio, 2.0f / 3.0f);
-        int py = rc.top + (int)((1.0f - freq_norm) * (height - 1));
+        // Map frequency to y-coordinate: LINEAR over [0, nyquist],
+        // matching render_spectrum()'s new linear bin mapping.  So the
+        // visual distance between 0–5, 5–10, 10–15, … kHz ticks is
+        // exactly equal — this is what Spek does too.
+        float freq_ratio = (float)freq_hz / nyquist;   // 0.0 (DC) → 1.0 (Nyquist)
+        // bottom of rect = DC, top of rect = Nyquist.
+        int py = rc.top + (int)((1.0f - freq_ratio) * (height - 1));
 
         if (py < rc.top || py > rc.bottom) continue;
 
@@ -895,17 +965,19 @@ LRESULT SpectrumCompareWindow::OnSpectrumReady(UINT uMsg, WPARAM wParam, LPARAM 
 // does the same translation but with an explicit local leaf_idms.
 //
 // Flat layout (indexed 0..N-1):
-//   [0..3]  Display count  ▶  1 / 2 / 3 / 4 tracks
-//   [4..8]  Palette        ▶  Spectrum / SoX / Mono / Spek / Spek-X
-//   [9..10] Axes           ▶  Freq / Time
-//   [11..12] Title format  ▶  Edit / Reset
-//   [13]    Refresh analysis
+//   [0..3]   Display count  ▶  1 / 2 / 3 / 4 tracks        (4 leaves)
+//   [4..8]   Palette        ▶  Spectrum / SoX / Mono / Spek / Spek-X  (5 leaves)
+//   [9..13]  FFT size       ▶  1024 / 2048 / 4096 / 8192 / 16384     (5 leaves)
+//   [14..15] Axes           ▶  Freq / Time                 (2 leaves)
+//   [16..17] Title format   ▶  Edit / Reset                (2 leaves)
+//   [18]     Refresh analysis                              (1 leaf)
 static constexpr size_t kCountIdx    = 0;
 static constexpr size_t kPaletteIdx  = 4;
-static constexpr size_t kAxesIdx     = 9;
-static constexpr size_t kTitleIdx    = 11;
-static constexpr size_t kRefreshIdx  = 13;
-static constexpr size_t kTotalLeaves = 14;
+static constexpr size_t kFftIdx      = 9;
+static constexpr size_t kAxesIdx     = 14;
+static constexpr size_t kTitleIdx    = 16;
+static constexpr size_t kRefreshIdx  = 18;
+static constexpr size_t kTotalLeaves = 19;
 
 static void build_display_count_popup(HMENU hmenu, unsigned base, int max_tracks,
                                       std::vector<UINT>& leaf_idms) {
@@ -937,6 +1009,33 @@ static void build_palette_popup(HMENU hmenu, unsigned base, palette_t current,
     }
 }
 
+// FFT size submenu — 5 sizes matching Spek's MIN_FFT_BITS..MAX_FFT_BITS
+// range (bits 10..14 = 1024..16384).  Each label shows the resulting
+// spectral bin width (Hz per bin) at 44.1 kHz so the user can see at a
+// glance how "细腻" each choice is — e.g. 2048 = ~21 Hz / bin at 44k1.
+static void build_fft_popup(HMENU hmenu, unsigned base, int current_bits,
+                            std::vector<UINT>& leaf_idms) {
+    struct E { UINT id; LPCTSTR label; int bits; };
+    // Bin width at 44100 Hz (the most common sampling rate) so the
+    // displayed numbers match the vast majority of the user's tracks.
+    // Formula: bin_hz = sample_rate / (1 << bits).  Integer truncation
+    // below is fine because we only need a hint (Spek's own menu shows
+    // the same kind of approximate Hz/bin values).
+    static const E s_rows[5] = {
+        { IDM_FFT_1024,  _T("1024  (43 Hz / bin)"),  10 },
+        { IDM_FFT_2048,  _T("2048  (21 Hz / bin)"),  11 },
+        { IDM_FFT_4096,  _T("4096  (11 Hz / bin)"),  12 },
+        { IDM_FFT_8192,  _T("8192  (5 Hz / bin)"),   13 },
+        { IDM_FFT_16384, _T("16384 (3 Hz / bin)"),   14 },
+    };
+    PFC_ASSERT(leaf_idms.size() == kFftIdx);
+    for (auto& r : s_rows) {
+        ::AppendMenu(hmenu, MF_STRING | (current_bits == r.bits ? MF_CHECKED : 0),
+                     base + (unsigned)leaf_idms.size(), r.label);
+        leaf_idms.push_back(r.id);
+    }
+}
+
 static void build_axes_popup(HMENU hmenu, unsigned base, bool show_freq, bool show_time,
                              std::vector<UINT>& leaf_idms) {
     PFC_ASSERT(leaf_idms.size() == kAxesIdx);
@@ -961,6 +1060,7 @@ static void build_title_format_popup(HMENU hmenu, unsigned base,
 // leaf id mapping (size == kTotalLeaves).
 static std::vector<UINT> build_settings_block(HMENU p_menu, unsigned p_id_base,
                                               int max_tracks, palette_t palette,
+                                              int fft_bits,
                                               bool show_freq, bool show_time) {
     std::vector<UINT> leaf_idms;
     leaf_idms.reserve(kTotalLeaves);
@@ -985,6 +1085,19 @@ static std::vector<UINT> build_settings_block(HMENU p_menu, unsigned p_id_base,
 
     WIN32_OP_D(::AppendMenu(p_menu, MF_SEPARATOR, 0, _T("")));
 
+    // FFT size submenu — larger FFT = finer frequency resolution but
+    // coarser time resolution (industry tradeoff).  We default to 2048
+    // which matches Spek and gives a nice 细腻/性能 balance; 8192+ on
+    // long tracks can take several seconds per file so the user opts in.
+    {
+        CMenu fft_menu; WIN32_OP_D(fft_menu.CreatePopupMenu() != NULL);
+        build_fft_popup(fft_menu, p_id_base, fft_bits, leaf_idms);
+        WIN32_OP_D(::AppendMenu(p_menu, MF_POPUP, (UINT_PTR)fft_menu.m_hMenu, _T("FFT size")));
+        fft_menu.Detach();
+    }
+
+    WIN32_OP_D(::AppendMenu(p_menu, MF_SEPARATOR, 0, _T("")));
+
     // Axes submenu
     {
         CMenu axes_menu; WIN32_OP_D(axes_menu.CreatePopupMenu() != NULL);
@@ -1003,7 +1116,7 @@ static std::vector<UINT> build_settings_block(HMENU p_menu, unsigned p_id_base,
 
     WIN32_OP_D(::AppendMenu(p_menu, MF_SEPARATOR, 0, _T("")));
 
-    // Refresh analysis (flat item) — the 12th leaf (index kRefreshIdx).
+    // Refresh analysis (flat item) — the last leaf (index kRefreshIdx).
     PFC_ASSERT(leaf_idms.size() == kRefreshIdx);
     WIN32_OP_D(::AppendMenu(p_menu, MF_STRING, p_id_base + (unsigned)leaf_idms.size(), _T("Refresh analysis")));
     leaf_idms.push_back(IDM_REFRESH);
@@ -1083,7 +1196,8 @@ void SpectrumCompareWindow::edit_mode_context_menu_build(const POINT& /*p_point*
     }
 
     m_edit_mode_cmd_to_idm = build_settings_block(
-        p_menu, p_id_base, m_max_tracks, m_palette, m_show_freq_axis, m_show_time_axis);
+        p_menu, p_id_base, m_max_tracks, m_palette, m_fft_bits,
+        m_show_freq_axis, m_show_time_axis);
 }
 
 void SpectrumCompareWindow::edit_mode_context_menu_command(
@@ -1126,7 +1240,8 @@ void SpectrumCompareWindow::OnContextMenu(CWindow wnd, CPoint point) {
     // Build settings block with id_base = 0, so each leaf's cmd id is a
     // 0-based index we can look up in `leaf_idms`.
     const std::vector<UINT> leaf_idms = build_settings_block(
-        menu, 0, m_max_tracks, m_palette, m_show_freq_axis, m_show_time_axis);
+        menu, 0, m_max_tracks, m_palette, m_fft_bits,
+        m_show_freq_axis, m_show_time_axis);
 
     CPoint ptShow = point;
     if (ptShow.x == -1 && ptShow.y == -1) {
@@ -1230,6 +1345,40 @@ void SpectrumCompareWindow::OnPalette(UINT uNotifyCode, int nID, CWindow wndCtl)
     }
     g_cfg_palette = (int64_t)m_palette;
     Invalidate();
+}
+
+void SpectrumCompareWindow::OnFFTSize(UINT uNotifyCode, int nID, CWindow wndCtl) {
+    (void)uNotifyCode; (void)wndCtl;
+
+    int new_bits = 0;
+    switch (nID) {
+    case IDM_FFT_1024:  new_bits = 10; break;
+    case IDM_FFT_2048:  new_bits = 11; break;
+    case IDM_FFT_4096:  new_bits = 12; break;
+    case IDM_FFT_8192:  new_bits = 13; break;
+    case IDM_FFT_16384: new_bits = 14; break;
+    default: return; // unknown id → ignore
+    }
+
+    if (new_bits == m_fft_bits) return;  // no change, nothing to do
+
+    // 1) commit runtime + persistent cfg
+    m_fft_bits = new_bits;
+    g_cfg_fft_bits = (int64_t)new_bits;
+
+    // 2) push to analyzer so tracks analyzed from this moment on use the new size
+    m_analyzer.set_fft_bits(new_bits);
+
+    // 3) FFT size changes the number of bins and the spectrum layout — we
+    //    must re-analyze every currently-loaded track, not just repaint.
+    //    Wipe m_last_selection so update_selection() can't short-circuit.
+    m_last_selection = last_selection_key{};
+
+    // 4) reuse the Refresh machinery: it aborts inflight threads, rebuilds
+    //    the TrackSpectrum list with fresh abort_callbacks, then calls
+    //    start_analysis_for_track for each one.  Cheaper than duplicating
+    //    all that code inline.
+    OnRefresh(0, IDM_REFRESH, nullptr);
 }
 
 // ============================================================

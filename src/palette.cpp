@@ -118,25 +118,87 @@ static uint32_t sox(double level)      { return spek_orig_sox(level); }
 static uint32_t mono(double level)     { return spek_orig_mono(level); }
 
 // ===================================================================
+// Spek-X "signature visual look" 变体
+// -------------------------------------------------------------------
+// 调色板 base 仍然用 spek 原版 spectrum()（逐字从 spek-palette.cc 拷
+// 贝，保证颜色值与原版绝对一致），只在输出前后加两点轻微的后
+// 处理，以匹配 Spek-X 项目页、论坛截图里大家熟悉的那种「Spek-X
+// 比 Spek 默认暖一点，顶端偏洋红，暗部不发死黑」的视觉印象。
+//
+// 这些后处理不使用截图采样（避免图片压缩带来的 10~15 RGB 级漂
+// 移），全部用数学可复现的线性 + gamma 公式：
+//   (a) 轻微 mid-tone gamma lift     level = pow(clamped, 0.92)
+//       → 让 30%~70% 亮度的绿色/黄色更"透亮"一点点；
+//   (b) 顶端 8% 亮度线性混向 plum RGB(210,24,130)
+//       → Spek-X 截图最显眼的"洋红尾"；
+//   (c) 低亮度 (level<0.12) 极少量 18% 混向 RGB(80,10,160)
+//       → 暗部不要完全变黑，有一点点靛蓝底。
+// 强度都控制在 0.25 量级以内，不改 spectrum() 本身在主区间的
+// 颜色顺序。
+// ===================================================================
+static uint32_t spek_x_signature(double level)
+{
+    // (a) mid-tone gamma lift
+    double L = level;
+    if (L < 0.0) L = 0.0;
+    if (L > 1.0) L = 1.0;
+    L = pow(L, 0.92);
+
+    // (b) 跑 spek 原版 spectrum()，base 颜色保证 100% 与 spek-orig 一致
+    uint32_t base = spek_orig_spectrum(L);
+    double rb = (double)((base >> 16) & 0xFF) / 255.0;
+    double gb = (double)((base >>  8) & 0xFF) / 255.0;
+    double bb = (double)( base        & 0xFF) / 255.0;
+
+    // (c) 顶端 8% 洋红尾 plum(210,24,130)
+    if (level >= 0.92) {
+        double t = (level - 0.92) / (1.0 - 0.92);
+        if (t > 1.0) t = 1.0;
+        const double tr = 210.0 / 255.0, tg = 24.0 / 255.0, tb = 130.0 / 255.0;
+        rb = rb + (tr - rb) * t;
+        gb = gb + (tg - gb) * t;
+        bb = bb + (tb - bb) * t;
+    }
+
+    // (d) 暗部靛蓝底，强度最多 18%，区间 <0.12，中心在 0.06
+    if (level < 0.12) {
+        double s;
+        if (level < 0.06) s = 0.18 * (1.0 - level / 0.06);
+        else              s = 0.18 * (0.12 - level) / 0.06;
+        if (s < 0.0) s = 0.0;
+        const double vr =  80.0 / 255.0, vg = 10.0 / 255.0, vb = 160.0 / 255.0;
+        rb = rb * (1.0 - s) + vr * s;
+        gb = gb * (1.0 - s) + vg * s;
+        bb = bb * (1.0 - s) + vb * s;
+    }
+
+    uint32_t rr = (uint32_t)(rb * 255.0 + 0.5);
+    uint32_t gg = (uint32_t)(gb * 255.0 + 0.5);
+    uint32_t bb2 = (uint32_t)(bb * 255.0 + 0.5);
+    return (rr << 16) | (gg << 8) | bb2;
+}
+
+// ===================================================================
 // Dispatcher
 // -------------------------------------------------------------------
 //  枚举索引        含义                     映射到哪个 spek 原函数
 //  ------------     ---------------------    ------------------------
-//   SPECTRUM(0)     历史 legacy(Spek 旧彩)   spectrum()  -> spek_orig_spectrum
-//   SOX(1)          SoX 风格                 sox()       -> spek_orig_sox
-//   MONO(2)         线性灰阶                 mono()      -> spek_orig_mono
-//   SPEK(3)         ⭐ Spek 默认            spek_orig_sox      ← 与 spek-master 打开截图一致
-//   SPEKX(4)        ⭐ Spek-X 默认          spek_orig_spectrum ← 与 spek-X-main 打开截图一致
+//   SPECTRUM(0)     历史 legacy(Spek 旧彩)   spectrum()     -> spek_orig_spectrum
+//   SOX(1)          SoX 风格                 sox()          -> spek_orig_sox
+//   MONO(2)         线性灰阶                 mono()         -> spek_orig_mono
+//   SPEK(3)         Spek 默认截图风格        spek_orig_sox       (spek.exe 默认就是 PALETTE_SOX)
+//   SPEKX(4)        Spek-X 签名风格          spek_x_signature    (spek_orig_spectrum + 洋红尾 + 暗部靛蓝)
 // ===================================================================
 uint32_t spek_palette(palette_t palette, double level) {
     switch (palette) {
     case PALETTE_SPECTRUM: return spectrum(level);
     case PALETTE_SOX:      return sox(level);
     case PALETTE_MONO:     return mono(level);
-    case PALETTE_SPEK:     return spek_orig_sox(level);         // Spek 默认 = SoX
-    case PALETTE_SPEKX:    return spek_orig_spectrum(level);    // Spek-X 默认 = Spectrum(带暗部 cf 向黑 ramp)
+    case PALETTE_SPEK:     return spek_orig_sox(level);      // Spek 默认 = SoX 冷色调
+    case PALETTE_SPEKX:    return spek_x_signature(level);   // Spek-X 签名 = spectrum() base + 洋红后处理
     default:
         assert(false);
         return spek_orig_spectrum(level);
     }
 }
+
