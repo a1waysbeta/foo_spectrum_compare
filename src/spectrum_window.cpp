@@ -69,11 +69,6 @@ SpectrumCompareWindow::~SpectrumCompareWindow() {
         KillTimer(TIMER_END_EDIT);
     }
 
-    // Unhook the pre-message-map window subclass before destroying the HWND.
-    // This is symmetric to install_outer_window_subclass() and prevents a
-    // race where the subclass proc is invoked on a half-destroyed window.
-    uninstall_outer_window_subclass();
-
     // Unregister playlist callback
     try {
         static_api_ptr_t<playlist_manager>()->unregister_callback(this);
@@ -96,13 +91,6 @@ SpectrumCompareWindow::~SpectrumCompareWindow() {
 
 void SpectrumCompareWindow::initialize_window(HWND parent) {
     WIN32_OP(Create(parent) != NULL);
-
-    // Install the outermost window subclass BEFORE anything else. This
-    // sits in front of WTL's window procedure and lets us filter
-    // WM_CONTEXTMENU depending on edit mode — see outer_window_subclass_proc
-    // for a detailed motivation. It MUST be the very first subclass we
-    // install so it gets messages before our WTL ProcessWindowMessage.
-    install_outer_window_subclass();
 
     // Register playlist callback for active playlist
     static_api_ptr_t<playlist_manager>()->register_callback(
@@ -185,7 +173,35 @@ void SpectrumCompareWindow::update_selection() {
     static_api_ptr_t<playlist_manager>()->activeplaylist_get_selected_items(selected);
 
     // Determine how many tracks to display
-    size_t display_count = (std::min)((size_t)m_max_tracks, selected.get_size());
+    const size_t max_tracks_sz = (size_t)m_max_tracks;
+    const size_t display_count = (std::min)(max_tracks_sz, selected.get_count());
+
+    // ------------------------------------------------------------------
+    // Short-circuit: if the effective selection (first `display_count`
+    // tracks, with current `m_max_tracks` cap) is byte-for-byte identical
+    // to the last one we processed, there is nothing to abort or start.
+    //
+    // This guards against synthetic playlist callbacks:
+    //   * inline title-format editor closes on Enter → focus returns →
+    //     foobar2000 re-fires on_items_selection_change even though the
+    //     selection itself did not change;
+    //   * layout / visibility / reorder notifications that come in as
+    //     on_items_added / on_items_reordered with identical contents.
+    // Without this, every Enter press would abort all in-flight threads
+    // and restart the analysis → the user sees the spectrum "reload".
+    //
+    // We still always Invalidate() so label rendering / axes / title text
+    // pick up config changes (palette swap, titleformat edit, axis toggle)
+    // independently of the playlist state.
+    // ------------------------------------------------------------------
+    const bool selection_unchanged = m_last_selection.equals(
+        max_tracks_sz, selected);
+    if (selection_unchanged) {
+        // Callers expect the view to refresh; just redraw, don't touch
+        // the analysis state.
+        Invalidate();
+        return;
+    }
 
     // Build new track list, reusing existing data where possible
     std::vector<std::shared_ptr<TrackSpectrum>> new_tracks;
@@ -244,6 +260,10 @@ void SpectrumCompareWindow::update_selection() {
             start_analysis_for_track(i);
         }
     }
+
+    // Remember the selection snapshot AFTER a successful processing run so
+    // the fast path can return on subsequent identical callbacks.
+    m_last_selection.assign(max_tracks_sz, selected, display_count);
 
     Invalidate();
 }
@@ -667,48 +687,68 @@ LRESULT SpectrumCompareWindow::OnSpectrumReady(UINT uMsg, WPARAM wParam, LPARAM 
 // ------------------------------------------------------------
 // Two modes, selected via m_callback->is_edit_mode_enabled() so we match
 // the behaviour of every other Default UI / Columns UI panel:
-//   * Layout Editing Mode ON  → We do NOTHING with WM_CONTEXTMENU. The
-//                               outer_window_subclass_proc has already
-//                               skipped our WTL message map entirely, so
-//                               the message is left to foobar2000's host
-//                               pretranslate routing which calls
-//                               standard_edit_context_menu with the real
-//                               slot (p_id) and produces Replace / Cut /
-//                               Copy / Paste that actually operate on the
-//                               live layout. This matches playlist_tree's
-//                               DUIElement which simply does NOT register a
-//                               MSG_WM_CONTEXTMENU.
+//   * Layout Editing Mode ON  → We route WM_CONTEXTMENU with
+//                               SetMsgHandled(FALSE) so DefWindowProc is
+//                               invoked (exactly what ControlPanelDUI in
+//                               foo_nowbar returns from the final
+//                               handle_message() branch).  The foobar2000
+//                               host has its own message-routing layer
+//                               that observes right-clicks on element
+//                               windows and invokes
+//                               ui_element_edit_tools::standard_edit_context_menu
+//                               with the real slot (p_id); that path is
+//                               what produces Replace / Cut / Copy / Paste
+//                               commands which actually mutate the live
+//                               layout.
 //   * Layout Editing Mode OFF → Spectrum Compare settings menu
-//
-// NOTE: The reason we cannot "forward WM_CONTEXTMENU to the parent
-// container" (the approach we tried and discarded) is that containers
-// re-hit-test the coordinates with ChildWindowFromPointEx, and when the
-// menu position sits on a pane, the splitter/panel-stack assumes *itself*
-// to be the target and shows its own menu. Only the default foobar2000
-// host routing — which is exactly what we reach by NOT processing the
-// message — iterates over real child *slots* and invokes
-// standard_edit_context_menu for each slot that contains the hit point.
 // ============================================================
 
 void SpectrumCompareWindow::OnContextMenu(CWindow wnd, CPoint point) {
     (void)wnd;
-    (void)point;
 
     // ------------------------------------------------------------------
-    // Safety: if this handler is ever reached with edit mode ON (e.g.
-    // outer subclass was unhooked on an unusual path), just bail. The
-    // whole point is that Edit Mode → we do NOT bring up our own menu.
+    // Layout Editing Mode: do NOTHING on our side. Exactly as foo_nowbar
+    // and foo_uie_playlist_tree do (they simply don't register a
+    // MSG_WM_CONTEXTMENU handler at all).
+    //
+    // We SetMsgHandled(FALSE) so our WTL window procedure will fall
+    // through to DefWindowProc(m_hWnd, WM_CONTEXTMENU, ...), which —
+    // like ControlPanelDUI::handle_message()'s final
+    //     return DefWindowProc(m_hwnd, msg, wp, lp)
+    // branch — leaves the message on the default routing path. The
+    // Default UI / Columns UI host (which has a hook / subclass /
+    // pre-translate layer that both foo_nowbar and playlist_tree rely
+    // on) then catches the right-click event, walks our slot, and calls
+    // ui_element_edit_tools::standard_edit_context_menu with the real
+    // slot p_id — and *that* brings up a proper Replace/Cut/Copy/Paste
+    // menu whose commands actually operate on the live layout.
+    //
+    // If we were to return; here (SetMsgHandled defaulting to TRUE) or
+    // if we forwarded the message ourselves to some parent, we'd either
+    // silently swallow it → no menu, or re-route it to a splitter that
+    // shows the container-level menu instead of the element-level menu
+    // — the two bugs the user previously reported.
     // ------------------------------------------------------------------
     if (m_callback->is_edit_mode_enabled()) {
+        SetMsgHandled(FALSE);
         return;
     }
 
     // ------------------------------------------------------------------
-    // Normal mode: show Spectrum Compare settings menu (what used to be the
-    // only context menu this panel had).
+    // Normal mode: show Spectrum Compare settings menu (Display count /
+    // Palette / Axes / Title format / Refresh analysis).
     // ------------------------------------------------------------------
     CMenu menu;
     menu.CreatePopupMenu();
+    // (CPoint from Apps-key / Shift+F10 contains (-1,-1); pin the menu
+    // to the panel centre so it appears on-screen, matching the usual
+    // Windows convention for context-key-driven menus.)
+    CPoint pt;
+    if (point.x == -1 && point.y == -1) {
+        CRect rc; GetWindowRect(&rc); pt = rc.CenterPoint();
+    } else {
+        pt = point;
+    }
 
     // Display count submenu
     CMenu count_menu;
@@ -784,6 +824,7 @@ void SpectrumCompareWindow::OnSetCount(UINT uNotifyCode, int nID, CWindow wndCtl
 }
 
 void SpectrumCompareWindow::OnRefresh(UINT uNotifyCode, int nID, CWindow wndCtl) {
+    (void)uNotifyCode; (void)nID; (void)wndCtl;
     // Mark all tracks as needing re-analysis
     {
         std::lock_guard<std::mutex> lock(m_tracks_mutex);
@@ -796,6 +837,12 @@ void SpectrumCompareWindow::OnRefresh(UINT uNotifyCode, int nID, CWindow wndCtl)
             t->data.error = false;
         }
     }
+
+    // Invalidate the selection-snapshot cache so the next update_selection()
+    // call (or the manual loop below) will actually restart analysis. Without
+    // this, update_selection() would see identical handles and short-circuit
+    // while data.ready stays false → "refresh analysis" looks like a no-op.
+    m_last_selection = last_selection_key{};
     // Brief wait for in-flight threads to observe abort and mark analyzing=false.
     // Then reset the abort state by creating new TrackSpectrum entries is overkill;
     // instead we just wait for analyzing to clear.
@@ -1147,73 +1194,6 @@ LRESULT CALLBACK SpectrumCompareWindow::parent_subclass_proc(
         if (self != NULL) self->m_hwnd_parent = NULL;
         break;
     }
-    return ::DefSubclassProc(hWnd, uMsg, wParam, lParam);
-}
-
-// ============================================================
-// Outer (pre-message-map) window subclass
-// ------------------------------------------------------------
-// This sits in front of our WTL window procedure. For WM_CONTEXTMENU:
-//   * edit mode ON  → return 0, do NOT call DefSubclassProc. Our
-//                     ProcessWindowMessage never sees the message. The
-//                     original WM_CONTEXTMENU gets discarded *from this
-//                     chain*, but foobar2000's host already has its own
-//                     message routing (pretranslate / slot-based dispatch)
-//                     that triggered this message and will run its
-//                     Replace/Cut/Copy/Paste path on us regardless.
-//                     (This is exactly what happens to DUIElement: it
-//                     doesn't register MSG_WM_CONTEXTMENU so it simply
-//                     never sees the message.)
-//   * edit mode OFF → fall through to DefSubclassProc → our
-//                     ProcessWindowMessage → OnContextMenu → settings menu
-// ============================================================
-void SpectrumCompareWindow::install_outer_window_subclass() {
-    if (m_hWnd == NULL) return;
-    // ComCtl32 SetWindowSubclass works correctly here even though WTL
-    // itself uses a different StartWindowProc mechanism — the two
-    // chaining systems stack properly.
-    ::SetWindowSubclass(
-        m_hWnd,
-        outer_window_subclass_proc,
-        IDC_OUTER_SUBCLASS,
-        (DWORD_PTR)this);
-}
-
-void SpectrumCompareWindow::uninstall_outer_window_subclass() {
-    if (m_hWnd == NULL) return;
-    ::RemoveWindowSubclass(m_hWnd, outer_window_subclass_proc, IDC_OUTER_SUBCLASS);
-}
-
-LRESULT CALLBACK SpectrumCompareWindow::outer_window_subclass_proc(
-    HWND hWnd, UINT uMsg, WPARAM wParam, LPARAM lParam,
-    UINT_PTR uIdSubclass, DWORD_PTR dwRefData)
-{
-    (void)hWnd; (void)uIdSubclass;
-    SpectrumCompareWindow* self = (SpectrumCompareWindow*)dwRefData;
-
-    if (uMsg == WM_CONTEXTMENU && self != NULL && self->m_callback.is_valid()) {
-        try {
-            if (self->m_callback->is_edit_mode_enabled()) {
-                // Consume the message silently. Do NOT DefSubclassProc.
-                // Our own WTL MSG_WM_CONTEXTMENU handler is bypassed, and
-                // foobar2000's host-level dispatch (which fires before
-                // this window proc returns to the message loop — it is
-                // the reason we received this very message) has already
-                // identified the slot we occupy and will invoke
-                // standard_edit_context_menu targeting us.
-                return 0;
-            }
-        } catch (...) {
-            // Miserly fallback in case callback dies mid-call: just let
-            // the normal chain run.
-        }
-    }
-
-    if (uMsg == WM_NCDESTROY) {
-        // Mirror our explicit uninstall hook so there's no dangling proc.
-        ::RemoveWindowSubclass(hWnd, outer_window_subclass_proc, uIdSubclass);
-    }
-
     return ::DefSubclassProc(hWnd, uMsg, wParam, lParam);
 }
 
