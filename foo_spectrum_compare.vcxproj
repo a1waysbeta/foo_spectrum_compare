@@ -170,6 +170,7 @@
   </ItemDefinitionGroup>
   <ItemGroup>
     <ClCompile Include="src\fft.cpp" />
+    <ClCompile Include="src\i18n.cpp" />
     <ClCompile Include="src\main.cpp" />
     <ClCompile Include="src\palette.cpp" />
     <ClCompile Include="src\PCH.cpp">
@@ -183,6 +184,7 @@
   </ItemGroup>
   <ItemGroup>
     <ClInclude Include="src\fft.h" />
+    <ClInclude Include="src\i18n.h" />
     <ClInclude Include="src\palette.h" />
     <ClInclude Include="src\spectrum_analyzer.h" />
     <ClInclude Include="src\spectrum_window.h" />
