@@ -713,18 +713,24 @@ void SpectrumCompareWindow::OnContextMenu(CWindow wnd, CPoint point) {
         WIN32_OP_D(menu.CreatePopupMenu());
 
         // Disabled name header (matches host's standard_edit_context_menu).
+        // NOTE: casts are required to disambiguate WTL's two AppendMenu
+        // overloads (UINT,UINT_PTR,LPCTSTR) vs (UINT,HMENU,LPCTSTR).
         WIN32_OP_D(menu.AppendMenu(
-            MF_STRING | MF_DISABLED | MF_GRAYED, 0,
-            pfc::stringcvt::string_os_from_utf8(elemName)));
-        WIN32_OP_D(menu.AppendMenu(MF_SEPARATOR, 0, _T("")));
+            MF_STRING | MF_DISABLED | MF_GRAYED,
+            (UINT_PTR)0,
+            (LPCTSTR)pfc::stringcvt::string_os_from_utf8(elemName)));
+        WIN32_OP_D(menu.AppendMenu(MF_SEPARATOR));
 
-        WIN32_OP_D(menu.AppendMenu(MF_STRING, kEditReplace, _T("Replace UI Element")));
-        WIN32_OP_D(menu.AppendMenu(MF_SEPARATOR, 0, _T("")));
-        WIN32_OP_D(menu.AppendMenu(MF_STRING, kEditCut,   _T("Cut UI Element")));
-        WIN32_OP_D(menu.AppendMenu(MF_STRING, kEditCopy,  _T("Copy UI Element")));
+        WIN32_OP_D(menu.AppendMenu(
+            MF_STRING, (UINT_PTR)kEditReplace, _T("Replace UI Element")));
+        WIN32_OP_D(menu.AppendMenu(MF_SEPARATOR));
+        WIN32_OP_D(menu.AppendMenu(
+            MF_STRING, (UINT_PTR)kEditCut,  _T("Cut UI Element")));
+        WIN32_OP_D(menu.AppendMenu(
+            MF_STRING, (UINT_PTR)kEditCopy, _T("Copy UI Element")));
         WIN32_OP_D(menu.AppendMenu(
             MF_STRING | (canPaste ? 0 : (MF_DISABLED | MF_GRAYED)),
-            kEditPaste, _T("Paste UI Element")));
+            (UINT_PTR)kEditPaste, _T("Paste UI Element")));
 
         int cmd = 0;
         {
@@ -798,10 +804,10 @@ void SpectrumCompareWindow::OnContextMenu(CWindow wnd, CPoint point) {
     // Display count submenu
     CMenu count_menu;
     count_menu.CreatePopupMenu();
-    count_menu.AppendMenu(MF_STRING | (m_max_tracks == 1 ? MF_CHECKED : 0), IDM_SET_COUNT_1, _T("1 track"));
-    count_menu.AppendMenu(MF_STRING | (m_max_tracks == 2 ? MF_CHECKED : 0), IDM_SET_COUNT_2, _T("2 tracks"));
-    count_menu.AppendMenu(MF_STRING | (m_max_tracks == 3 ? MF_CHECKED : 0), IDM_SET_COUNT_3, _T("3 tracks"));
-    count_menu.AppendMenu(MF_STRING | (m_max_tracks == 4 ? MF_CHECKED : 0), IDM_SET_COUNT_4, _T("4 tracks"));
+    count_menu.AppendMenu(MF_STRING | (m_max_tracks == 1 ? MF_CHECKED : 0), (UINT_PTR)IDM_SET_COUNT_1, _T("1 track"));
+    count_menu.AppendMenu(MF_STRING | (m_max_tracks == 2 ? MF_CHECKED : 0), (UINT_PTR)IDM_SET_COUNT_2, _T("2 tracks"));
+    count_menu.AppendMenu(MF_STRING | (m_max_tracks == 3 ? MF_CHECKED : 0), (UINT_PTR)IDM_SET_COUNT_3, _T("3 tracks"));
+    count_menu.AppendMenu(MF_STRING | (m_max_tracks == 4 ? MF_CHECKED : 0), (UINT_PTR)IDM_SET_COUNT_4, _T("4 tracks"));
     menu.AppendMenu(MF_POPUP, (UINT_PTR)count_menu.m_hMenu, _T("Display count"));
 
     menu.AppendMenu(MF_SEPARATOR);
@@ -809,9 +815,9 @@ void SpectrumCompareWindow::OnContextMenu(CWindow wnd, CPoint point) {
     // Palette submenu
     CMenu palette_menu;
     palette_menu.CreatePopupMenu();
-    palette_menu.AppendMenu(MF_STRING | (m_palette == PALETTE_SPECTRUM ? MF_CHECKED : 0), IDM_PALETTE_SPECTRUM, _T("Spectrum (Spek)"));
-    palette_menu.AppendMenu(MF_STRING | (m_palette == PALETTE_SOX ? MF_CHECKED : 0), IDM_PALETTE_SOX, _T("SoX"));
-    palette_menu.AppendMenu(MF_STRING | (m_palette == PALETTE_MONO ? MF_CHECKED : 0), IDM_PALETTE_MONO, _T("Mono"));
+    palette_menu.AppendMenu(MF_STRING | (m_palette == PALETTE_SPECTRUM ? MF_CHECKED : 0), (UINT_PTR)IDM_PALETTE_SPECTRUM, _T("Spectrum (Spek)"));
+    palette_menu.AppendMenu(MF_STRING | (m_palette == PALETTE_SOX ? MF_CHECKED : 0), (UINT_PTR)IDM_PALETTE_SOX, _T("SoX"));
+    palette_menu.AppendMenu(MF_STRING | (m_palette == PALETTE_MONO ? MF_CHECKED : 0), (UINT_PTR)IDM_PALETTE_MONO, _T("Mono"));
     menu.AppendMenu(MF_POPUP, (UINT_PTR)palette_menu.m_hMenu, _T("Palette"));
 
     menu.AppendMenu(MF_SEPARATOR);
@@ -819,19 +825,19 @@ void SpectrumCompareWindow::OnContextMenu(CWindow wnd, CPoint point) {
     // Axes submenu
     CMenu axes_menu;
     axes_menu.CreatePopupMenu();
-    axes_menu.AppendMenu(MF_STRING | (m_show_freq_axis ? MF_CHECKED : 0), IDM_TOGGLE_FREQ_AXIS, _T("Frequency axis (kHz)"));
-    axes_menu.AppendMenu(MF_STRING | (m_show_time_axis ? MF_CHECKED : 0), IDM_TOGGLE_TIME_AXIS, _T("Time axis (20s)"));
+    axes_menu.AppendMenu(MF_STRING | (m_show_freq_axis ? MF_CHECKED : 0), (UINT_PTR)IDM_TOGGLE_FREQ_AXIS, _T("Frequency axis (kHz)"));
+    axes_menu.AppendMenu(MF_STRING | (m_show_time_axis ? MF_CHECKED : 0), (UINT_PTR)IDM_TOGGLE_TIME_AXIS, _T("Time axis (20s)"));
     menu.AppendMenu(MF_POPUP, (UINT_PTR)axes_menu.m_hMenu, _T("Axes"));
 
     // Title format submenu
     CMenu fmt_menu;
     fmt_menu.CreatePopupMenu();
-    fmt_menu.AppendMenu(MF_STRING, IDM_EDIT_TITLE_FORMAT, _T("Edit format..."));
-    fmt_menu.AppendMenu(MF_STRING, IDM_RESET_TITLE_FORMAT, _T("Reset to default"));
+    fmt_menu.AppendMenu(MF_STRING, (UINT_PTR)IDM_EDIT_TITLE_FORMAT, _T("Edit format..."));
+    fmt_menu.AppendMenu(MF_STRING, (UINT_PTR)IDM_RESET_TITLE_FORMAT, _T("Reset to default"));
     menu.AppendMenu(MF_POPUP, (UINT_PTR)fmt_menu.m_hMenu, _T("Title format"));
 
     menu.AppendMenu(MF_SEPARATOR);
-    menu.AppendMenu(MF_STRING, IDM_REFRESH, _T("Refresh analysis"));
+    menu.AppendMenu(MF_STRING, (UINT_PTR)IDM_REFRESH, _T("Refresh analysis"));
 
     CPoint ptShow = point;
     if (ptShow.x == -1 && ptShow.y == -1) {
