@@ -896,16 +896,16 @@ LRESULT SpectrumCompareWindow::OnSpectrumReady(UINT uMsg, WPARAM wParam, LPARAM 
 //
 // Flat layout (indexed 0..N-1):
 //   [0..3]  Display count  ▶  1 / 2 / 3 / 4 tracks
-//   [4..6]  Palette        ▶  Spectrum / SoX / Mono
-//   [7..8]  Axes           ▶  Freq axis / Time axis
-//   [9..10] Title format   ▶  Edit / Reset
-//   [11]    Refresh analysis
+//   [4..8]  Palette        ▶  Spectrum / SoX / Mono / Spek / Spek-X
+//   [9..10] Axes           ▶  Freq / Time
+//   [11..12] Title format  ▶  Edit / Reset
+//   [13]    Refresh analysis
 static constexpr size_t kCountIdx    = 0;
 static constexpr size_t kPaletteIdx  = 4;
-static constexpr size_t kAxesIdx     = 7;
-static constexpr size_t kTitleIdx    = 9;
-static constexpr size_t kRefreshIdx  = 11;
-static constexpr size_t kTotalLeaves = 12;
+static constexpr size_t kAxesIdx     = 9;
+static constexpr size_t kTitleIdx    = 11;
+static constexpr size_t kRefreshIdx  = 13;
+static constexpr size_t kTotalLeaves = 14;
 
 static void build_display_count_popup(HMENU hmenu, unsigned base, int max_tracks,
                                       std::vector<UINT>& leaf_idms) {
@@ -922,10 +922,12 @@ static void build_display_count_popup(HMENU hmenu, unsigned base, int max_tracks
 static void build_palette_popup(HMENU hmenu, unsigned base, palette_t current,
                                 std::vector<UINT>& leaf_idms) {
     struct E { UINT id; LPCTSTR label; palette_t value; };
-    static const E s_rows[3] = {
-        { IDM_PALETTE_SPECTRUM, _T("Spectrum (Spek)"), PALETTE_SPECTRUM },
-        { IDM_PALETTE_SOX,      _T("SoX"),              PALETTE_SOX },
-        { IDM_PALETTE_MONO,     _T("Mono"),             PALETTE_MONO },
+    static const E s_rows[5] = {
+        { IDM_PALETTE_SPECTRUM, _T("Spectrum (Spek legacy)"), PALETTE_SPECTRUM },
+        { IDM_PALETTE_SOX,      _T("SoX"),                     PALETTE_SOX },
+        { IDM_PALETTE_MONO,     _T("Mono"),                    PALETTE_MONO },
+        { IDM_PALETTE_SPEK,     _T("Spek"),                    PALETTE_SPEK },
+        { IDM_PALETTE_SPEKX,    _T("Spek-X"),                  PALETTE_SPEKX },
     };
     PFC_ASSERT(leaf_idms.size() == kPaletteIdx);
     for (auto& r : s_rows) {
@@ -1166,8 +1168,10 @@ void SpectrumCompareWindow::OnRefresh(UINT uNotifyCode, int nID, CWindow wndCtl)
 void SpectrumCompareWindow::OnPalette(UINT uNotifyCode, int nID, CWindow wndCtl) {
     switch (nID) {
     case IDM_PALETTE_SPECTRUM: m_palette = PALETTE_SPECTRUM; break;
-    case IDM_PALETTE_SOX: m_palette = PALETTE_SOX; break;
-    case IDM_PALETTE_MONO: m_palette = PALETTE_MONO; break;
+    case IDM_PALETTE_SOX:      m_palette = PALETTE_SOX;      break;
+    case IDM_PALETTE_MONO:     m_palette = PALETTE_MONO;     break;
+    case IDM_PALETTE_SPEK:     m_palette = PALETTE_SPEK;     break;
+    case IDM_PALETTE_SPEKX:    m_palette = PALETTE_SPEKX;    break;
     }
     g_cfg_palette = (int64_t)m_palette;
     Invalidate();
