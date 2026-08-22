@@ -661,35 +661,38 @@ LRESULT SpectrumCompareWindow::OnSpectrumReady(UINT uMsg, WPARAM wParam, LPARAM 
 // ============================================================
 
 namespace {
-    // Private command IDs for the edit-mode menu, kept as a safety net for
-    // hosts that don't have a dedicated layout-editing window above us.
-    enum {
-        kEditReplace = 5001,
-        kEditCut     = 5002,
-        kEditCopy    = 5003,
-        kEditPaste   = 5004
-    };
-
     // ------------------------------------------------------------------
-    // Walk up the parent chain to find the SDK popup host that owns our
-    // element. In Default UI and Columns UI this is the top-level host
-    // window returned by ui_element_impl_withpopup / ui_element_window,
-    // which is exactly the window that hosts a ui_element_edit_tools
-    // and correctly processes WM_CONTEXTMENU in Layout Editing Mode by
-    // showing Replace / Cut / Copy / Paste and executing them properly.
-    // We stop at the first top-level (WS_POPUP-style) popup shell we find
-    // to avoid forwarding to foobar2000's main window.
+    // Walk up the parent chain of an element window looking for the
+    // "closest non-leaf container" that really hosts the layout slot.
+    //
+    // In foobar2000's Default UI / Columns UI every ui_element lives as a
+    // direct child of its layout container (a ui_element_instance_host_base
+    // subclass, e.g. splitter / tabs / panel stack). That container both
+    // owns the child's slot p_id AND aggregates a ui_element_edit_tools,
+    // so only it can correctly execute Replace / Cut / Paste.
+    //
+    // The key difference from the previous "find the topmost popup"
+    // approach is: we MUST stop at the immediate parent chain members
+    // that still have WS_CHILD set, and break BEFORE any WS_POPUP /
+    // top-level window — the popup shell we used to forward to before is
+    // a dumb titlebar wrapper and has no idea about ui_element_edit_tools.
+    // This is exactly why playlist_tree / DUIElement simply DO NOT handle
+    // WM_CONTEXTMENU at all, and let the host window catch it first.
     // ------------------------------------------------------------------
-    HWND find_host_popup(HWND child) {
-        HWND best = NULL;
-        HWND cur  = ::GetParent(child);
+    HWND find_layout_container(HWND child) {
+        HWND cur = ::GetParent(child);
+        // If there is no parent at all, bail immediately — no forwarding.
+        if (cur == NULL) return NULL;
+        HWND best = cur;
         while (cur != NULL) {
-            best = cur;
             const LONG_PTR style = ::GetWindowLongPtr(cur, GWL_STYLE);
-            if ((style & WS_POPUP) != 0) break; // popup shell boundary
-            // Also stop if this parent has no parent itself (top-level).
-            if (::GetParent(cur) == NULL) break;
-            cur = ::GetParent(cur);
+            // Popup / overlapped shells wrap the layout; we don't want to
+            // forward to them because they only carry the chrome menu.
+            if ((style & WS_CHILD) == 0) break;
+            best = cur;
+            HWND up = ::GetParent(cur);
+            if (up == NULL || up == cur) break;
+            cur = up;
         }
         return best;
     }
@@ -700,117 +703,70 @@ void SpectrumCompareWindow::OnContextMenu(CWindow wnd, CPoint point) {
 
     // ------------------------------------------------------------------
     // Layout Editing Mode active:
-    //   We do NOT build our own menu. Instead, forward the WM_CONTEXTMENU
-    //   straight to the SDK popup host window that owns this element.
-    //   That host already has a ui_element_edit_tools and will bring up
-    //   Replace / Cut / Copy / Paste (optionally followed by any custom
-    //   items the host or this element declares via edit_mode_context_menu_*)
-    //   AND correctly execute those commands via its own host-side routing.
+    //   DO NOT build our own Replace / Cut / Copy / Paste menu. The only
+    //   implementation that can actually move/remove/paste a ui_element in
+    //   a layout slot is the one on the host side (see
+    //   ui_element_edit_tools::standard_edit_context_menu in
+    //   ui_element_helpers.cpp): it uses host_replace_element / replace_dialog
+    //   / host_paste_element which are overridden by the real container to
+    //   touch the slot (p_id). Our own ui_element_common_methods::cut() /
+    //   replace_element_dialog_start() calls had NO access to that p_id,
+    //   which is why Replace / Cut did literally nothing before.
     //
-    // If for some reason we don't have a real host parent (e.g. we were
-    // created as a raw standalone window), fall back to a minimal manual
-    // menu built on top of ui_element_common_methods / v3 APIs.
+    // Strategy: forward the raw WM_CONTEXTMENU to the innermost layout
+    // container that is a WS_CHILD ancestor. The container's message map
+    // (CHAIN_MSG_MAP(ui_element_instance_host_base) → ui_element_edit_tools
+    //  routed via its pretranslate or window subclass) will either catch
+    // it directly or re-route to standard_edit_context_menu for us.
+    // WPARAM of WM_CONTEXTMENU is the control that originated the message,
+    // i.e. our m_hWnd — passing it through lets the host know WHICH of its
+    // children (slot) to operate on, instead of operating on some other
+    // point.
     // ------------------------------------------------------------------
     if (m_callback->is_edit_mode_enabled()) {
-        HWND host = find_host_popup(m_hWnd);
+        HWND host = find_layout_container(m_hWnd);
         if (host != NULL && host != m_hWnd) {
             LPARAM lp;
             if (point.x == -1 && point.y == -1) {
                 lp = (LPARAM)-1;
             } else {
-                // WM_CONTEXTMENU lParam is screen coordinates in the LOWORD/HIWORD.
-                // CPoint from the MSG_WM_CONTEXTMENU macro already contains the
-                // screen coordinates verbatim.
                 lp = MAKELPARAM((short)point.x, (short)point.y);
             }
             ::SendMessage(host, WM_CONTEXTMENU, (WPARAM)m_hWnd, lp);
-            // Host has handled the menu + any command.
             return;
         }
-
-        // ============== FALLBACK (no usable host parent) =================
+        // No host parent could be determined. Instead of going through the
+        // wrong APIs (which silently no-op as observed), bail out and show
+        // a minimal menu with the ONLY command that is safe to run without
+        // a host-slot connection: Copy. For Cut / Replace / Paste we need
+        // the real container anyway.
         static_api_ptr_t<ui_element_common_methods> cm;
-
         CPoint pt;
         if (point.x == -1 && point.y == -1) {
-            CRect rc;
-            GetWindowRect(&rc);
-            pt = rc.CenterPoint();
+            CRect rc; GetWindowRect(&rc); pt = rc.CenterPoint();
         } else {
             pt = point;
         }
-
-        pfc::string8 elemName;
+        pfc::string8 elemName = "Spectrum Compare";
         {
             service_ptr_t<ui_element> e;
-            if (ui_element::g_find(e, guid_spectrum_compare)) {
-                e->get_name(elemName);
-            } else {
-                elemName = "Spectrum Compare";
-            }
+            if (ui_element::g_find(e, guid_spectrum_compare)) e->get_name(elemName);
         }
-        const bool canPaste = !!(cm->is_paste_available());
-
         CMenu menu;
         WIN32_OP_D(menu.CreatePopupMenu());
-
         WIN32_OP_D(menu.AppendMenu(
             MF_STRING | MF_DISABLED | MF_GRAYED,
             (UINT_PTR)0,
             (LPCTSTR)pfc::stringcvt::string_os_from_utf8(elemName)));
         WIN32_OP_D(menu.AppendMenu(MF_SEPARATOR));
-
-        WIN32_OP_D(menu.AppendMenu(
-            MF_STRING, (UINT_PTR)kEditReplace, _T("Replace UI Element")));
-        WIN32_OP_D(menu.AppendMenu(MF_SEPARATOR));
-        WIN32_OP_D(menu.AppendMenu(
-            MF_STRING, (UINT_PTR)kEditCut,  _T("Cut UI Element")));
         WIN32_OP_D(menu.AppendMenu(
             MF_STRING, (UINT_PTR)kEditCopy, _T("Copy UI Element")));
-        WIN32_OP_D(menu.AppendMenu(
-            MF_STRING | (canPaste ? 0 : (MF_DISABLED | MF_GRAYED)),
-            (UINT_PTR)kEditPaste, _T("Paste UI Element")));
-
-        int cmd = 0;
         {
-            HWND highlight = NULL;
-            try {
-                static_api_ptr_t<ui_element_common_methods_v3> cm3_hl;
-                highlight = cm3_hl->highlight_element(m_hWnd);
-            } catch (...) { highlight = NULL; }
-
             CMenuSelectionReceiver receiver(m_hWnd);
-            cmd = menu.TrackPopupMenu(
+            const int cmd = menu.TrackPopupMenu(
                 TPM_RIGHTBUTTON | TPM_NONOTIFY | TPM_RETURNCMD,
                 pt.x, pt.y, receiver);
-
-            if (highlight != NULL) ::DestroyWindow(highlight);
-        }
-
-        switch (cmd) {
-        case kEditReplace: {
-            static_api_ptr_t<ui_element_common_methods_v3> cm3;
-            auto notify = ui_element_replace_dialog_notify::create([](GUID) {});
-            cm3->replace_element_dialog_start(m_hWnd, guid_spectrum_compare, notify);
-            break;
-        }
-        case kEditCopy:
-            cm->copy(get_configuration());
-            break;
-        case kEditCut: {
-            ui_element_instance_ptr tmp(this);
-            static_api_ptr_t<ui_element_common_methods> cutApi;
-            cutApi->cut(tmp, m_hWnd, m_callback);
-            break;
-        }
-        case kEditPaste: {
-            ui_element_instance_ptr tmp(this);
-            static_api_ptr_t<ui_element_common_methods> pasteApi;
-            pasteApi->paste(tmp, m_hWnd, m_callback);
-            break;
-        }
-        default:
-            break;
+            if (cmd == (int)kEditCopy) cm->copy(get_configuration());
         }
         return;
     }
@@ -991,6 +947,22 @@ LRESULT CALLBACK SpectrumCompareWindow::title_edit_subclass_proc(
     SpectrumCompareWindow* self = (SpectrumCompareWindow*)dwRefData;
 
     switch (uMsg) {
+    // ------------------------------------------------------------------
+    // Critical: tell any dialog-style message loop (foobar2000 host uses
+    // IsDialogMessage / pretranslate_message) that THIS edit control wants
+    // to receive *all* keyboard input — including VK_RETURN, VK_ESCAPE and
+    // VK_TAB — instead of having it swallowed by the dialog manager before
+    // it ever reaches our WM_KEYDOWN / WM_CHAR handlers.
+    //
+    // This mirrors foo_uie_playlist_tree's edit_subclass_t (EditSubclass.h):
+    //   return DLGC_WANTALLKEYS | CallWindowProc(OldWndProc, ...)
+    // Without it, the host will intercept VK_RETURN on our behalf and the
+    // in-place edit never commits on Enter.
+    // ------------------------------------------------------------------
+    case WM_GETDLGCODE: {
+        const LRESULT base = DefSubclassProc(hWnd, uMsg, wParam, lParam);
+        return (base | DLGC_WANTALLKEYS);
+    }
     case WM_KEYDOWN:
     case WM_CHAR: {
         bool commit = false;
