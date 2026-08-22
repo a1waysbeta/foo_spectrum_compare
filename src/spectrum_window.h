@@ -75,15 +75,22 @@ public:
     void initialize_window(HWND parent);
     HWND get_wnd() { return *this; }
 
-    void set_configuration(ui_element_config::ptr config) { m_config = config; }
-    ui_element_config::ptr get_configuration() { return m_config; }
+    // --- ui_element instance configuration ---
+    //
+    // The host (Default UI / Columns UI) drives these when our panel is
+    // embedded in a layout, used as a floating popup, or exported /
+    // imported via Scratchbox (.fth), or copy-pasted between slots.
+    // We MUST round-trip *per-instance* runtime settings here — not just
+    // hold the opaque m_config blob we were constructed with. Otherwise
+    // "Export settings" writes 0 bytes of real payload and "Import /
+    // Paste settings" has nothing to apply, which was the original bug.
+    void set_configuration(ui_element_config::ptr config);
+    ui_element_config::ptr get_configuration();
 
     static GUID g_get_guid() { return guid_spectrum_compare; }
     static GUID g_get_subclass() { return ui_element_subclass_utility; }
     static void g_get_name(pfc::string_base& out) { out = "Spectrum Compare"; }
-    static ui_element_config::ptr g_get_default_configuration() {
-        return ui_element_config::g_create_empty(g_get_guid());
-    }
+    static ui_element_config::ptr g_get_default_configuration();
     static const char* g_get_description() {
         return "Vertical spectrogram comparison for selected tracks (Spek-style).";
     }

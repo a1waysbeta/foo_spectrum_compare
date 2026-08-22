@@ -16,7 +16,6 @@ SpectrumCompareWindow::SpectrumCompareWindow(
     ui_element_config::ptr config,
     ui_element_instance_callback_ptr p_callback)
     : m_callback(p_callback)
-    , m_config(config)
 {
     // Cache system DPI once at construction so rendering helpers don't need
     // to call ::GetDC(::GetDesktopWindow()) on every draw.
@@ -25,7 +24,11 @@ SpectrumCompareWindow::SpectrumCompareWindow(
     if (m_dpi < 96) m_dpi = 96;
     ::ReleaseDC(NULL, screenDC);
 
-    // Load persistent config into runtime members
+    // Load persistent config into runtime members as fallbacks, then let
+    // set_configuration() override them when a saved panel configuration
+    // exists. This ensures:
+    //   * Empty / default configuration falls back to cfg_* registry values.
+    //   * Imported .fth / pasted settings from Scratchbox win over cfg_*.
     m_show_freq_axis = g_cfg_show_freq_axis;
     m_show_time_axis = g_cfg_show_time_axis;
     m_title_format = g_cfg_title_format.get();
@@ -34,6 +37,9 @@ SpectrumCompareWindow::SpectrumCompareWindow(
 
     // Apply to analyzer
     m_analyzer.set_title_format(m_title_format.c_str());
+
+    // Apply the serialized instance configuration if present.
+    set_configuration(std::move(config));
 }
 
 SpectrumCompareWindow::~SpectrumCompareWindow() {
@@ -110,6 +116,162 @@ void SpectrumCompareWindow::initialize_window(HWND parent) {
 
     // Initial selection update
     update_selection();
+}
+
+// ============================================================
+// Instance configuration (set_configuration / get_configuration)
+// ------------------------------------------------------------
+// Binary layout of the ui_element_config payload we write / read.
+// Versioned so we can append fields without breaking old .fth files.
+//
+//   uint32_t version         ; currently 1
+//   uint32_t max_tracks      ; 1..4
+//   uint32_t palette         ; palette_t (0..PALETTE_COUNT-1)
+//   uint8_t  show_freq_axis  ; 0 / 1
+//   uint8_t  show_time_axis  ; 0 / 1
+//   string8  title_format    ; raw bytes (UTF-8 titleformat expression)
+//
+// Anything past the string is intentionally ignored on read so future
+// fields can be appended.
+// ============================================================
+static constexpr uint32_t kConfigMagicVersion = 1u;
+static constexpr int        kMinMaxTracks = 1;
+static constexpr int        kMaxMaxTracks = 4;
+
+static ui_element_config::ptr build_instance_config(
+    int max_tracks,
+    palette_t palette,
+    bool show_freq_axis,
+    bool show_time_axis,
+    const char* title_format)
+{
+    ui_element_config_builder b;
+    b << kConfigMagicVersion;
+    b << pfc::downcast_guarded<uint32_t>(
+        pfc::clip_t<int>(max_tracks, kMinMaxTracks, kMaxMaxTracks));
+    b << pfc::downcast_guarded<uint32_t>(pfc::clip_t<int>(
+        (int)palette, 0, (int)PALETTE_COUNT - 1));
+    b << (uint8_t)(show_freq_axis ? 1u : 0u);
+    b << (uint8_t)(show_time_axis ? 1u : 0u);
+    {
+        // pfc::string8 / pfc::string_base have dedicated << overloads which
+        // write uint32 length + raw bytes. Make sure we serialize a valid
+        // string even if the caller passes NULL.
+        pfc::string8 tf(title_format ? title_format : "");
+        b << tf;
+    }
+    return b.finish(SpectrumCompareWindow::g_get_guid());
+}
+
+void SpectrumCompareWindow::set_configuration(ui_element_config::ptr config) {
+    // Always remember the raw blob so later get_configuration() can fall
+    // back to it (e.g. forward-compatible unknown bytes we don't parse).
+    m_config = config;
+
+    bool changed_something = false;
+    int new_max_tracks = m_max_tracks;
+    palette_t new_palette = m_palette;
+    bool new_show_freq = m_show_freq_axis;
+    bool new_show_time = m_show_time_axis;
+    pfc::string8 new_title = m_title_format;
+
+    if (config.is_valid() && config->get_data_size() > 0) {
+        try {
+            ui_element_config_parser parser(config);
+            uint32_t version = 0;
+            parser >> version;
+            if (version >= 1u) {
+                uint32_t mx = 0, pal = 0;
+                uint8_t sf = 0, st = 0;
+                pfc::string8 tf;
+                parser >> mx >> pal >> sf >> st >> tf;
+
+                new_max_tracks = (int)pfc::clip_t<uint32_t>(
+                    mx, (uint32_t)kMinMaxTracks, (uint32_t)kMaxMaxTracks);
+                new_palette = (palette_t)pfc::clip_t<uint32_t>(
+                    pal, 0u, (uint32_t)PALETTE_COUNT - 1u);
+                new_show_freq = (sf != 0);
+                new_show_time = (st != 0);
+                if (tf.length() > 0) new_title = tf;
+            }
+            // Future versions will have more trailing bytes. We simply stop
+            // parsing here — ui_element_config_parser::get_remaining() is
+            // intentionally not drained so host-side opaque round-tripping
+            // via m_config stays intact.
+        } catch (...) {
+            // Malformed payload from a weird .fth file: fall through,
+            // keeping the cfg_* defaults already loaded at construction.
+        }
+    }
+
+    // Commit parsed values to runtime members. Use equality checks so we
+    // don't trigger unnecessary redraws / snapshot invalidations when the
+    // host hands us back our own identical blob.
+    if (new_max_tracks != m_max_tracks) {
+        m_max_tracks = new_max_tracks;
+        g_cfg_max_tracks = (int64_t)new_max_tracks;
+        // The effective cap changed — the cached selection snapshot is no
+        // longer comparable, so the next update_selection() must re-verify.
+        m_last_selection = last_selection_key{};
+        changed_something = true;
+    }
+    if (new_palette != m_palette) {
+        m_palette = new_palette;
+        g_cfg_palette = (int64_t)new_palette;
+        changed_something = true;
+    }
+    if (new_show_freq != m_show_freq_axis) {
+        m_show_freq_axis = new_show_freq;
+        g_cfg_show_freq_axis = new_show_freq;
+        changed_something = true;
+    }
+    if (new_show_time != m_show_time_axis) {
+        m_show_time_axis = new_show_time;
+        g_cfg_show_time_axis = new_show_time;
+        changed_something = true;
+    }
+    if (strcmp(new_title.get_ptr(), m_title_format.get_ptr()) != 0) {
+        m_title_format = new_title;
+        g_cfg_title_format.set(new_title);
+        m_analyzer.set_title_format(new_title.get_ptr());
+        // Cached formatted labels inside TrackSpectrum are stale. Simplest
+        // safe fix: blow away selection snapshot so next update_selection
+        // rebuilds labels from the fresh titleformat string.
+        m_last_selection = last_selection_key{};
+        changed_something = true;
+    }
+
+    if (changed_something && IsWindow()) {
+        Invalidate();
+        update_selection();
+    }
+}
+
+ui_element_config::ptr SpectrumCompareWindow::get_configuration() {
+    // Build a FRESH config blob from the CURRENT runtime settings. This is
+    // what makes "Export settings / Copy settings / Scratchbox save .fth"
+    // actually include the user's real choices instead of the empty blob we
+    // started from. The previous code just returned m_config unchanged, so
+    // every export was an empty 0-byte payload -> imports did nothing.
+    ui_element_config::ptr fresh = build_instance_config(
+        m_max_tracks, m_palette,
+        m_show_freq_axis, m_show_time_axis,
+        m_title_format.get_ptr());
+    // Keep a copy so a subsequent set_configuration(get_configuration())
+    // roundtrip — which the host may do — is a proper no-op.
+    m_config = fresh;
+    return fresh;
+}
+
+ui_element_config::ptr SpectrumCompareWindow::g_get_default_configuration() {
+    // The "default" instance config (used by Scratchbox's reset, layout
+    // reset, and newly created slots that have nothing stored) should
+    // match the cfg_* defaults exactly so the panel behaves identically
+    // whether it's first created or wiped to defaults.
+    return build_instance_config(
+        (int)g_cfg_max_tracks, (palette_t)(int)g_cfg_palette,
+        (bool)g_cfg_show_freq_axis, (bool)g_cfg_show_time_axis,
+        g_cfg_title_format.get_ptr());
 }
 
 void SpectrumCompareWindow::notify(const GUID& p_what, t_size p_param1, const void* p_param2, t_size p_param2size) {
