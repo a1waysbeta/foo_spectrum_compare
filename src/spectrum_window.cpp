@@ -661,43 +661,85 @@ LRESULT SpectrumCompareWindow::OnSpectrumReady(UINT uMsg, WPARAM wParam, LPARAM 
 // ============================================================
 
 namespace {
-    // Private command IDs for the edit-mode menu. They live in a different
-    // range than the IDM_* settings IDs so the two menus never collide.
-    // NOTE: do NOT use names like ID_EDIT_* — those are WTL macros defined
-    // in atlres.h and would expand to integer literals here.
+    // Private command IDs for the edit-mode menu, kept as a safety net for
+    // hosts that don't have a dedicated layout-editing window above us.
     enum {
         kEditReplace = 5001,
         kEditCut     = 5002,
         kEditCopy    = 5003,
         kEditPaste   = 5004
     };
+
+    // ------------------------------------------------------------------
+    // Walk up the parent chain to find the SDK popup host that owns our
+    // element. In Default UI and Columns UI this is the top-level host
+    // window returned by ui_element_impl_withpopup / ui_element_window,
+    // which is exactly the window that hosts a ui_element_edit_tools
+    // and correctly processes WM_CONTEXTMENU in Layout Editing Mode by
+    // showing Replace / Cut / Copy / Paste and executing them properly.
+    // We stop at the first top-level (WS_POPUP-style) popup shell we find
+    // to avoid forwarding to foobar2000's main window.
+    // ------------------------------------------------------------------
+    HWND find_host_popup(HWND child) {
+        HWND best = NULL;
+        HWND cur  = ::GetParent(child);
+        while (cur != NULL) {
+            best = cur;
+            const LONG_PTR style = ::GetWindowLongPtr(cur, GWL_STYLE);
+            if ((style & WS_POPUP) != 0) break; // popup shell boundary
+            // Also stop if this parent has no parent itself (top-level).
+            if (::GetParent(cur) == NULL) break;
+            cur = ::GetParent(cur);
+        }
+        return best;
+    }
 }
 
 void SpectrumCompareWindow::OnContextMenu(CWindow wnd, CPoint point) {
     (void)wnd;
 
     // ------------------------------------------------------------------
-    // Layout Editing Mode active: show standard Replace/Cut/Copy/Paste.
-    // This mirrors the menu that foobar2000's UI host normally pops up when
-    // the element is embedded inside one of its layout helpers — but since
-    // our window handles WM_CONTEXTMENU directly, we have to reproduce it.
+    // Layout Editing Mode active:
+    //   We do NOT build our own menu. Instead, forward the WM_CONTEXTMENU
+    //   straight to the SDK popup host window that owns this element.
+    //   That host already has a ui_element_edit_tools and will bring up
+    //   Replace / Cut / Copy / Paste (optionally followed by any custom
+    //   items the host or this element declares via edit_mode_context_menu_*)
+    //   AND correctly execute those commands via its own host-side routing.
+    //
+    // If for some reason we don't have a real host parent (e.g. we were
+    // created as a raw standalone window), fall back to a minimal manual
+    // menu built on top of ui_element_common_methods / v3 APIs.
     // ------------------------------------------------------------------
     if (m_callback->is_edit_mode_enabled()) {
+        HWND host = find_host_popup(m_hWnd);
+        if (host != NULL && host != m_hWnd) {
+            LPARAM lp;
+            if (point.x == -1 && point.y == -1) {
+                lp = (LPARAM)-1;
+            } else {
+                // WM_CONTEXTMENU lParam is screen coordinates in the LOWORD/HIWORD.
+                // CPoint from the MSG_WM_CONTEXTMENU macro already contains the
+                // screen coordinates verbatim.
+                lp = MAKELPARAM((short)point.x, (short)point.y);
+            }
+            ::SendMessage(host, WM_CONTEXTMENU, (WPARAM)m_hWnd, lp);
+            // Host has handled the menu + any command.
+            return;
+        }
+
+        // ============== FALLBACK (no usable host parent) =================
         static_api_ptr_t<ui_element_common_methods> cm;
 
-        // Build (screen) point. When lp = -1 (context-menu key on keyboard),
-        // fall back to the centre of the element.
         CPoint pt;
         if (point.x == -1 && point.y == -1) {
             CRect rc;
             GetWindowRect(&rc);
             pt = rc.CenterPoint();
         } else {
-            // WM_CONTEXTMENU always delivers screen coordinates already.
             pt = point;
         }
 
-        // Determine display labels + enabled state.
         pfc::string8 elemName;
         {
             service_ptr_t<ui_element> e;
@@ -712,9 +754,6 @@ void SpectrumCompareWindow::OnContextMenu(CWindow wnd, CPoint point) {
         CMenu menu;
         WIN32_OP_D(menu.CreatePopupMenu());
 
-        // Disabled name header (matches host's standard_edit_context_menu).
-        // NOTE: casts are required to disambiguate WTL's two AppendMenu
-        // overloads (UINT,UINT_PTR,LPCTSTR) vs (UINT,HMENU,LPCTSTR).
         WIN32_OP_D(menu.AppendMenu(
             MF_STRING | MF_DISABLED | MF_GRAYED,
             (UINT_PTR)0,
@@ -734,10 +773,6 @@ void SpectrumCompareWindow::OnContextMenu(CWindow wnd, CPoint point) {
 
         int cmd = 0;
         {
-            // Highlight the element during the menu, mirroring the host's
-            // standard_edit_context_menu behaviour (ui_element_highlight_scope
-            // is a nested helper inside ui_element_edit_tools, so we
-            // reproduce the raw v3 highlight + DestroyWindow pair here).
             HWND highlight = NULL;
             try {
                 static_api_ptr_t<ui_element_common_methods_v3> cm3_hl;
@@ -754,34 +789,21 @@ void SpectrumCompareWindow::OnContextMenu(CWindow wnd, CPoint point) {
 
         switch (cmd) {
         case kEditReplace: {
-            // Spawn the core "Replace UI Element" modal dialog (v3 API).
-            // The dialog wires the replacement straight into the host, so we
-            // just hand it our element GUID + a no-op notify callback.
             static_api_ptr_t<ui_element_common_methods_v3> cm3;
             auto notify = ui_element_replace_dialog_notify::create([](GUID) {});
             cm3->replace_element_dialog_start(m_hWnd, guid_spectrum_compare, notify);
             break;
         }
-        case kEditCopy: {
+        case kEditCopy:
             cm->copy(get_configuration());
             break;
-        }
         case kEditCut: {
-            // Match ui_element_edit_tools::standard_edit_context_menu:
-            //   copy(instance); release(instance); host_replace_with_guid_null
-            // The cut() API encapsulates exactly that. It releases the
-            // passed instance_ptr so we must feed it a *temporary* copy,
-            // otherwise "this" would be destroyed while still on the stack.
             ui_element_instance_ptr tmp(this);
             static_api_ptr_t<ui_element_common_methods> cutApi;
             cutApi->cut(tmp, m_hWnd, m_callback);
-            // tmp is now empty and our own refcount remains intact.
             break;
         }
         case kEditPaste: {
-            // paste(instance_ptr&, hwnd, callback) will replace the content
-            // of the passed instance_ptr in-place (removing us and inserting
-            // whatever was copied). Same as Cut — always use a tmp copy.
             ui_element_instance_ptr tmp(this);
             static_api_ptr_t<ui_element_common_methods> pasteApi;
             pasteApi->paste(tmp, m_hWnd, m_callback);
@@ -790,7 +812,6 @@ void SpectrumCompareWindow::OnContextMenu(CWindow wnd, CPoint point) {
         default:
             break;
         }
-
         return;
     }
 
