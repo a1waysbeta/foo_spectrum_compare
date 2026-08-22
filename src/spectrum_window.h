@@ -2,6 +2,7 @@
 
 #include "stdafx.h"
 #include "spectrum_analyzer.h"
+#include "i18n.h"
 #include <thread>
 #include <atomic>
 
@@ -32,6 +33,8 @@ static const GUID guid_cfg_max_tracks =
     { 0x4d5e6f70, 0x8192, 0xa3b4, { 0xc5, 0xd6, 0xe7, 0xf8, 0x09, 0x1a, 0x2b, 0x3c } };
 static const GUID guid_cfg_palette =
     { 0x5e6f7081, 0x92a3, 0xb4c5, { 0xd6, 0xe7, 0xf8, 0x09, 0x1a, 0x2b, 0x3c, 0x4d } };
+static const GUID guid_cfg_language =
+    { 0x6f708192, 0xa3b4, 0xc5d6, { 0xe7, 0xf8, 0x09, 0x1a, 0x2b, 0x3c, 0x4d, 0x5e } };
 
 // Persistent config storage (static globals, registered once at startup).
 // Defined as static so they persist across window creation/destruction.
@@ -40,6 +43,7 @@ extern cfg_bool g_cfg_show_time_axis;
 extern cfg_string g_cfg_title_format;
 extern cfg_int g_cfg_max_tracks;
 extern cfg_int g_cfg_palette;
+extern cfg_int g_cfg_language;
 
 // Menu command IDs — values are arbitrary but unique within this window's
 // command range.  Do NOT reuse numbers across different IDs because
@@ -58,6 +62,8 @@ extern cfg_int g_cfg_palette;
 #define IDM_TOGGLE_TIME_AXIS 1021
 #define IDM_EDIT_TITLE_FORMAT 1022
 #define IDM_RESET_TITLE_FORMAT 1023
+#define IDM_LANG_ENGLISH  1030
+#define IDM_LANG_CHINESE  1031
 
 // Holds per-track spectrum state
 struct TrackSpectrum {
@@ -153,6 +159,8 @@ public:
         COMMAND_ID_HANDLER_EX(IDM_TOGGLE_TIME_AXIS, OnToggleTimeAxis)
         COMMAND_ID_HANDLER_EX(IDM_EDIT_TITLE_FORMAT,  OnEditTitleFormat)
         COMMAND_ID_HANDLER_EX(IDM_RESET_TITLE_FORMAT, OnResetTitleFormat)
+        COMMAND_ID_HANDLER_EX(IDM_LANG_ENGLISH,  OnLanguage)
+        COMMAND_ID_HANDLER_EX(IDM_LANG_CHINESE,  OnLanguage)
     END_MSG_MAP()
 
     // ImplementBumpableElem (CRTP base via ui_element_impl) accesses m_callback
@@ -173,6 +181,7 @@ private:
     void OnToggleTimeAxis(UINT uNotifyCode, int nID, CWindow wndCtl);
     void OnEditTitleFormat(UINT uNotifyCode, int nID, CWindow wndCtl);
     void OnResetTitleFormat(UINT uNotifyCode, int nID, CWindow wndCtl);
+    void OnLanguage(UINT uNotifyCode, int nID, CWindow wndCtl);
 
     // Inline title-format editing helpers (right-click menu entry only).
     void begin_inline_title_format_edit();
@@ -208,6 +217,7 @@ private:
     bool m_show_freq_axis = true;
     bool m_show_time_axis = true;
     pfc::string8 m_title_format = DEFAULT_TITLE_FORMAT;
+    language_t m_language = LANG_DEFAULT;
 
     ui_element_config::ptr m_config;
     const ui_element_instance_callback_ptr m_callback;

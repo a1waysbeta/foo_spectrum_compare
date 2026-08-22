@@ -1,5 +1,6 @@
 #include "stdafx.h"
 #include "spectrum_window.h"
+#include "i18n.h"
 #include <helpers/BumpableElem.h>
 #include <helpers/atl-misc.h>
 #include <algorithm>
@@ -11,6 +12,7 @@ cfg_bool g_cfg_show_time_axis(guid_cfg_show_time_axis, true);
 cfg_string g_cfg_title_format(guid_cfg_title_format, DEFAULT_TITLE_FORMAT);
 cfg_int g_cfg_max_tracks(guid_cfg_max_tracks, 4);
 cfg_int g_cfg_palette(guid_cfg_palette, (int)PALETTE_SPECTRUM);
+cfg_int g_cfg_language(guid_cfg_language, (int)LANG_DEFAULT);
 
 SpectrumCompareWindow::SpectrumCompareWindow(
     ui_element_config::ptr config,
@@ -35,6 +37,8 @@ SpectrumCompareWindow::SpectrumCompareWindow(
     m_max_tracks = (int)g_cfg_max_tracks;
     m_palette = (palette_t)pfc::clip_t<int>(
         (int)g_cfg_palette, 0, (int)PALETTE_COUNT - 1);
+    m_language = (language_t)pfc::clip_t<int>(
+        (int)g_cfg_language, 0, (int)LANG_COUNT - 1);
 
     m_analyzer.set_title_format(m_title_format.c_str());
 
@@ -124,17 +128,18 @@ void SpectrumCompareWindow::initialize_window(HWND parent) {
 // Binary layout of the ui_element_config payload we write / read.
 // Versioned so we can append fields without breaking old .fth files.
 //
-//   uint32_t version         ; always 1
+//   uint32_t version         ; 2 (v1 = no language field)
 //   uint32_t max_tracks      ; 1..4
 //   uint32_t palette         ; palette_t (0..PALETTE_COUNT-1)
 //   uint8_t  show_freq_axis  ; 0 / 1
 //   uint8_t  show_time_axis  ; 0 / 1
 //   string8  title_format    ; raw bytes (UTF-8 titleformat expression)
+//   uint8_t  language        ; language_t (0=EN, 1=ZH)  [v2+]
 //
-// Anything past the above fields is intentionally ignored on read so
-// future versions can be appended.
+// v1 readers stop after title_format and ignore the language byte,
+// which is fine — language defaults to English on old .fth files.
 // ============================================================
-static constexpr uint32_t kConfigMagicVersion = 1u;
+static constexpr uint32_t kConfigMagicVersion = 2u;
 static constexpr int        kMinMaxTracks = 1;
 static constexpr int        kMaxMaxTracks = 4;
 
@@ -143,7 +148,8 @@ static ui_element_config::ptr build_instance_config(
     palette_t palette,
     bool show_freq_axis,
     bool show_time_axis,
-    const char* title_format)
+    const char* title_format,
+    language_t language)
 {
     ui_element_config_builder b;
     b << kConfigMagicVersion;
@@ -157,6 +163,8 @@ static ui_element_config::ptr build_instance_config(
         pfc::string8 tf(title_format ? title_format : "");
         b << tf;
     }
+    b << (uint8_t)pfc::clip_t<int>(
+        (int)language, 0, (int)LANG_COUNT - 1);
     return b.finish(SpectrumCompareWindow::g_get_guid());
 }
 
@@ -172,6 +180,7 @@ void SpectrumCompareWindow::set_configuration(ui_element_config::ptr config) {
     bool new_show_freq = m_show_freq_axis;
     bool new_show_time = m_show_time_axis;
     pfc::string8 new_title = m_title_format;
+    language_t new_language = m_language;
 
     if (config.is_valid() && config->get_data_size() > 0) {
         try {
@@ -191,6 +200,14 @@ void SpectrumCompareWindow::set_configuration(ui_element_config::ptr config) {
                 new_show_freq = (sf != 0);
                 new_show_time = (st != 0);
                 if (tf.length() > 0) new_title = tf;
+
+                // v2+ adds language field after title_format.
+                if (version >= 2u) {
+                    uint8_t lang = 0;
+                    parser >> lang;
+                    new_language = (language_t)pfc::clip_t<int>(
+                        (int)lang, 0, (int)LANG_COUNT - 1);
+                }
             }
             // (Earlier experimental versions of this file wrote extra
             // fields beyond version=1 with larger wire formats.  The PFC
@@ -236,6 +253,11 @@ void SpectrumCompareWindow::set_configuration(ui_element_config::ptr config) {
         title_format_changed = true;
         changed_something = true;
     }
+    if (new_language != m_language) {
+        m_language = new_language;
+        g_cfg_language = (int64_t)new_language;
+        changed_something = true;
+    }
 
     if (changed_something && IsWindow()) {
         if (title_format_changed) refresh_track_titles();
@@ -248,7 +270,7 @@ ui_element_config::ptr SpectrumCompareWindow::get_configuration() {
     ui_element_config::ptr fresh = build_instance_config(
         m_max_tracks, m_palette,
         m_show_freq_axis, m_show_time_axis,
-        m_title_format.get_ptr());
+        m_title_format.get_ptr(), m_language);
     m_config = fresh;
     return fresh;
 }
@@ -260,7 +282,9 @@ ui_element_config::ptr SpectrumCompareWindow::g_get_default_configuration() {
             (int)g_cfg_palette, 0, (int)PALETTE_COUNT - 1),
         (bool)g_cfg_show_freq_axis,
         (bool)g_cfg_show_time_axis,
-        g_cfg_title_format.get_ptr());
+        g_cfg_title_format.get_ptr(),
+        (language_t)pfc::clip_t<int>(
+            (int)g_cfg_language, 0, (int)LANG_COUNT - 1));
 }
 
 void SpectrumCompareWindow::notify(const GUID& p_what, t_size p_param1, const void* p_param2, t_size p_param2size) {
@@ -556,7 +580,8 @@ void SpectrumCompareWindow::OnPaint(CDCHandle) {
         dc.SetBkMode(TRANSPARENT);
         SelectObjectScope fontScope(dc, (HGDIOBJ)m_callback->query_font_ex(ui_font_default));
         const UINT format = DT_NOPREFIX | DT_CENTER | DT_VCENTER | DT_SINGLELINE;
-        dc.DrawText(_T("Select tracks in the playlist to view spectrograms"), -1, &rc, format);
+        pfc::stringcvt::string_wide_from_utf8 w_placeholder(i18n(S_SELECT_TRACKS, m_language));
+        dc.DrawText(w_placeholder, -1, &rc, format);
     } else {
 
     // DPI-aware scaling: use DPI cached at construction time so we don't need
@@ -615,14 +640,15 @@ void SpectrumCompareWindow::OnPaint(CDCHandle) {
             dc.SetBkMode(TRANSPARENT);
             SelectObjectScope fontScope(dc, (HGDIOBJ)m_callback->query_font_ex(ui_font_default));
             pfc::string8 err;
-            err << "Error: " << m_tracks[i]->data.error_msg.c_str();
+            err << i18n(S_ERROR, m_language) << m_tracks[i]->data.error_msg.c_str();
             pfc::stringcvt::string_wide_from_utf8 err_w(err);
             dc.DrawText(err_w, -1, &spec_rc, DT_NOPREFIX | DT_CENTER | DT_VCENTER | DT_SINGLELINE);
         } else if (m_tracks[i]->analyzing) {
             dc.SetTextColor(m_callback->query_std_color(ui_color_text));
             dc.SetBkMode(TRANSPARENT);
             SelectObjectScope fontScope(dc, (HGDIOBJ)m_callback->query_font_ex(ui_font_default));
-            dc.DrawText(_T("Analyzing..."), -1, &spec_rc, DT_NOPREFIX | DT_CENTER | DT_VCENTER | DT_SINGLELINE);
+            pfc::stringcvt::string_wide_from_utf8 w_analyzing(i18n(S_ANALYZING, m_language));
+            dc.DrawText(w_analyzing, -1, &spec_rc, DT_NOPREFIX | DT_CENTER | DT_VCENTER | DT_SINGLELINE);
         }
 
         // Time axis (below spectrum, aligned with spectrum horizontal range)
@@ -1008,70 +1034,94 @@ static constexpr size_t kCountIdx    = 0;
 static constexpr size_t kPaletteIdx  = 4;
 static constexpr size_t kAxesIdx     = 7;
 static constexpr size_t kTitleIdx    = 9;
-static constexpr size_t kRefreshIdx  = 11;
-static constexpr size_t kTotalLeaves = 12;
+static constexpr size_t kLangIdx     = 11;
+static constexpr size_t kRefreshIdx  = 13;
+static constexpr size_t kTotalLeaves = 14;
+
+// Helper: narrow UTF-8 -> wide for Win32 menu APIs.
+static void append_menu_i18n(HMENU hmenu, UINT flags, UINT id, strid_t sid, language_t lang) {
+    pfc::stringcvt::string_wide_from_utf8 w(i18n(sid, lang));
+    ::AppendMenuW(hmenu, flags, id, w);
+}
 
 static void build_display_count_popup(HMENU hmenu, unsigned base, int max_tracks,
-                                      std::vector<UINT>& leaf_idms) {
-    static const UINT   s_ids[4]    = { IDM_SET_COUNT_1, IDM_SET_COUNT_2, IDM_SET_COUNT_3, IDM_SET_COUNT_4 };
-    static const LPCTSTR s_labels[4] = { _T("1 track"), _T("2 tracks"), _T("3 tracks"), _T("4 tracks") };
+                                      language_t lang, std::vector<UINT>& leaf_idms) {
+    static const UINT s_ids[4] = { IDM_SET_COUNT_1, IDM_SET_COUNT_2, IDM_SET_COUNT_3, IDM_SET_COUNT_4 };
+    static const strid_t s_sids[4] = { S_1_TRACK, S_2_TRACKS, S_3_TRACKS, S_4_TRACKS };
     PFC_ASSERT(leaf_idms.size() == kCountIdx);
     for (int i = 0; i < 4; ++i) {
-        ::AppendMenu(hmenu, MF_STRING | ((i + 1) == max_tracks ? MF_CHECKED : 0),
-                     base + (unsigned)leaf_idms.size(), s_labels[i]);
+        append_menu_i18n(hmenu, MF_STRING | ((i + 1) == max_tracks ? MF_CHECKED : 0),
+                         base + (unsigned)leaf_idms.size(), s_sids[i], lang);
         leaf_idms.push_back(s_ids[i]);
     }
 }
 
 static void build_palette_popup(HMENU hmenu, unsigned base, palette_t current,
-                                std::vector<UINT>& leaf_idms) {
-    struct E { UINT id; LPCTSTR label; palette_t value; };
+                                language_t lang, std::vector<UINT>& leaf_idms) {
+    struct E { UINT id; strid_t sid; palette_t value; };
     static const E s_rows[3] = {
-        { IDM_PALETTE_SPECTRUM, _T("Spectrum"), PALETTE_SPECTRUM },
-        { IDM_PALETTE_SOX,      _T("SoX"),      PALETTE_SOX },
-        { IDM_PALETTE_MONO,     _T("Mono"),     PALETTE_MONO },
+        { IDM_PALETTE_SPECTRUM, S_SPECTRUM, PALETTE_SPECTRUM },
+        { IDM_PALETTE_SOX,      S_SOX,      PALETTE_SOX },
+        { IDM_PALETTE_MONO,     S_MONO,     PALETTE_MONO },
     };
     PFC_ASSERT(leaf_idms.size() == kPaletteIdx);
     for (auto& r : s_rows) {
-        ::AppendMenu(hmenu, MF_STRING | (current == r.value ? MF_CHECKED : 0),
-                     base + (unsigned)leaf_idms.size(), r.label);
+        append_menu_i18n(hmenu, MF_STRING | (current == r.value ? MF_CHECKED : 0),
+                         base + (unsigned)leaf_idms.size(), r.sid, lang);
         leaf_idms.push_back(r.id);
     }
 }
 
 static void build_axes_popup(HMENU hmenu, unsigned base, bool show_freq, bool show_time,
-                             std::vector<UINT>& leaf_idms) {
+                             language_t lang, std::vector<UINT>& leaf_idms) {
     PFC_ASSERT(leaf_idms.size() == kAxesIdx);
-    ::AppendMenu(hmenu, MF_STRING | (show_freq ? MF_CHECKED : 0),
-                 base + (unsigned)leaf_idms.size(), _T("Frequency axis (kHz)"));
+    append_menu_i18n(hmenu, MF_STRING | (show_freq ? MF_CHECKED : 0),
+                     base + (unsigned)leaf_idms.size(), S_FREQ_AXIS, lang);
     leaf_idms.push_back(IDM_TOGGLE_FREQ_AXIS);
-    ::AppendMenu(hmenu, MF_STRING | (show_time ? MF_CHECKED : 0),
-                 base + (unsigned)leaf_idms.size(), _T("Time axis (20s)"));
+    append_menu_i18n(hmenu, MF_STRING | (show_time ? MF_CHECKED : 0),
+                     base + (unsigned)leaf_idms.size(), S_TIME_AXIS, lang);
     leaf_idms.push_back(IDM_TOGGLE_TIME_AXIS);
 }
 
 static void build_title_format_popup(HMENU hmenu, unsigned base,
-                                     std::vector<UINT>& leaf_idms) {
+                                     language_t lang, std::vector<UINT>& leaf_idms) {
     PFC_ASSERT(leaf_idms.size() == kTitleIdx);
-    ::AppendMenu(hmenu, MF_STRING, base + (unsigned)leaf_idms.size(), _T("Edit format..."));
+    append_menu_i18n(hmenu, MF_STRING, base + (unsigned)leaf_idms.size(), S_EDIT_FORMAT, lang);
     leaf_idms.push_back(IDM_EDIT_TITLE_FORMAT);
-    ::AppendMenu(hmenu, MF_STRING, base + (unsigned)leaf_idms.size(), _T("Reset to default"));
+    append_menu_i18n(hmenu, MF_STRING, base + (unsigned)leaf_idms.size(), S_RESET_DEFAULT, lang);
     leaf_idms.push_back(IDM_RESET_TITLE_FORMAT);
+}
+
+static void build_language_popup(HMENU hmenu, unsigned base, language_t current,
+                                 language_t lang, std::vector<UINT>& leaf_idms) {
+    PFC_ASSERT(leaf_idms.size() == kLangIdx);
+    struct E { UINT id; strid_t sid; language_t value; };
+    static const E s_rows[2] = {
+        { IDM_LANG_ENGLISH, S_LANG_EN, LANG_EN },
+        { IDM_LANG_CHINESE, S_LANG_ZH, LANG_ZH },
+    };
+    for (auto& r : s_rows) {
+        append_menu_i18n(hmenu, MF_STRING | (current == r.value ? MF_CHECKED : 0),
+                         base + (unsigned)leaf_idms.size(), r.sid, lang);
+        leaf_idms.push_back(r.id);
+    }
 }
 
 // Builds the full settings block into a root-level HMENU.  Returns the
 // leaf id mapping (size == kTotalLeaves).
 static std::vector<UINT> build_settings_block(HMENU p_menu, unsigned p_id_base,
                                               int max_tracks, palette_t palette,
-                                              bool show_freq, bool show_time) {
+                                              bool show_freq, bool show_time,
+                                              language_t lang) {
     std::vector<UINT> leaf_idms;
     leaf_idms.reserve(kTotalLeaves);
 
     // Display count submenu
     {
         CMenu count_menu; WIN32_OP_D(count_menu.CreatePopupMenu() != NULL);
-        build_display_count_popup(count_menu, p_id_base, max_tracks, leaf_idms);
-        WIN32_OP_D(::AppendMenu(p_menu, MF_POPUP, (UINT_PTR)count_menu.m_hMenu, _T("Display count")));
+        build_display_count_popup(count_menu, p_id_base, max_tracks, lang, leaf_idms);
+        pfc::stringcvt::string_wide_from_utf8 w(i18n(S_DISPLAY_COUNT, lang));
+        WIN32_OP_D(::AppendMenuW(p_menu, MF_POPUP, (UINT_PTR)count_menu.m_hMenu, w));
         count_menu.Detach();
     }
 
@@ -1080,8 +1130,9 @@ static std::vector<UINT> build_settings_block(HMENU p_menu, unsigned p_id_base,
     // Palette submenu
     {
         CMenu palette_menu; WIN32_OP_D(palette_menu.CreatePopupMenu() != NULL);
-        build_palette_popup(palette_menu, p_id_base, palette, leaf_idms);
-        WIN32_OP_D(::AppendMenu(p_menu, MF_POPUP, (UINT_PTR)palette_menu.m_hMenu, _T("Palette")));
+        build_palette_popup(palette_menu, p_id_base, palette, lang, leaf_idms);
+        pfc::stringcvt::string_wide_from_utf8 w(i18n(S_PALETTE, lang));
+        WIN32_OP_D(::AppendMenuW(p_menu, MF_POPUP, (UINT_PTR)palette_menu.m_hMenu, w));
         palette_menu.Detach();
     }
 
@@ -1090,24 +1141,37 @@ static std::vector<UINT> build_settings_block(HMENU p_menu, unsigned p_id_base,
     // Axes submenu
     {
         CMenu axes_menu; WIN32_OP_D(axes_menu.CreatePopupMenu() != NULL);
-        build_axes_popup(axes_menu, p_id_base, show_freq, show_time, leaf_idms);
-        WIN32_OP_D(::AppendMenu(p_menu, MF_POPUP, (UINT_PTR)axes_menu.m_hMenu, _T("Axes")));
+        build_axes_popup(axes_menu, p_id_base, show_freq, show_time, lang, leaf_idms);
+        pfc::stringcvt::string_wide_from_utf8 w(i18n(S_AXES, lang));
+        WIN32_OP_D(::AppendMenuW(p_menu, MF_POPUP, (UINT_PTR)axes_menu.m_hMenu, w));
         axes_menu.Detach();
     }
 
     // Title format submenu
     {
         CMenu fmt_menu; WIN32_OP_D(fmt_menu.CreatePopupMenu() != NULL);
-        build_title_format_popup(fmt_menu, p_id_base, leaf_idms);
-        WIN32_OP_D(::AppendMenu(p_menu, MF_POPUP, (UINT_PTR)fmt_menu.m_hMenu, _T("Title format")));
+        build_title_format_popup(fmt_menu, p_id_base, lang, leaf_idms);
+        pfc::stringcvt::string_wide_from_utf8 w(i18n(S_TITLE_FORMAT, lang));
+        WIN32_OP_D(::AppendMenuW(p_menu, MF_POPUP, (UINT_PTR)fmt_menu.m_hMenu, w));
         fmt_menu.Detach();
+    }
+
+    WIN32_OP_D(::AppendMenu(p_menu, MF_SEPARATOR, 0, _T("")));
+
+    // Language submenu
+    {
+        CMenu lang_menu; WIN32_OP_D(lang_menu.CreatePopupMenu() != NULL);
+        build_language_popup(lang_menu, p_id_base, lang, lang, leaf_idms);
+        pfc::stringcvt::string_wide_from_utf8 w(i18n(S_LANGUAGE, lang));
+        WIN32_OP_D(::AppendMenuW(p_menu, MF_POPUP, (UINT_PTR)lang_menu.m_hMenu, w));
+        lang_menu.Detach();
     }
 
     WIN32_OP_D(::AppendMenu(p_menu, MF_SEPARATOR, 0, _T("")));
 
     // Refresh analysis (flat item) — the last leaf (index kRefreshIdx).
     PFC_ASSERT(leaf_idms.size() == kRefreshIdx);
-    WIN32_OP_D(::AppendMenu(p_menu, MF_STRING, p_id_base + (unsigned)leaf_idms.size(), _T("Refresh analysis")));
+    append_menu_i18n(p_menu, MF_STRING, p_id_base + (unsigned)leaf_idms.size(), S_REFRESH, lang);
     leaf_idms.push_back(IDM_REFRESH);
 
     PFC_ASSERT(leaf_idms.size() == kTotalLeaves);
@@ -1186,7 +1250,7 @@ void SpectrumCompareWindow::edit_mode_context_menu_build(const POINT& /*p_point*
 
     m_edit_mode_cmd_to_idm = build_settings_block(
         p_menu, p_id_base, m_max_tracks, m_palette,
-        m_show_freq_axis, m_show_time_axis);
+        m_show_freq_axis, m_show_time_axis, m_language);
 }
 
 void SpectrumCompareWindow::edit_mode_context_menu_command(
@@ -1230,7 +1294,7 @@ void SpectrumCompareWindow::OnContextMenu(CWindow wnd, CPoint point) {
     // 0-based index we can look up in `leaf_idms`.
     const std::vector<UINT> leaf_idms = build_settings_block(
         menu, 0, m_max_tracks, m_palette,
-        m_show_freq_axis, m_show_time_axis);
+        m_show_freq_axis, m_show_time_axis, m_language);
 
     CPoint ptShow = point;
     if (ptShow.x == -1 && ptShow.y == -1) {
@@ -1579,6 +1643,17 @@ void SpectrumCompareWindow::OnResetTitleFormat(UINT uNotifyCode, int nID, CWindo
     g_cfg_title_format.set(m_title_format);
     m_analyzer.set_title_format(m_title_format.c_str());
     refresh_track_titles();
+}
+
+void SpectrumCompareWindow::OnLanguage(UINT uNotifyCode, int nID, CWindow wndCtl) {
+    (void)uNotifyCode; (void)wndCtl;
+    language_t new_lang = (nID == IDM_LANG_CHINESE) ? LANG_ZH : LANG_EN;
+    if (new_lang == m_language) return;
+    m_language = new_lang;
+    g_cfg_language = (int64_t)new_lang;
+    // Language only affects menu/label text — no need to re-analyze.
+    // Just repaint so "Analyzing..." / placeholder text updates.
+    if (IsWindow()) Invalidate();
 }
 
 // ============================================================
