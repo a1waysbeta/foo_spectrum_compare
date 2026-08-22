@@ -1023,10 +1023,65 @@ bool SpectrumCompareWindow::edit_mode_context_menu_test(const POINT& /*p_point*/
 }
 
 void SpectrumCompareWindow::edit_mode_context_menu_build(const POINT& /*p_point*/, bool /*p_fromkeyboard*/, HMENU p_menu, unsigned p_id_base) {
-    // Prepend a separator so the "Spectrum Compare settings" block is
-    // visually separated from the host-provided Replace / Cut / Copy /
-    // Paste section above it.
-    WIN32_OP_D(::AppendMenu(p_menu, MF_SEPARATOR, 0, _T("")));
+    // -------------------------------------------------------------------
+    // Defensive "trim trailing separators" step.
+    //
+    // The SDK's standard_edit_context_menu() can leave more than one
+    // MF_SEPARATOR at the tail of the menu before invoking our hook.
+    // Specifically, the code path in ui_element_helpers.cpp does:
+    //
+    //   line 143  → AppendMenu(MF_SEPARATOR)          (before Cut/Copy/Paste)
+    //   line 146  → Cut UI Element
+    //   line 147  → Copy UI Element
+    //   line 148  → Paste UI Element
+    //   line 154  → AppendMenu(MF_SEPARATOR)          // if host_test==true
+    //   line 156  → host_edit_mode_context_menu_build
+    //   line 161  → AppendMenu(MF_SEPARATOR)          // before our hook
+    //   line 163  → edit_mode_context_menu_build(THIS)
+    //
+    // Cases that can produce double separators between "Paste UI Element"
+    // and our first "Display count" submenu:
+    //
+    //  (A) host_edit_mode_context_menu_test returns true AND the host
+    //      hook appends zero clickable items — line 154's separator is
+    //      orphaned, adjacent to line 161's separator ⇒ 2 blank lines.
+    //
+    //  (B) Previous versions of *this* function prepended yet another
+    //      MF_SEPARATOR, stacking 3 in total — the current function
+    //      never does that, but the SDK's double-case (A) is enough
+    //      by itself to reproduce the user-reported visual bug.
+    //
+    // Fix: collapse any run of trailing MF_SEPARATOR entries down to
+    // exactly **one** before we append our settings block.  This is
+    // safe because a trailing separator at the very end of a menu is
+    // never rendered anyway, and between the SDK section and the
+    // settings block we want exactly one visual gap.
+    // -------------------------------------------------------------------
+    {
+        int count = ::GetMenuItemCount(p_menu);
+        // Strip trailing MF_SEPARATOR entries until the last item is NOT
+        // a separator (or the menu is empty, should never happen here).
+        while (count > 0) {
+            const int lastIdx = count - 1;
+            MENUITEMINFO mii;
+            memset(&mii, 0, sizeof(mii));
+            mii.cbSize = sizeof(mii);
+            mii.fMask = MIIM_FTYPE;
+            if (!::GetMenuItemInfo(p_menu, (UINT)lastIdx, TRUE, &mii)) break;
+            if ((mii.fType & MFT_SEPARATOR) == 0) break; // last entry not a separator → done
+            // Drop this orphan trailing separator.
+            ::DeleteMenu(p_menu, (UINT)lastIdx, MF_BYPOSITION);
+            --count;
+        }
+        // Now add back exactly ONE separator between "Paste UI Element /
+        // last host custom item" and our settings block.
+        if (count > 0) {
+            // Only add if the menu already has real entries (it always
+            // does because Replace/Cut/Copy/Paste are guaranteed).
+            WIN32_OP_D(::AppendMenu(p_menu, MF_SEPARATOR, 0, _T("")));
+        }
+    }
+
     m_edit_mode_cmd_to_idm = build_settings_block(
         p_menu, p_id_base, m_max_tracks, m_palette, m_show_freq_axis, m_show_time_axis);
 }

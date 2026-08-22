@@ -2,23 +2,33 @@
 
 #include <stdint.h>
 
-// Palette types borrowed from Spek
+// Palette types — the 3 legacy entries are byte-identical to the
+// upstream Spek palette functions.  The 2 new entries ("Spek" and
+// "Spek-X") are also verbatim copies of those same functions, but
+// routed so each menu label matches the DEFAULT palette of the
+// corresponding upstream binary:
+//
+//   * PALETTE_SPEK  →  PALETTE_SOX  (default palette in spek-master)
+//   * PALETTE_SPEKX →  PALETTE_SPECTRUM (default palette in spek-X-main)
+//
+// Reference (source code verified on local checkouts):
+//   spek-master/src/spek-palette.h : PALETTE_DEFAULT = PALETTE_SOX
+//   spek-X-main/src/spek-palette.h : PALETTE_DEFAULT = PALETTE_SPECTRUM
+//   spek-{master,X-main}/src/spek-palette.cc : spectrum()/sox()/mono()
+//                                               are byte-for-byte equal.
 enum palette_t {
-    PALETTE_SPECTRUM = 0, // Bruton physics spectrum (original spectrum()
-                          // borrowed by upstream spek-audio; note it clips
-                          // the colour wheel at level*0.6625 — so the top
-                          // third of the intensity range is clamped to red).
-    PALETTE_SOX,          // Rob Sykes' SoX default palette.
-    PALETTE_MONO,         // Linear greyscale.
-
-    // New — colour maps visually matched to the spek.png / spek-x.png
-    // reference screenshots.  Each uses an 18-stop piecewise-linear
-    // anchor table; we interpolate in RGB so transitions are smooth
-    // (no colour banding at any bit-depth).
-    PALETTE_SPEK,         // Classic Spek: black-indigo → deep blue →
-                          // teal → emerald → gold → deep red.
-    PALETTE_SPEKX,        // Spek-X: violet-black → indigo → cyan →
-                          // emerald → gold → magenta → deep plum.
+    PALETTE_SPECTRUM = 0, // Legacy — Dan Bruton's physics spectrum
+                          // (clips colour wheel at level*0.6625 and
+                          // applies a black-ramp for levels < 0.1).
+    PALETTE_SOX,          // Legacy — Rob Sykes' SoX default palette.
+    PALETTE_MONO,         // Legacy — linear greyscale.
+    PALETTE_SPEK,         // Spek default (identical to PALETTE_SOX above;
+                          // matches what spek.exe shows on first launch).
+    PALETTE_SPEKX,        // Spek-X default (identical to PALETTE_SPECTRUM
+                          // above; matches what Spek-X.exe shows on first
+                          // launch.  Screenshots appear warmer because
+                          // Spek-X often ships with a narrower lrange,
+                          // NOT because the palette math itself differs).
 
     PALETTE_COUNT,
     PALETTE_DEFAULT = PALETTE_SPECTRUM,
