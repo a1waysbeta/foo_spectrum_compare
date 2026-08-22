@@ -115,16 +115,30 @@ bool SpectrumAnalyzer::analyze(metadb_handle_ptr track, SpectrumData& out, abort
         // Target frames: use user's setting if > 0, else 800 minimum,
         // don't exceed the realistic total_hops we can actually produce
         // (so short clips don't get upscaled blanks).
+        //
+        // NOTE: Wrapping std::min / std::max in extra parentheses
+        //   e.g. (std::min)<T>(a, b)
+        // is the standard idiom to survive <windows.h> #define min/max
+        // macros.  Without it MSVC expands `std::max(1, x)` into
+        // `std:: (((1) > (x) ? (1) : (x)))` → C2589 "illegal token on
+        // right side of '::'".  The SDK/libPPUI headers pull Windows.h
+        // indirectly and sometimes don't set NOMINMAX globally, so we
+        // cannot rely on that.  Using pfc::min_t / pfc::max_t would
+        // also work but the (std::xxx) parens are more self-documenting.
         int target_cols = m_target_frames > 0 ? m_target_frames : 800;
-        int columns = (int)std::min<int64_t>(
+        int columns = (int)(std::min)<int64_t>(
             (int64_t)target_cols,
-            std::max<int64_t>(1, total_hops_i64));
+            (std::max)<int64_t>(1, total_hops_i64));
         // Bucket = how many consecutive FFTs we average per displayed column.
         // Minimum 1 so we never divide by zero.
-        int ffts_per_col = (int)std::max<int64_t>(1, total_hops_i64 / std::max(1, columns));
+        int ffts_per_col = (int)(std::max)<int64_t>(
+            1,
+            total_hops_i64 / (std::max)<int64_t>(1, (int64_t)columns));
         // Re-derive columns so the last bucket has full count too (avoids a
         // tiny final column whose average would be noisier).
-        columns = (int)std::max<int64_t>(1, total_hops_i64 / ffts_per_col);
+        columns = (int)(std::max)<int64_t>(
+            1,
+            total_hops_i64 / (std::max)<int64_t>(1, (int64_t)ffts_per_col));
 
         // Ring buffer for audio samples (mono mixed down)
         std::vector<float> buffer(nfft * 4, 0.0f);
@@ -145,20 +159,27 @@ bool SpectrumAnalyzer::analyze(metadb_handle_ptr track, SpectrumData& out, abort
             abort.check();
 
             const audio_sample* samples = chunk.get_data();
-            int nch = chunk.get_channels();
-            int nsamples = chunk.get_sample_count();
+            // get_channels / get_sample_count return t_size = size_t.  We
+            // cast to int with an explicit clamp because real audio chunks
+            // are always well within INT_MAX samples / channels, but the
+            // bare assignments used to trigger C4267.
+            int nch = pfc::downcast_guarded<int, t_size>(chunk.get_channels());
+            int nsamples = pfc::downcast_guarded<int, t_size>(chunk.get_sample_count());
 
             // Mix down to mono and fill ring buffer
             for (int i = 0; i < nsamples; i++) {
                 float mono = 0;
                 for (int c = 0; c < nch; c++) {
-                    mono += samples[i * nch + c];
+                    // audio_sample is typedef'd to float or double
+                    // depending on SDK configuration.  Explicit cast to
+                    // float avoids C4244 when the SDK chose double.
+                    mono += static_cast<float>(samples[i * nch + c]);
                 }
                 mono /= nch;
 
                 buffer[buf_pos] = mono;
-                buf_pos = (buf_pos + 1) % (int)buffer.size();
-                if (buf_filled < (int)buffer.size()) buf_filled++;
+                buf_pos = (buf_pos + 1) % pfc::downcast_guarded<int, size_t>(buffer.size());
+                if (buf_filled < pfc::downcast_guarded<int, size_t>(buffer.size())) buf_filled++;
 
                 samples_since_fft++;
 
