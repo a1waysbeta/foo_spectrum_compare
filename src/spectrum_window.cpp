@@ -166,6 +166,7 @@ void SpectrumCompareWindow::set_configuration(ui_element_config::ptr config) {
     m_config = config;
 
     bool changed_something = false;
+    bool title_format_changed = false;
     int new_max_tracks = m_max_tracks;
     palette_t new_palette = m_palette;
     bool new_show_freq = m_show_freq_axis;
@@ -228,11 +229,16 @@ void SpectrumCompareWindow::set_configuration(ui_element_config::ptr config) {
         m_title_format = new_title;
         g_cfg_title_format.set(new_title);
         m_analyzer.set_title_format(new_title.get_ptr());
-        m_last_selection = last_selection_key{};
+        // Don't clear m_last_selection — track selection itself hasn't
+        // changed, only the label format.  Re-format existing titles
+        // in-place via refresh_track_titles() instead of aborting and
+        // re-analyzing everything from scratch.
+        title_format_changed = true;
         changed_something = true;
     }
 
     if (changed_something && IsWindow()) {
+        if (title_format_changed) refresh_track_titles();
         Invalidate();
         update_selection();
     }
@@ -470,6 +476,47 @@ void SpectrumCompareWindow::analysis_worker(metadb_handle_ptr handle, std::share
     }
 }
 
+void SpectrumCompareWindow::refresh_track_titles() {
+    // Re-evaluate the titleformat string for already-analyzed tracks WITHOUT
+    // re-decoding audio.  This is called when the user edits the title format
+    // string — the spectrum data is unchanged, only the label text updates.
+    //
+    // Previously this called OnRefresh() which aborted all analysis threads
+    // and re-decoded every track from scratch, causing visible flicker + CPU
+    // spike for what is just a text label change.
+    service_ptr_t<titleformat_object> obj;
+    const char* fmt = m_title_format.empty() ? "%title%" : m_title_format.c_str();
+    try {
+        static_api_ptr_t<titleformat_compiler>()->compile_safe(obj, fmt);
+    } catch (...) {
+        return;
+    }
+
+    {
+        std::lock_guard<std::mutex> lock(m_tracks_mutex);
+        for (auto& t : m_tracks) {
+            if (!t->handle.is_valid() || !t->data.ready) continue;
+            try {
+                titleformat_hook* hook = NULL;
+                pfc::string8 title_tmp;
+                file_info_impl info;
+                if (t->handle->get_info_async(info)) {
+                    t->handle->format_title_from_external_info(info, hook, title_tmp, obj, NULL);
+                } else {
+                    t->handle->format_title(hook, title_tmp, obj, NULL);
+                }
+                if (title_tmp.length() > 0) {
+                    t->data.title = title_tmp.c_str();
+                }
+            } catch (...) {
+                // keep old title on failure
+            }
+        }
+    }
+
+    if (IsWindow()) Invalidate();
+}
+
 // ============================================================
 // Painting
 // ============================================================
@@ -479,9 +526,21 @@ LRESULT SpectrumCompareWindow::OnEraseBkgnd(CDCHandle dc) {
 }
 
 void SpectrumCompareWindow::OnPaint(CDCHandle) {
-    CPaintDC dc(*this);
+    CPaintDC paint_dc(*this);
     CRect rc;
     GetClientRect(&rc);
+
+    // Double-buffer: render everything to a memory DC, then BitBlt once.
+    // Without this, the multiple Invalidate() calls during track selection
+    // (update_selection → WM_PAINT with "Analyzing...", then
+    // WM_SPECTRUM_READY → WM_PAINT with spectrum) each produce a visible
+    // flash because the background fill is shown momentarily before content
+    // is drawn on top.  Drawing to an off-screen bitmap and blitting in a
+    // single operation eliminates all intermediate states.
+    HDC mem_dc = CreateCompatibleDC(paint_dc);
+    HBITMAP mem_bmp = CreateCompatibleBitmap(paint_dc, rc.Width(), rc.Height());
+    HBITMAP old_bmp = (HBITMAP)SelectObject(mem_dc, mem_bmp);
+    CDCHandle dc = mem_dc;
 
     // Fill background
     COLORREF bg_color = m_callback->query_std_color(ui_color_background);
@@ -498,8 +557,7 @@ void SpectrumCompareWindow::OnPaint(CDCHandle) {
         SelectObjectScope fontScope(dc, (HGDIOBJ)m_callback->query_font_ex(ui_font_default));
         const UINT format = DT_NOPREFIX | DT_CENTER | DT_VCENTER | DT_SINGLELINE;
         dc.DrawText(_T("Select tracks in the playlist to view spectrograms"), -1, &rc, format);
-        return;
-    }
+    } else {
 
     // DPI-aware scaling: use DPI cached at construction time so we don't need
     // to grab a screen DC on every paint.
@@ -573,6 +631,13 @@ void SpectrumCompareWindow::OnPaint(CDCHandle) {
             render_time_axis(dc.m_hDC, time_rc, m_tracks[i]->data.duration);
         }
     }
+    } // end else (m_tracks not empty)
+
+    // Single BitBlt to screen — no intermediate states visible → no flicker.
+    BitBlt(paint_dc, 0, 0, rc.Width(), rc.Height(), mem_dc, 0, 0, SRCCOPY);
+    SelectObject(mem_dc, old_bmp);
+    DeleteDC(mem_dc);
+    DeleteObject(mem_bmp);
 }
 
 void SpectrumCompareWindow::render_track_label(CDCHandle dc, const RECT& rc, const TrackSpectrum& track) {
@@ -1479,7 +1544,7 @@ void SpectrumCompareWindow::end_inline_title_format_edit(bool commit) {
             m_title_format = newFormat;
             g_cfg_title_format.set(m_title_format);
             m_analyzer.set_title_format(m_title_format.c_str());
-            OnRefresh(0, IDM_REFRESH, nullptr);
+            refresh_track_titles();
         } else {
             Invalidate();
         }
@@ -1513,7 +1578,7 @@ void SpectrumCompareWindow::OnResetTitleFormat(UINT uNotifyCode, int nID, CWindo
     m_title_format = DEFAULT_TITLE_FORMAT;
     g_cfg_title_format.set(m_title_format);
     m_analyzer.set_title_format(m_title_format.c_str());
-    OnRefresh(0, IDM_REFRESH, nullptr);
+    refresh_track_titles();
 }
 
 // ============================================================

@@ -196,6 +196,9 @@ private:
 
     // Selection management
     void update_selection();
+    // Re-format titles of already-analyzed tracks using current m_title_format.
+    // Much cheaper than OnRefresh — no audio decode, just titleformat evaluation.
+    void refresh_track_titles();
     void start_analysis_for_track(size_t index);
     void analysis_worker(metadb_handle_ptr handle, std::shared_ptr<TrackSpectrum> target);
 
