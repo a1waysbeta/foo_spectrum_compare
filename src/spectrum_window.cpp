@@ -1,6 +1,7 @@
 #include "stdafx.h"
 #include "spectrum_window.h"
 #include <helpers/BumpableElem.h>
+#include <helpers/atl-misc.h>
 #include <algorithm>
 #include <cmath>
 
@@ -651,9 +652,144 @@ LRESULT SpectrumCompareWindow::OnSpectrumReady(UINT uMsg, WPARAM wParam, LPARAM 
 
 // ============================================================
 // Context menu
+// ------------------------------------------------------------
+// Two modes, selected via m_callback->is_edit_mode_enabled() so we match
+// the behaviour of every other Default UI / Columns UI panel:
+//   * Layout Editing Mode ON  → Replace / Cut / Copy / Paste (standard
+//                                element-editing commands)
+//   * Layout Editing Mode OFF → Spectrum Compare settings menu
 // ============================================================
 
+namespace {
+    // Private command IDs for the edit-mode menu. They live in a different
+    // range than the IDM_* settings IDs so the two menus never collide.
+    enum {
+        ID_EDIT_REPLACE = 5001,
+        ID_EDIT_CUT     = 5002,
+        ID_EDIT_COPY    = 5003,
+        ID_EDIT_PASTE   = 5004
+    };
+}
+
 void SpectrumCompareWindow::OnContextMenu(CWindow wnd, CPoint point) {
+    (void)wnd;
+
+    // ------------------------------------------------------------------
+    // Layout Editing Mode active: show standard Replace/Cut/Copy/Paste.
+    // This mirrors the menu that foobar2000's UI host normally pops up when
+    // the element is embedded inside one of its layout helpers — but since
+    // our window handles WM_CONTEXTMENU directly, we have to reproduce it.
+    // ------------------------------------------------------------------
+    if (m_callback->is_edit_mode_enabled()) {
+        static_api_ptr_t<ui_element_common_methods> cm;
+
+        // Build (screen) point. When lp = -1 (context-menu key on keyboard),
+        // fall back to the centre of the element.
+        CPoint pt;
+        if (point.x == -1 && point.y == -1) {
+            CRect rc;
+            GetWindowRect(&rc);
+            pt = rc.CenterPoint();
+        } else {
+            // WM_CONTEXTMENU always delivers screen coordinates already.
+            pt = point;
+        }
+
+        // Determine display labels + enabled state.
+        pfc::string8 elemName;
+        {
+            service_ptr_t<ui_element> e;
+            if (ui_element::g_find(e, guid_spectrum_compare)) {
+                e->get_name(elemName);
+            } else {
+                elemName = "Spectrum Compare";
+            }
+        }
+        const bool canPaste = !!(cm->is_paste_available());
+
+        CMenu menu;
+        WIN32_OP_D(menu.CreatePopupMenu());
+
+        // Disabled name header (matches host's standard_edit_context_menu).
+        WIN32_OP_D(menu.AppendMenu(
+            MF_STRING | MF_DISABLED | MF_GRAYED, 0,
+            pfc::stringcvt::string_os_from_utf8(elemName)));
+        WIN32_OP_D(menu.AppendMenu(MF_SEPARATOR, 0, _T("")));
+
+        WIN32_OP_D(menu.AppendMenu(MF_STRING, ID_EDIT_REPLACE, _T("Replace UI Element")));
+        WIN32_OP_D(menu.AppendMenu(MF_SEPARATOR, 0, _T("")));
+        WIN32_OP_D(menu.AppendMenu(MF_STRING, ID_EDIT_CUT,   _T("Cut UI Element")));
+        WIN32_OP_D(menu.AppendMenu(MF_STRING, ID_EDIT_COPY,  _T("Copy UI Element")));
+        WIN32_OP_D(menu.AppendMenu(
+            MF_STRING | (canPaste ? 0 : (MF_DISABLED | MF_GRAYED)),
+            ID_EDIT_PASTE, _T("Paste UI Element")));
+
+        int cmd = 0;
+        {
+            // Highlight the element during the menu, mirroring the host's
+            // standard_edit_context_menu behaviour (ui_element_highlight_scope
+            // is a nested helper inside ui_element_edit_tools, so we
+            // reproduce the raw v3 highlight + DestroyWindow pair here).
+            HWND highlight = NULL;
+            try {
+                static_api_ptr_t<ui_element_common_methods_v3> cm3_hl;
+                highlight = cm3_hl->highlight_element(m_hWnd);
+            } catch (...) { highlight = NULL; }
+
+            CMenuSelectionReceiver receiver(m_hWnd);
+            cmd = menu.TrackPopupMenu(
+                TPM_RIGHTBUTTON | TPM_NONOTIFY | TPM_RETURNCMD,
+                pt.x, pt.y, receiver);
+
+            if (highlight != NULL) ::DestroyWindow(highlight);
+        }
+
+        switch (cmd) {
+        case ID_EDIT_REPLACE: {
+            // Spawn the core "Replace UI Element" modal dialog (v3 API).
+            // The dialog wires the replacement straight into the host, so we
+            // just hand it our element GUID + a no-op notify callback.
+            static_api_ptr_t<ui_element_common_methods_v3> cm3;
+            auto notify = ui_element_replace_dialog_notify::create([](GUID) {});
+            cm3->replace_element_dialog_start(m_hWnd, guid_spectrum_compare, notify);
+            break;
+        }
+        case ID_EDIT_COPY: {
+            cm->copy(get_configuration());
+            break;
+        }
+        case ID_EDIT_CUT: {
+            // Match ui_element_edit_tools::standard_edit_context_menu:
+            //   copy(instance); release(instance); host_replace_with_guid_null
+            // The cut() API encapsulates exactly that. It releases the
+            // passed instance_ptr so we must feed it a *temporary* copy,
+            // otherwise "this" would be destroyed while still on the stack.
+            ui_element_instance_ptr tmp(this);
+            static_api_ptr_t<ui_element_common_methods> cutApi;
+            cutApi->cut(tmp, m_hWnd, m_callback);
+            // tmp is now empty and our own refcount remains intact.
+            break;
+        }
+        case ID_EDIT_PASTE: {
+            // paste(instance_ptr&, hwnd, callback) will replace the content
+            // of the passed instance_ptr in-place (removing us and inserting
+            // whatever was copied). Same as Cut — always use a tmp copy.
+            ui_element_instance_ptr tmp(this);
+            static_api_ptr_t<ui_element_common_methods> pasteApi;
+            pasteApi->paste(tmp, m_hWnd, m_callback);
+            break;
+        }
+        default:
+            break;
+        }
+
+        return;
+    }
+
+    // ------------------------------------------------------------------
+    // Normal mode: show Spectrum Compare settings menu (what used to be the
+    // only context menu this panel had).
+    // ------------------------------------------------------------------
     CMenu menu;
     menu.CreatePopupMenu();
 
@@ -695,11 +831,18 @@ void SpectrumCompareWindow::OnContextMenu(CWindow wnd, CPoint point) {
     menu.AppendMenu(MF_SEPARATOR);
     menu.AppendMenu(MF_STRING, IDM_REFRESH, _T("Refresh analysis"));
 
+    CPoint ptShow = point;
+    if (ptShow.x == -1 && ptShow.y == -1) {
+        CRect rc;
+        GetWindowRect(&rc);
+        ptShow = rc.CenterPoint();
+    }
+
     // All submenu handles must remain valid until TrackPopupMenu returns.
     int cmd = TrackPopupMenu(
         menu,
         TPM_RETURNCMD | TPM_RIGHTBUTTON,
-        point.x, point.y,
+        ptShow.x, ptShow.y,
         0, m_hWnd, NULL
     );
 
