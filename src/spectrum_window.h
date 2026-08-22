@@ -162,6 +162,38 @@ private:
         HWND hWnd, UINT uMsg, WPARAM wParam, LPARAM lParam,
         UINT_PTR uIdSubclass, DWORD_PTR dwRefData);
 
+    // ------------------------------------------------------------------
+    // Outermost "pre-message-map" window hook installed on our HWND.
+    //
+    // Motivation: WTL's BEGIN_MSG_MAP / MSG_WM_CONTEXTMENU is static, so
+    // there is no clean way to "temporarily unregister" the handler. But
+    // in foobar2000 Layout Editing Mode we MUST NOT process WM_CONTEXTMENU
+    // ourselves — doing so (even to forward it) makes the Default UI /
+    // Columns UI host miss its own "which slot got right-clicked?"
+    // analysis, and the menu either attaches to the wrong container or
+    // shows the wrong target (see user screenshots: parent splitter menu
+    // instead of this element's Replace/Cut/Copy/Paste).
+    //
+    // playlist_tree's DUIElement simply does NOT register MSG_WM_CONTEXTMENU.
+    // We emulate the same behaviour by intercepting WM_CONTEXTMENU in this
+    // outermost subclass BEFORE WTL's ProcessWindowMessage fires:
+    //   * edit mode ON  -> return 0 without calling DefSubclassProc (i.e.
+    //                     our WTL handler is SKIPPED). The original message
+    //                     stays live in the input pipeline and the host's
+    //                     pretranslate / per-child routing catches it,
+    //                     correctly invoking ui_element_edit_tools with
+    //                     the real slot p_id.
+    //   * edit mode OFF -> fall through to DefSubclassProc normally so our
+    //                     OnContextMenu still shows the Spectrum Compare
+    //                     settings menu.
+    // ------------------------------------------------------------------
+    static LRESULT CALLBACK outer_window_subclass_proc(
+        HWND hWnd, UINT uMsg, WPARAM wParam, LPARAM lParam,
+        UINT_PTR uIdSubclass, DWORD_PTR dwRefData);
+    static const UINT_PTR IDC_OUTER_SUBCLASS = 4;
+    void install_outer_window_subclass();
+    void uninstall_outer_window_subclass();
+
     // Spectrum rendering
     void render_spectrum(CDCHandle dc, const RECT& rc, const SpectrumData& data);
     void render_track_label(CDCHandle dc, const RECT& rc, const TrackSpectrum& track);

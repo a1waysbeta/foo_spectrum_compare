@@ -69,6 +69,11 @@ SpectrumCompareWindow::~SpectrumCompareWindow() {
         KillTimer(TIMER_END_EDIT);
     }
 
+    // Unhook the pre-message-map window subclass before destroying the HWND.
+    // This is symmetric to install_outer_window_subclass() and prevents a
+    // race where the subclass proc is invoked on a half-destroyed window.
+    uninstall_outer_window_subclass();
+
     // Unregister playlist callback
     try {
         static_api_ptr_t<playlist_manager>()->unregister_callback(this);
@@ -91,6 +96,13 @@ SpectrumCompareWindow::~SpectrumCompareWindow() {
 
 void SpectrumCompareWindow::initialize_window(HWND parent) {
     WIN32_OP(Create(parent) != NULL);
+
+    // Install the outermost window subclass BEFORE anything else. This
+    // sits in front of WTL's window procedure and lets us filter
+    // WM_CONTEXTMENU depending on edit mode — see outer_window_subclass_proc
+    // for a detailed motivation. It MUST be the very first subclass we
+    // install so it gets messages before our WTL ProcessWindowMessage.
+    install_outer_window_subclass();
 
     // Register playlist callback for active playlist
     static_api_ptr_t<playlist_manager>()->register_callback(
@@ -655,128 +667,39 @@ LRESULT SpectrumCompareWindow::OnSpectrumReady(UINT uMsg, WPARAM wParam, LPARAM 
 // ------------------------------------------------------------
 // Two modes, selected via m_callback->is_edit_mode_enabled() so we match
 // the behaviour of every other Default UI / Columns UI panel:
-//   * Layout Editing Mode ON  → Replace / Cut / Copy / Paste (standard
-//                                element-editing commands)
+//   * Layout Editing Mode ON  → We do NOTHING with WM_CONTEXTMENU. The
+//                               outer_window_subclass_proc has already
+//                               skipped our WTL message map entirely, so
+//                               the message is left to foobar2000's host
+//                               pretranslate routing which calls
+//                               standard_edit_context_menu with the real
+//                               slot (p_id) and produces Replace / Cut /
+//                               Copy / Paste that actually operate on the
+//                               live layout. This matches playlist_tree's
+//                               DUIElement which simply does NOT register a
+//                               MSG_WM_CONTEXTMENU.
 //   * Layout Editing Mode OFF → Spectrum Compare settings menu
+//
+// NOTE: The reason we cannot "forward WM_CONTEXTMENU to the parent
+// container" (the approach we tried and discarded) is that containers
+// re-hit-test the coordinates with ChildWindowFromPointEx, and when the
+// menu position sits on a pane, the splitter/panel-stack assumes *itself*
+// to be the target and shows its own menu. Only the default foobar2000
+// host routing — which is exactly what we reach by NOT processing the
+// message — iterates over real child *slots* and invokes
+// standard_edit_context_menu for each slot that contains the hit point.
 // ============================================================
-
-namespace {
-    // Single private command ID used by the minimal "Copy only" fallback
-    // menu shown when no layout container parent can be found (extremely
-    // rare). Replace / Cut / Paste are intentionally NOT emulated here,
-    // as they require access to the host's internal slot (p_id) which we
-    // don't have without a real ui_element_instance_host_base.
-    // NOTE: keep names with a "k" prefix — ID_EDIT_* are predefined WTL
-    // resource macros (atlres.h) and would expand to integer literals.
-    enum { kEditCopy = 5003 };
-
-    // ------------------------------------------------------------------
-    // Walk up the parent chain of an element window looking for the
-    // "closest non-leaf container" that really hosts the layout slot.
-    //
-    // In foobar2000's Default UI / Columns UI every ui_element lives as a
-    // direct child of its layout container (a ui_element_instance_host_base
-    // subclass, e.g. splitter / tabs / panel stack). That container both
-    // owns the child's slot p_id AND aggregates a ui_element_edit_tools,
-    // so only it can correctly execute Replace / Cut / Paste.
-    //
-    // The key difference from the previous "find the topmost popup"
-    // approach is: we MUST stop at the immediate parent chain members
-    // that still have WS_CHILD set, and break BEFORE any WS_POPUP /
-    // top-level window — the popup shell we used to forward to before is
-    // a dumb titlebar wrapper and has no idea about ui_element_edit_tools.
-    // This is exactly why playlist_tree / DUIElement simply DO NOT handle
-    // WM_CONTEXTMENU at all, and let the host window catch it first.
-    // ------------------------------------------------------------------
-    HWND find_layout_container(HWND child) {
-        HWND cur = ::GetParent(child);
-        // If there is no parent at all, bail immediately — no forwarding.
-        if (cur == NULL) return NULL;
-        HWND best = cur;
-        while (cur != NULL) {
-            const LONG_PTR style = ::GetWindowLongPtr(cur, GWL_STYLE);
-            // Popup / overlapped shells wrap the layout; we don't want to
-            // forward to them because they only carry the chrome menu.
-            if ((style & WS_CHILD) == 0) break;
-            best = cur;
-            HWND up = ::GetParent(cur);
-            if (up == NULL || up == cur) break;
-            cur = up;
-        }
-        return best;
-    }
-}
 
 void SpectrumCompareWindow::OnContextMenu(CWindow wnd, CPoint point) {
     (void)wnd;
+    (void)point;
 
     // ------------------------------------------------------------------
-    // Layout Editing Mode active:
-    //   DO NOT build our own Replace / Cut / Copy / Paste menu. The only
-    //   implementation that can actually move/remove/paste a ui_element in
-    //   a layout slot is the one on the host side (see
-    //   ui_element_edit_tools::standard_edit_context_menu in
-    //   ui_element_helpers.cpp): it uses host_replace_element / replace_dialog
-    //   / host_paste_element which are overridden by the real container to
-    //   touch the slot (p_id). Our own ui_element_common_methods::cut() /
-    //   replace_element_dialog_start() calls had NO access to that p_id,
-    //   which is why Replace / Cut did literally nothing before.
-    //
-    // Strategy: forward the raw WM_CONTEXTMENU to the innermost layout
-    // container that is a WS_CHILD ancestor. The container's message map
-    // (CHAIN_MSG_MAP(ui_element_instance_host_base) → ui_element_edit_tools
-    //  routed via its pretranslate or window subclass) will either catch
-    // it directly or re-route to standard_edit_context_menu for us.
-    // WPARAM of WM_CONTEXTMENU is the control that originated the message,
-    // i.e. our m_hWnd — passing it through lets the host know WHICH of its
-    // children (slot) to operate on, instead of operating on some other
-    // point.
+    // Safety: if this handler is ever reached with edit mode ON (e.g.
+    // outer subclass was unhooked on an unusual path), just bail. The
+    // whole point is that Edit Mode → we do NOT bring up our own menu.
     // ------------------------------------------------------------------
     if (m_callback->is_edit_mode_enabled()) {
-        HWND host = find_layout_container(m_hWnd);
-        if (host != NULL && host != m_hWnd) {
-            LPARAM lp;
-            if (point.x == -1 && point.y == -1) {
-                lp = (LPARAM)-1;
-            } else {
-                lp = MAKELPARAM((short)point.x, (short)point.y);
-            }
-            ::SendMessage(host, WM_CONTEXTMENU, (WPARAM)m_hWnd, lp);
-            return;
-        }
-        // No host parent could be determined. Instead of going through the
-        // wrong APIs (which silently no-op as observed), bail out and show
-        // a minimal menu with the ONLY command that is safe to run without
-        // a host-slot connection: Copy. For Cut / Replace / Paste we need
-        // the real container anyway.
-        static_api_ptr_t<ui_element_common_methods> cm;
-        CPoint pt;
-        if (point.x == -1 && point.y == -1) {
-            CRect rc; GetWindowRect(&rc); pt = rc.CenterPoint();
-        } else {
-            pt = point;
-        }
-        pfc::string8 elemName = "Spectrum Compare";
-        {
-            service_ptr_t<ui_element> e;
-            if (ui_element::g_find(e, guid_spectrum_compare)) e->get_name(elemName);
-        }
-        CMenu menu;
-        WIN32_OP_D(menu.CreatePopupMenu());
-        WIN32_OP_D(menu.AppendMenu(
-            MF_STRING | MF_DISABLED | MF_GRAYED,
-            (UINT_PTR)0,
-            (LPCTSTR)pfc::stringcvt::string_os_from_utf8(elemName)));
-        WIN32_OP_D(menu.AppendMenu(MF_SEPARATOR));
-        WIN32_OP_D(menu.AppendMenu(
-            MF_STRING, (UINT_PTR)kEditCopy, _T("Copy UI Element")));
-        {
-            CMenuSelectionReceiver receiver(m_hWnd);
-            const int cmd = menu.TrackPopupMenu(
-                TPM_RIGHTBUTTON | TPM_NONOTIFY | TPM_RETURNCMD,
-                pt.x, pt.y, receiver);
-            if (cmd == (int)kEditCopy) cm->copy(get_configuration());
-        }
         return;
     }
 
@@ -1224,6 +1147,73 @@ LRESULT CALLBACK SpectrumCompareWindow::parent_subclass_proc(
         if (self != NULL) self->m_hwnd_parent = NULL;
         break;
     }
+    return ::DefSubclassProc(hWnd, uMsg, wParam, lParam);
+}
+
+// ============================================================
+// Outer (pre-message-map) window subclass
+// ------------------------------------------------------------
+// This sits in front of our WTL window procedure. For WM_CONTEXTMENU:
+//   * edit mode ON  → return 0, do NOT call DefSubclassProc. Our
+//                     ProcessWindowMessage never sees the message. The
+//                     original WM_CONTEXTMENU gets discarded *from this
+//                     chain*, but foobar2000's host already has its own
+//                     message routing (pretranslate / slot-based dispatch)
+//                     that triggered this message and will run its
+//                     Replace/Cut/Copy/Paste path on us regardless.
+//                     (This is exactly what happens to DUIElement: it
+//                     doesn't register MSG_WM_CONTEXTMENU so it simply
+//                     never sees the message.)
+//   * edit mode OFF → fall through to DefSubclassProc → our
+//                     ProcessWindowMessage → OnContextMenu → settings menu
+// ============================================================
+void SpectrumCompareWindow::install_outer_window_subclass() {
+    if (m_hWnd == NULL) return;
+    // ComCtl32 SetWindowSubclass works correctly here even though WTL
+    // itself uses a different StartWindowProc mechanism — the two
+    // chaining systems stack properly.
+    ::SetWindowSubclass(
+        m_hWnd,
+        outer_window_subclass_proc,
+        IDC_OUTER_SUBCLASS,
+        (DWORD_PTR)this);
+}
+
+void SpectrumCompareWindow::uninstall_outer_window_subclass() {
+    if (m_hWnd == NULL) return;
+    ::RemoveWindowSubclass(m_hWnd, outer_window_subclass_proc, IDC_OUTER_SUBCLASS);
+}
+
+LRESULT CALLBACK SpectrumCompareWindow::outer_window_subclass_proc(
+    HWND hWnd, UINT uMsg, WPARAM wParam, LPARAM lParam,
+    UINT_PTR uIdSubclass, DWORD_PTR dwRefData)
+{
+    (void)hWnd; (void)uIdSubclass;
+    SpectrumCompareWindow* self = (SpectrumCompareWindow*)dwRefData;
+
+    if (uMsg == WM_CONTEXTMENU && self != NULL && self->m_callback.is_valid()) {
+        try {
+            if (self->m_callback->is_edit_mode_enabled()) {
+                // Consume the message silently. Do NOT DefSubclassProc.
+                // Our own WTL MSG_WM_CONTEXTMENU handler is bypassed, and
+                // foobar2000's host-level dispatch (which fires before
+                // this window proc returns to the message loop — it is
+                // the reason we received this very message) has already
+                // identified the slot we occupy and will invoke
+                // standard_edit_context_menu targeting us.
+                return 0;
+            }
+        } catch (...) {
+            // Miserly fallback in case callback dies mid-call: just let
+            // the normal chain run.
+        }
+    }
+
+    if (uMsg == WM_NCDESTROY) {
+        // Mirror our explicit uninstall hook so there's no dangling proc.
+        ::RemoveWindowSubclass(hWnd, outer_window_subclass_proc, uIdSubclass);
+    }
+
     return ::DefSubclassProc(hWnd, uMsg, wParam, lParam);
 }
 
