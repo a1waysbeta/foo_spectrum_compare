@@ -709,25 +709,18 @@ void SpectrumCompareWindow::render_spectrum(CDCHandle dc, const RECT& rc, const 
 
     uint32_t* pixel_data = (uint32_t*)pixels;
 
-    // Dynamic range for dB scaling — intentionally 80 dB (LRANGE=-80,
-    // URANGE=0).  Why not Spek's default 120 dB?
-    //
-    //   * Music's perceptually-interesting content lives in roughly
-    //     -60 dBFS … -10 dBFS.  On 120 dB that maps to palette level
-    //     0.50 … 0.92 — the cold half (green → red only at peaks).
-    //   * On 80 dB the same -60 … -10 dBFS maps to level 0.25 … 0.88 —
-    //     the warm half (orange/yellow/lime dominant with red at peaks).
-    //   * Combined with PALETTE_INTENSITY's built-in gamma=0.35 lift
-    //     this gives the "热力加强" density the user wants without us
-    //     having to do a single extra FFT, accumulator, or averaging
-    //     pass — zero runtime cost, just two numeric constants.
-    //
-    // The old 120 dB "蓝色带" concern is handled by palette code:
-    // spectrum() has an explicit cf black-ramp for level < 0.1, and
-    // intensity() returns pure 0x000000 for level <= 0.0 so the
-    // -80 dBFS floor decays to clean black.
-    const float dyn_range = 80.0f;  // dB — warm colours (project constraint)
-    const float floor_db  = -80.0f; // LRANGE
+    // Dynamic range for dB scaling — matches Spek upstream default:
+    //   spek-spectrogram.cc  LRANGE=-120, URANGE=0  → range=120 dB
+    // Previous versions used 80 dB, which compressed anything quieter
+    // than -80 dBFS into palette level 0.0 (→ deep blue of spectrum()),
+    // producing the user-reported "蓝色带" at the bottom of every track.
+    // At 120 dB we give ~40 dB more headroom: the noise floor at ~-96
+    // dBFS lands at palette level 0.20 (green begins to fade into blue)
+    // instead of 0.0 (solid spectrum() dark blue).  Together
+    // with spectrum()'s built-in cf ramp for level<0.1 we get clean
+    // black for absolute silence but NOT a fake blue band on noise.
+    const float dyn_range = 120.0f; // dB
+    const float floor_db = -120.0f;
     float ref_level = data.max_level > 0 ? data.max_level : 1.0f;
 
     // Map spectrum data to pixels.
@@ -1033,18 +1026,17 @@ LRESULT SpectrumCompareWindow::OnSpectrumReady(UINT uMsg, WPARAM wParam, LPARAM 
 //
 // Flat layout (indexed 0..N-1):
 //   [0..3]   Display count  ▶  1 / 2 / 3 / 4 tracks        (4 leaves)
-//   [4..7]   Palette        ▶  Spectrum / SoX / Mono / Int (4 leaves)
-//   [8..9]   Axes           ▶  Freq / Time                 (2 leaves)
-//   [10..11] Title format   ▶  Edit / Reset                (2 leaves)
-//   [12..13] Language       ▶  English / Chinese           (2 leaves)
-//   [14]     Refresh analysis                              (1 leaf)
+//   [4..6]   Palette        ▶  Spectrum / SoX / Mono       (3 leaves)
+//   [7..8]   Axes           ▶  Freq / Time                 (2 leaves)
+//   [9..10]  Title format   ▶  Edit / Reset                (2 leaves)
+//   [11]     Refresh analysis                              (1 leaf)
 static constexpr size_t kCountIdx    = 0;
 static constexpr size_t kPaletteIdx  = 4;
-static constexpr size_t kAxesIdx     = 8;
-static constexpr size_t kTitleIdx    = 10;
-static constexpr size_t kLangIdx     = 12;
-static constexpr size_t kRefreshIdx  = 14;
-static constexpr size_t kTotalLeaves = 15;
+static constexpr size_t kAxesIdx     = 7;
+static constexpr size_t kTitleIdx    = 9;
+static constexpr size_t kLangIdx     = 11;
+static constexpr size_t kRefreshIdx  = 13;
+static constexpr size_t kTotalLeaves = 14;
 
 // Helper: narrow UTF-8 -> wide for Win32 menu APIs.
 static void append_menu_i18n(HMENU hmenu, UINT flags, UINT id, strid_t sid, language_t lang) {
@@ -1067,11 +1059,10 @@ static void build_display_count_popup(HMENU hmenu, unsigned base, int max_tracks
 static void build_palette_popup(HMENU hmenu, unsigned base, palette_t current,
                                 language_t lang, std::vector<UINT>& leaf_idms) {
     struct E { UINT id; strid_t sid; palette_t value; };
-    static const E s_rows[4] = {
-        { IDM_PALETTE_SPECTRUM,  S_SPECTRUM,  PALETTE_SPECTRUM },
-        { IDM_PALETTE_SOX,       S_SOX,       PALETTE_SOX },
-        { IDM_PALETTE_MONO,      S_MONO,      PALETTE_MONO },
-        { IDM_PALETTE_INTENSITY, S_INTENSITY, PALETTE_INTENSITY },
+    static const E s_rows[3] = {
+        { IDM_PALETTE_SPECTRUM, S_SPECTRUM, PALETTE_SPECTRUM },
+        { IDM_PALETTE_SOX,      S_SOX,      PALETTE_SOX },
+        { IDM_PALETTE_MONO,     S_MONO,     PALETTE_MONO },
     };
     PFC_ASSERT(leaf_idms.size() == kPaletteIdx);
     for (auto& r : s_rows) {
@@ -1400,10 +1391,9 @@ void SpectrumCompareWindow::OnRefresh(UINT uNotifyCode, int nID, CWindow wndCtl)
 void SpectrumCompareWindow::OnPalette(UINT uNotifyCode, int nID, CWindow wndCtl) {
     (void)uNotifyCode; (void)wndCtl;
     switch (nID) {
-    case IDM_PALETTE_SPECTRUM:  m_palette = PALETTE_SPECTRUM;  break;
-    case IDM_PALETTE_SOX:       m_palette = PALETTE_SOX;       break;
-    case IDM_PALETTE_MONO:      m_palette = PALETTE_MONO;      break;
-    case IDM_PALETTE_INTENSITY: m_palette = PALETTE_INTENSITY; break;
+    case IDM_PALETTE_SPECTRUM: m_palette = PALETTE_SPECTRUM; break;
+    case IDM_PALETTE_SOX:      m_palette = PALETTE_SOX;      break;
+    case IDM_PALETTE_MONO:     m_palette = PALETTE_MONO;     break;
     default: return;
     }
     g_cfg_palette = (int64_t)m_palette;

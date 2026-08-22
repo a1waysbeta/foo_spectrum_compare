@@ -19,8 +19,6 @@ static const char* const g_strings[STRID_COUNT][LANG_COUNT] = {
     { "Spectrum",            "Spectrum" },
     { "SoX",                 "SoX" },
     { "Mono",                "\xe5\x8d\x95\xe8\x89\xb2" },
-    // S_INTENSITY
-    { "Intensity",           "\xe7\x83\xad\xe5\x8a\x9b\xe5\x8a\xa0\xe5\xbc\xba" },
     // S_AXES
     { "Axes",                "\xe5\x9d\x90\xe6\xa0\x87\xe8\xbd\xb4" },
     // S_FREQ_AXIS, S_TIME_AXIS

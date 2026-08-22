@@ -2,17 +2,14 @@
 
 #include <stdint.h>
 
-// Built-in palettes — the numerical values (0, 1, 2, 3, PALETTE_COUNT=4)
+// Built-in palettes — the numerical values (0, 1, 2, PALETTE_COUNT=3)
 // have been stable since the first shipped release and are persisted
 // inside .fth / layout config blobs.  DO NOT REORDER.
 //
 // Reference (source code verified on local checkouts of spek-master /
-// spek-X-main at src/spek-palette.cc): entries 0–2 are direct,
+// spek-X-main at src/spek-palette.cc): all three entries are direct,
 // verbatim, byte-for-byte C++ ports of the corresponding upstream
-// functions.  Entry 3 (INTENSITY) is modelled on ffmpeg's
-// showspectrumpic filter's `color=intensity` — a saturated
-// black→blue→cyan→green→yellow→orange→red→magenta gradient with
-// gamma-boosted dark range so low-level signals look "thermally hot".
+// functions.
 enum palette_t {
     PALETTE_SPECTRUM = 0, // Dan Bruton's physics spectrum — the classic
                           // rainbow palette used by most audio visualisers.
@@ -23,9 +20,6 @@ enum palette_t {
                           // and the default scheme in spek.exe.
     PALETTE_MONO,         // Greyscale linear — 0→black, 1→white.  Good
                           // for printing / side-by-side comparisons.
-    PALETTE_INTENSITY,    // ffmpeg showspectrumpic `intensity` — a
-                          // thermally saturated 12-stop gradient with
-                          // gamma correction for punchy low-level detail.
 
     PALETTE_COUNT,
     PALETTE_DEFAULT = PALETTE_SPECTRUM,
