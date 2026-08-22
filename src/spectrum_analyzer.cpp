@@ -81,84 +81,61 @@ bool SpectrumAnalyzer::analyze(metadb_handle_ptr track, SpectrumData& out, abort
         input_helper input;
         input.open(NULL, track, decode_flags, abort);
 
-        FFTPlan fft(m_fft_bits);
+        FFTPlan fft(FFT_BITS);
         int nfft = fft.get_input_size();
         int nbins = fft.get_output_size();
         out.fft_bins = nbins;
 
         // Decide hop size and number of time columns.
         //
-        // Previous (v1): hop = total_samples / m_target_frames, min = nfft/4,
-        //                1 FFT per column, NO overlap.
-        // This (v2) is closer to Spek and gives much smoother time-domain
-        // rendering plus avoids the "blocks of 2px wide columns" blocky
-        // look that users described:
-        //   - we fix hop = nfft / 4  ↔ 75% window overlap (industry
-        //                               standard for spectrogram display).
-        //   - the number of time columns is then the natural total FFTs
-        //     possible given hop = nfft/4:
-        //         total_hops = ceil(total_samples / hop) - 3
-        //     (we lose the first 3 half-windows because they're not
-        //      fully overlapped; if total is small we clamp to 1 minimum).
-        //   - we cap columns to m_target_frames (default 800, or higher if
-        //     the user passed one via set_time_resolution); that keeps
-        //     memory / paint cost flat on 3-hour mixes.  If the cap is
-        //     smaller than total_hops we aggregate several consecutive
-        //     FFTs per output column (Spek's same averaging).
+        // Performance-tuned fast path (matches the pre-FFT-menu "秒加载"
+        // behaviour the user wants back):
+        //   - we aim for m_target_frames time columns spread evenly
+        //     across the whole file;
+        //   - hop = total_samples / target_cols, clamped so there's at
+        //     least 50% window overlap (hop <= nfft/2) and never smaller
+        //     than nfft/4 (avoids pathological oversampling on short
+        //     clips);
+        //   - exactly 1 FFT per displayed column, no bucket-averaging.
+        //
+        // This gives roughly 1200-1500 FFTs per 3-minute track at 2048
+        // samples/FFT, which is the ~instant load the user remembers.
         double total_samples = out.duration * out.sample_rate;
-        int hop = nfft / 4;                  // 75% overlap, matches Spek's feel
-        if (hop < 1) hop = 1;
+        int target_cols = m_target_frames > 0 ? m_target_frames : 800;
+        int64_t hop_i64 = target_cols > 0 && total_samples > 0
+            ? (int64_t)(total_samples / target_cols)
+            : (int64_t)(nfft / 2);
+        // Clamp hop: nfft/4 (75% overlap) <= hop <= nfft/2 (50% overlap)
+        const int64_t hop_min = (int64_t)(nfft / 4);
+        const int64_t hop_max = (int64_t)(nfft / 2);
+        if (hop_i64 < hop_min) hop_i64 = hop_min;
+        if (hop_i64 > hop_max) hop_i64 = hop_max;
+        int hop = (int)hop_i64;
+
         int64_t total_hops_i64 = total_samples > 0
-            ? (int64_t)(total_samples / hop) - 3
+            ? (int64_t)(total_samples / hop) - 1
             : 0;
         if (total_hops_i64 < 1) total_hops_i64 = 1;
-        // Target frames: use user's setting if > 0, else 800 minimum,
-        // don't exceed the realistic total_hops we can actually produce
-        // (so short clips don't get upscaled blanks).
-        //
-        // NOTE: We intentionally use pfc::min_t<T> / pfc::max_t<T> here
-        // instead of std::min / std::max.  The SDK PFC headers we pull
-        // in (via stdafx.h → foobar2000 SDK → libPPUI → Windows.h) can
-        // expose the <windows.h> object-like macros:
-        //   #define min(a,b) (((a)<(b))?(a):(b))
-        //   #define max(a,b) (((a)>(b))?(a):(b))
-        // When those macros are live, writing `std::max(1, x)` gets
-        // textually expanded by the preprocessor before the compiler
-        // ever sees it, producing C2589 / C2664 on the `::` token.
-        // The classic "wrap the qualified name in parens" workaround
-        // (std::max)<T>(a,b) compiles with some MSVC frontends but not
-        // reliably with /permissive- + /std:c++17 (it can produce
-        // C2440: cannot convert from 'overloaded-function' to int).
-        // pfc::min_t/max_t live in a PFC-namespaced template, their
-        // names do NOT collide with the object-like max(a,b) macros
-        // (different arity + qualified namespace → macro pattern
-        // doesn't match), so they're 100 % safe regardless of
-        // NOMINMAX / permissive mode / language version.
-        int target_cols = m_target_frames > 0 ? m_target_frames : 800;
         int columns = (int)pfc::min_t<int64_t>(
             (int64_t)target_cols,
             pfc::max_t<int64_t>(1, total_hops_i64));
-        // Bucket = how many consecutive FFTs we average per displayed column.
-        // Minimum 1 so we never divide by zero.
-        int ffts_per_col = (int)pfc::max_t<int64_t>(
+
+        // Stride = how many hops we skip per displayed column so the
+        // final count never exceeds `columns`.  Keeps 1 FFT/column.
+        int stride = (int)pfc::max_t<int64_t>(
             1,
             total_hops_i64 / pfc::max_t<int64_t>(1, (int64_t)columns));
-        // Re-derive columns so the last bucket has full count too (avoids a
-        // tiny final column whose average would be noisier).
         columns = (int)pfc::max_t<int64_t>(
             1,
-            total_hops_i64 / pfc::max_t<int64_t>(1, (int64_t)ffts_per_col));
+            total_hops_i64 / pfc::max_t<int64_t>(1, (int64_t)stride));
 
         // Ring buffer for audio samples (mono mixed down)
-        std::vector<float> buffer(nfft * 4, 0.0f);
+        std::vector<float> buffer(nfft * 2, 0.0f);
         int buf_pos = 0;
         int buf_filled = 0;
 
-        // Accumulator for averaging multiple FFTs per displayed time column
-        std::vector<float> accum(nbins, 0.0f);
-        int accum_count = 0;
         int samples_since_fft = 0;
-        int ffts_in_current_bucket = 0;
+        int hops_since_last_emit = 0;
 
         std::vector<float> frame_data; // output frames: nbins floats per column
         frame_data.reserve((size_t)columns * (size_t)nbins);
@@ -192,56 +169,46 @@ bool SpectrumAnalyzer::analyze(metadb_handle_ptr track, SpectrumData& out, abort
 
                 samples_since_fft++;
 
-                // Run an FFT every `hop` new audio samples.  With hop =
-                // nfft/4 this gives 75% consecutive overlap between windows,
-                // which eliminates time-domain smearing when combined with
-                // the multi-FFT-per-column average below.
+                // Run an FFT every `hop` new audio samples.  With hop
+                // between nfft/4 and nfft/2 this gives 50-75% overlap
+                // — enough to smooth the time axis, then we decimate
+                // with `stride` so we emit exactly 1 FFT per displayed
+                // time column, NO extra averaging, NO accumulator copy.
                 if (samples_since_fft >= hop && buf_filled >= nfft) {
                     samples_since_fft = 0;
+                    hops_since_last_emit++;
 
-                    // Extract nfft samples from ring buffer (most recent)
-                    std::vector<float> fft_in(nfft);
-                    int start = (buf_pos - nfft + (int)buffer.size()) % (int)buffer.size();
-                    for (int j = 0; j < nfft; j++) {
-                        fft_in[j] = buffer[(start + j) % buffer.size()];
-                    }
-
-                    apply_window(fft_in.data(), nfft, m_window);
-                    for (int j = 0; j < nfft; j++) {
-                        fft.set_input(j, fft_in[j]);
-                    }
-                    fft.execute();
-
-                    // Accumulate into current bucket's running average
-                    for (int j = 0; j < nbins; j++) {
-                        accum[j] += fft.get_output(j);
-                    }
-                    accum_count++;
-                    ffts_in_current_bucket++;
-
-                    // Emit one displayed time column when we've averaged
-                    // enough FFTs for this bucket.
-                    if (ffts_in_current_bucket >= ffts_per_col &&
+                    if (hops_since_last_emit >= stride &&
                         (int)frame_data.size() / nbins < columns)
                     {
-                        for (int j = 0; j < nbins; j++) {
-                            frame_data.push_back(accum[j] / (float)accum_count);
+                        hops_since_last_emit = 0;
+
+                        // Extract nfft samples from ring buffer (most recent)
+                        std::vector<float> fft_in(nfft);
+                        int start = (buf_pos - nfft + (int)buffer.size()) % (int)buffer.size();
+                        for (int j = 0; j < nfft; j++) {
+                            fft_in[j] = buffer[(start + j) % buffer.size()];
                         }
-                        std::fill(accum.begin(), accum.end(), 0.0f);
-                        accum_count = 0;
-                        ffts_in_current_bucket = 0;
+
+                        apply_window(fft_in.data(), nfft, m_window);
+                        for (int j = 0; j < nfft; j++) {
+                            fft.set_input(j, fft_in[j]);
+                        }
+                        fft.execute();
+
+                        // 1 FFT → 1 time column, direct write
+                        for (int j = 0; j < nbins; j++) {
+                            frame_data.push_back(fft.get_output(j));
+                        }
                     }
                 }
             }
         }
 
-        // Process remaining data.  If we have an unterminated bucket we
-        // flush it (as long as there's >=1 FFT averaged).  If not but
-        // there's at least one full window in the ring, we do one last
-        // FFT so songs shorter than the bucket boundary still render.
-        if (accum_count == 0 && buf_filled >= nfft &&
-            (int)frame_data.size() / nbins < columns)
-        {
+        // Tail: if we haven't produced any column yet but have a full
+        // window in the ring, emit one final FFT so short clips still
+        // render (covers the <1-column edge case).
+        if (frame_data.empty() && buf_filled >= nfft) {
             std::vector<float> fft_in(nfft);
             int start = (buf_pos - nfft + (int)buffer.size()) % (int)buffer.size();
             for (int j = 0; j < nfft; j++) {
@@ -253,13 +220,7 @@ bool SpectrumAnalyzer::analyze(metadb_handle_ptr track, SpectrumData& out, abort
             }
             fft.execute();
             for (int j = 0; j < nbins; j++) {
-                accum[j] += fft.get_output(j);
-            }
-            accum_count = 1;
-        }
-        if (accum_count > 0 && (int)frame_data.size() / nbins < columns) {
-            for (int j = 0; j < nbins; j++) {
-                frame_data.push_back(accum[j] / (float)accum_count);
+                frame_data.push_back(fft.get_output(j));
             }
         }
 

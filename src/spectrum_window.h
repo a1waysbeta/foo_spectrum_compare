@@ -17,7 +17,11 @@ static const char* DEFAULT_TITLE_FORMAT =
     "%title% | %codec% | %bitrate% kbps"
     "[ | $info(bitspersample) bit] | %samplerate% Hz | $info(channels) CH | %path%";
 
-// Config storage GUIDs
+// Config storage GUIDs — 5 persisted settings.  The numerical values and
+// relative order of the palette/max_tracks/axis/title entries are part
+// of the versioned .fth / ui_element_config binary format and must not
+// be changed (see spectrum_window.cpp build_instance_config /
+// set_configuration for the exact wire layout).
 static const GUID guid_cfg_show_freq_axis =
     { 0x1a2b3c4d, 0x5e6f, 0x7081, { 0x92, 0xa3, 0xb4, 0xc5, 0xd6, 0xe7, 0xf8, 0x09 } };
 static const GUID guid_cfg_show_time_axis =
@@ -28,19 +32,20 @@ static const GUID guid_cfg_max_tracks =
     { 0x4d5e6f70, 0x8192, 0xa3b4, { 0xc5, 0xd6, 0xe7, 0xf8, 0x09, 0x1a, 0x2b, 0x3c } };
 static const GUID guid_cfg_palette =
     { 0x5e6f7081, 0x92a3, 0xb4c5, { 0xd6, 0xe7, 0xf8, 0x09, 0x1a, 0x2b, 0x3c, 0x4d } };
-static const GUID guid_cfg_fft_bits =
-    { 0x6f708192, 0xa3b4, 0xc5d6, { 0xe7, 0xf8, 0x09, 0x1a, 0x2b, 0x3c, 0x4d, 0x5e } };
 
-// Persistent config storage (static globals, registered once at startup)
+// Persistent config storage (static globals, registered once at startup).
 // Defined as static so they persist across window creation/destruction.
 extern cfg_bool g_cfg_show_freq_axis;
 extern cfg_bool g_cfg_show_time_axis;
 extern cfg_string g_cfg_title_format;
 extern cfg_int g_cfg_max_tracks;
 extern cfg_int g_cfg_palette;
-extern cfg_int g_cfg_fft_bits;
 
-// Menu command IDs
+// Menu command IDs — values are arbitrary but unique within this window's
+// command range.  Do NOT reuse numbers across different IDs because
+// set_configuration round-trips cfg_* values by their enum name, NOT by
+// the IDM_* constant — but collisions between IDM_* constants would make
+// COMMAND_ID_HANDLER_EX dispatch ambiguous.
 #define IDM_SET_COUNT_1  1001
 #define IDM_SET_COUNT_2  1002
 #define IDM_SET_COUNT_3  1003
@@ -49,13 +54,6 @@ extern cfg_int g_cfg_fft_bits;
 #define IDM_PALETTE_SPECTRUM 1010
 #define IDM_PALETTE_SOX      1011
 #define IDM_PALETTE_MONO     1012
-#define IDM_PALETTE_SPEK     1013
-#define IDM_PALETTE_SPEKX    1014
-#define IDM_FFT_1024    1030
-#define IDM_FFT_2048    1031
-#define IDM_FFT_4096    1032
-#define IDM_FFT_8192    1033
-#define IDM_FFT_16384   1034
 #define IDM_TOGGLE_FREQ_AXIS 1020
 #define IDM_TOGGLE_TIME_AXIS 1021
 #define IDM_EDIT_TITLE_FORMAT 1022
@@ -108,28 +106,6 @@ public:
     void notify(const GUID& p_what, t_size p_param1, const void* p_param2, t_size p_param2size);
 
     // --- ui_element_instance: Layout Editing Mode custom context menu ----
-    //
-    // Default UI / Columns UI's edit-mode right-click flow ultimately
-    // invokes ui_element_edit_tools::standard_edit_context_menu() which
-    // shows the Replace / Cut / Copy / Paste section and then uses the
-    // three hooks below to ask the *element* instance itself whether it
-    // wants to append any panel-specific settings.
-    //
-    // Previously we let those fall through to the base "return false"
-    // stubs, so the edit-mode menu was host-only — panel settings
-    // disappeared the moment the user flipped Layout Editing Mode ON.
-    // Implementing these hooks keeps the Replace / Cut / Copy / Paste
-    // section host-driven (with the REAL slot p_id, so commands really
-    // do mutate the live layout) AND appends exactly the same Display
-    // count / Palette / Axes / Title format / Refresh settings block
-    // that's visible in normal mode.
-    //
-    // Command IDs inside the appended block come from the host as a
-    // running `p_id_base + index` to avoid colliding with the host's
-    // own Replace/Cut/Copy/Paste range.  We record the index → IDM_*
-    // mapping at build time (m_edit_mode_cmd_to_idm) and translate back
-    // in the command hook, then SendMessage(WM_COMMAND, IDM_*) so the
-    // existing COMMAND_ID_HANDLER_EX handlers run entirely unchanged.
     bool edit_mode_context_menu_test(const POINT& p_point, bool p_fromkeyboard) override;
     void edit_mode_context_menu_build(const POINT& p_point, bool p_fromkeyboard, HMENU p_menu, unsigned p_id_base) override;
     void edit_mode_context_menu_command(const POINT& p_point, bool p_fromkeyboard, unsigned p_id, unsigned p_id_base) override;
@@ -137,7 +113,7 @@ public:
     // Temporary mapping recorded during edit_mode_context_menu_build and
     // consumed by edit_mode_context_menu_command.  Contents:
     //   m_edit_mode_cmd_to_idm[idx] == the IDM_* for clickable leaf #idx.
-    // The block layout has exactly 12 leaves (see spectrum_window.cpp).
+    // Block size == kTotalLeaves declared in spectrum_window.cpp.
     std::vector<UINT> m_edit_mode_cmd_to_idm;
 
     // playlist_callback_single
@@ -171,18 +147,11 @@ public:
         COMMAND_ID_HANDLER_EX(IDM_SET_COUNT_4, OnSetCount)
         COMMAND_ID_HANDLER_EX(IDM_REFRESH, OnRefresh)
         COMMAND_ID_HANDLER_EX(IDM_PALETTE_SPECTRUM, OnPalette)
-        COMMAND_ID_HANDLER_EX(IDM_PALETTE_SOX, OnPalette)
-        COMMAND_ID_HANDLER_EX(IDM_PALETTE_MONO, OnPalette)
-        COMMAND_ID_HANDLER_EX(IDM_PALETTE_SPEK, OnPalette)
-        COMMAND_ID_HANDLER_EX(IDM_PALETTE_SPEKX, OnPalette)
-        COMMAND_ID_HANDLER_EX(IDM_FFT_1024, OnFFTSize)
-        COMMAND_ID_HANDLER_EX(IDM_FFT_2048, OnFFTSize)
-        COMMAND_ID_HANDLER_EX(IDM_FFT_4096, OnFFTSize)
-        COMMAND_ID_HANDLER_EX(IDM_FFT_8192, OnFFTSize)
-        COMMAND_ID_HANDLER_EX(IDM_FFT_16384, OnFFTSize)
+        COMMAND_ID_HANDLER_EX(IDM_PALETTE_SOX,      OnPalette)
+        COMMAND_ID_HANDLER_EX(IDM_PALETTE_MONO,     OnPalette)
         COMMAND_ID_HANDLER_EX(IDM_TOGGLE_FREQ_AXIS, OnToggleFreqAxis)
         COMMAND_ID_HANDLER_EX(IDM_TOGGLE_TIME_AXIS, OnToggleTimeAxis)
-        COMMAND_ID_HANDLER_EX(IDM_EDIT_TITLE_FORMAT, OnEditTitleFormat)
+        COMMAND_ID_HANDLER_EX(IDM_EDIT_TITLE_FORMAT,  OnEditTitleFormat)
         COMMAND_ID_HANDLER_EX(IDM_RESET_TITLE_FORMAT, OnResetTitleFormat)
     END_MSG_MAP()
 
@@ -200,7 +169,6 @@ private:
     void OnSetCount(UINT uNotifyCode, int nID, CWindow wndCtl);
     void OnRefresh(UINT uNotifyCode, int nID, CWindow wndCtl);
     void OnPalette(UINT uNotifyCode, int nID, CWindow wndCtl);
-    void OnFFTSize(UINT uNotifyCode, int nID, CWindow wndCtl);
     void OnToggleFreqAxis(UINT uNotifyCode, int nID, CWindow wndCtl);
     void OnToggleTimeAxis(UINT uNotifyCode, int nID, CWindow wndCtl);
     void OnEditTitleFormat(UINT uNotifyCode, int nID, CWindow wndCtl);
@@ -234,7 +202,6 @@ private:
     // Runtime config (mirrors of cfg vars for fast access)
     int m_max_tracks = 4;
     palette_t m_palette = PALETTE_SPECTRUM;
-    int m_fft_bits = 11;   // 2^11 = 2048-point FFT (Spek's default)
     bool m_show_freq_axis = true;
     bool m_show_time_axis = true;
     pfc::string8 m_title_format = DEFAULT_TITLE_FORMAT;
@@ -247,12 +214,8 @@ private:
     std::atomic<bool> m_shutdown{ false };
 
     // Snapshot of the last selection that update_selection() actually processed
-    // as "needing re-analysis". Stored as <max_tracks, ordered handles> so we
-    // can short-circuit when the playlist selection hasn't really changed but we
-    // still get a callback (e.g. Enter in the inline title-format edit tears
-    // down the EDIT control, focus moves back to the panel, foobar2000 fires a
-    // synthetic on_items_selection_change). Without this guard, a simple Enter
-    // would abort every track's analysis and restart them — "spectrum reloads".
+    // as "needing re-analysis".  Avoids spurious re-analysis when Enter in the
+    // inline title editor triggers a synthetic focus-restore callback.
     struct last_selection_key {
         size_t max_tracks{ 0 };
         std::vector<metadb_handle_ptr> handles;

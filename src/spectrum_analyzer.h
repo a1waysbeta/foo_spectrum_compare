@@ -49,8 +49,6 @@ public:
     bool analyze(metadb_handle_ptr track, SpectrumData& out, abort_callback& abort);
 
     // Configuration
-    void set_fft_bits(int bits) { m_fft_bits = bits; }
-    int get_fft_bits() const { return m_fft_bits; }
     void set_window(window_function_t w) { m_window = w; }
     window_function_t get_window() const { return m_window; }
     void set_time_resolution(int frames) { m_target_frames = frames; }
@@ -61,7 +59,7 @@ public:
     const char* get_title_format() const { return m_title_format.c_str(); }
 
 private:
-    int m_fft_bits = 11; // 2048-point FFT by default
+    static constexpr int FFT_BITS = 11;        // 2048-point FFT (fixed for speed)
     window_function_t m_window = WINDOW_DEFAULT;
     int m_target_frames = 800; // target number of time columns
     std::string m_title_format = "%title%";

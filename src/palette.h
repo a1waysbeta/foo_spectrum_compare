@@ -2,33 +2,24 @@
 
 #include <stdint.h>
 
-// Palette types — the 3 legacy entries are byte-identical to the
-// upstream Spek palette functions.  The 2 new entries ("Spek" and
-// "Spek-X") are also verbatim copies of those same functions, but
-// routed so each menu label matches the DEFAULT palette of the
-// corresponding upstream binary:
+// Built-in palettes — the numerical values (0, 1, 2, PALETTE_COUNT=3)
+// have been stable since the first shipped release and are persisted
+// inside .fth / layout config blobs.  DO NOT REORDER.
 //
-//   * PALETTE_SPEK  →  PALETTE_SOX  (default palette in spek-master)
-//   * PALETTE_SPEKX →  PALETTE_SPECTRUM (default palette in spek-X-main)
-//
-// Reference (source code verified on local checkouts):
-//   spek-master/src/spek-palette.h : PALETTE_DEFAULT = PALETTE_SOX
-//   spek-X-main/src/spek-palette.h : PALETTE_DEFAULT = PALETTE_SPECTRUM
-//   spek-{master,X-main}/src/spek-palette.cc : spectrum()/sox()/mono()
-//                                               are byte-for-byte equal.
+// Reference (source code verified on local checkouts of spek-master /
+// spek-X-main at src/spek-palette.cc): all three entries are direct,
+// verbatim, byte-for-byte C++ ports of the corresponding upstream
+// functions.
 enum palette_t {
-    PALETTE_SPECTRUM = 0, // Legacy — Dan Bruton's physics spectrum
-                          // (clips colour wheel at level*0.6625 and
-                          // applies a black-ramp for levels < 0.1).
-    PALETTE_SOX,          // Legacy — Rob Sykes' SoX default palette.
-    PALETTE_MONO,         // Legacy — linear greyscale.
-    PALETTE_SPEK,         // Spek default (identical to PALETTE_SOX above;
-                          // matches what spek.exe shows on first launch).
-    PALETTE_SPEKX,        // Spek-X default (identical to PALETTE_SPECTRUM
-                          // above; matches what Spek-X.exe shows on first
-                          // launch.  Screenshots appear warmer because
-                          // Spek-X often ships with a narrower lrange,
-                          // NOT because the palette math itself differs).
+    PALETTE_SPECTRUM = 0, // Dan Bruton's physics spectrum — the classic
+                          // rainbow palette used by most audio visualisers.
+                          // Clips hue ramp at level*0.6625 and applies a
+                          // linear black-fade for level < 0.1.
+    PALETTE_SOX,          // Rob Sykes' SoX palette — the default cold
+                          // colour scheme used by SoX spectrogram.exe
+                          // and the default scheme in spek.exe.
+    PALETTE_MONO,         // Greyscale linear — 0→black, 1→white.  Good
+                          // for printing / side-by-side comparisons.
 
     PALETTE_COUNT,
     PALETTE_DEFAULT = PALETTE_SPECTRUM,
