@@ -847,108 +847,229 @@ LRESULT SpectrumCompareWindow::OnSpectrumReady(UINT uMsg, WPARAM wParam, LPARAM 
 // ============================================================
 // Context menu
 // ------------------------------------------------------------
-// Two modes, selected via m_callback->is_edit_mode_enabled() so we match
-// the behaviour of every other Default UI / Columns UI panel:
-//   * Layout Editing Mode ON  → We route WM_CONTEXTMENU with
-//                               SetMsgHandled(FALSE) so DefWindowProc is
-//                               invoked (exactly what ControlPanelDUI in
-//                               foo_nowbar returns from the final
-//                               handle_message() branch).  The foobar2000
-//                               host has its own message-routing layer
-//                               that observes right-clicks on element
-//                               windows and invokes
-//                               ui_element_edit_tools::standard_edit_context_menu
-//                               with the real slot (p_id); that path is
-//                               what produces Replace / Cut / Copy / Paste
-//                               commands which actually mutate the live
-//                               layout.
-//   * Layout Editing Mode OFF → Spectrum Compare settings menu
+// Two modes, selected via m_callback->is_edit_mode_enabled():
+//
+//   * Layout Editing Mode ON:
+//       We SetMsgHandled(FALSE) without showing any menu ourselves, so
+//       the message falls through DefWindowProc onto the default
+//       routing path — exactly what ControlPanelDUI in foo_nowbar does
+//       (its handle_message() tail returns DefWindowProc).  The Default
+//       UI / Columns UI host already has a pretranslate / subclass /
+//       hook layer that walks child element slots and calls
+//       ui_element_edit_tools::standard_edit_context_menu() with the
+//       REAL slot (p_id) that owns our window.  That helper shows
+//       Replace / Cut / Copy / Paste and, crucially, *asks the element
+//       instance itself* whether it wants to append custom items via
+//       the three edit_mode_context_menu_{test,build,command} virtual
+//       hooks declared on ui_element_instance.  We implement those
+//       hooks below so the menu ends up as:
+//           ┌─────────────────────────────┐
+//           │  <<Spectrum Compare>> (grey) │   label line
+//           │  ──────────────────────────  │
+//           │  Replace UI Element ...      │   ← host drives, real slot
+//           │  ──────────────────────────  │
+//           │  Cut / Copy / Paste          │
+//           │  ──────────────────────────  │
+//           │  Display count  ▶            │   ← our panel settings
+//           │  Palette          ▶            (appended via _build hook)
+//           │  Axes             ▶
+//           │  Title format     ▶
+//           │  ──────────────────────────  │
+//           │  Refresh analysis            │
+//           └─────────────────────────────┘
+//
+//   * Layout Editing Mode OFF:
+//       We build & show the panel settings menu directly, without the
+//       Replace / Cut / Copy / Paste section.  Reuses the SAME
+//       low-level submenu builders (build_display_count_popup etc.) so
+//       normal-mode vs edit-mode labels / checkmarks / clickable leaves
+//       can never drift apart.
 // ============================================================
+
+// Indexed ordering of the settings block.  Every submenu builder below
+// pushes one UINT entry into a `leaf_idms` vector for EACH CLICKABLE
+// LEAF (not separators, not MF_POPUP root entries).  edit mode then
+// captures that full ordering into `m_edit_mode_cmd_to_idm`, and
+// `edit_mode_context_menu_command` translates (p_id - p_id_base) →
+// that vector → IDM_* → SendMessage(WM_COMMAND, IDM_*).  Normal mode
+// does the same translation but with an explicit local leaf_idms.
+//
+// Flat layout (indexed 0..N-1):
+//   [0..3]  Display count  ▶  1 / 2 / 3 / 4 tracks
+//   [4..6]  Palette        ▶  Spectrum / SoX / Mono
+//   [7..8]  Axes           ▶  Freq axis / Time axis
+//   [9..10] Title format   ▶  Edit / Reset
+//   [11]    Refresh analysis
+static constexpr size_t kCountIdx    = 0;
+static constexpr size_t kPaletteIdx  = 4;
+static constexpr size_t kAxesIdx     = 7;
+static constexpr size_t kTitleIdx    = 9;
+static constexpr size_t kRefreshIdx  = 11;
+static constexpr size_t kTotalLeaves = 12;
+
+static void build_display_count_popup(HMENU hmenu, unsigned base, int max_tracks,
+                                      std::vector<UINT>& leaf_idms) {
+    static const UINT   s_ids[4]    = { IDM_SET_COUNT_1, IDM_SET_COUNT_2, IDM_SET_COUNT_3, IDM_SET_COUNT_4 };
+    static const LPCTSTR s_labels[4] = { _T("1 track"), _T("2 tracks"), _T("3 tracks"), _T("4 tracks") };
+    PFC_ASSERT(leaf_idms.size() == kCountIdx);
+    for (int i = 0; i < 4; ++i) {
+        ::AppendMenu(hmenu, MF_STRING | ((i + 1) == max_tracks ? MF_CHECKED : 0),
+                     base + (unsigned)leaf_idms.size(), s_labels[i]);
+        leaf_idms.push_back(s_ids[i]);
+    }
+}
+
+static void build_palette_popup(HMENU hmenu, unsigned base, palette_t current,
+                                std::vector<UINT>& leaf_idms) {
+    struct E { UINT id; LPCTSTR label; palette_t value; };
+    static const E s_rows[3] = {
+        { IDM_PALETTE_SPECTRUM, _T("Spectrum (Spek)"), PALETTE_SPECTRUM },
+        { IDM_PALETTE_SOX,      _T("SoX"),              PALETTE_SOX },
+        { IDM_PALETTE_MONO,     _T("Mono"),             PALETTE_MONO },
+    };
+    PFC_ASSERT(leaf_idms.size() == kPaletteIdx);
+    for (auto& r : s_rows) {
+        ::AppendMenu(hmenu, MF_STRING | (current == r.value ? MF_CHECKED : 0),
+                     base + (unsigned)leaf_idms.size(), r.label);
+        leaf_idms.push_back(r.id);
+    }
+}
+
+static void build_axes_popup(HMENU hmenu, unsigned base, bool show_freq, bool show_time,
+                             std::vector<UINT>& leaf_idms) {
+    PFC_ASSERT(leaf_idms.size() == kAxesIdx);
+    ::AppendMenu(hmenu, MF_STRING | (show_freq ? MF_CHECKED : 0),
+                 base + (unsigned)leaf_idms.size(), _T("Frequency axis (kHz)"));
+    leaf_idms.push_back(IDM_TOGGLE_FREQ_AXIS);
+    ::AppendMenu(hmenu, MF_STRING | (show_time ? MF_CHECKED : 0),
+                 base + (unsigned)leaf_idms.size(), _T("Time axis (20s)"));
+    leaf_idms.push_back(IDM_TOGGLE_TIME_AXIS);
+}
+
+static void build_title_format_popup(HMENU hmenu, unsigned base,
+                                     std::vector<UINT>& leaf_idms) {
+    PFC_ASSERT(leaf_idms.size() == kTitleIdx);
+    ::AppendMenu(hmenu, MF_STRING, base + (unsigned)leaf_idms.size(), _T("Edit format..."));
+    leaf_idms.push_back(IDM_EDIT_TITLE_FORMAT);
+    ::AppendMenu(hmenu, MF_STRING, base + (unsigned)leaf_idms.size(), _T("Reset to default"));
+    leaf_idms.push_back(IDM_RESET_TITLE_FORMAT);
+}
+
+// Builds the full settings block into a root-level HMENU.  Returns the
+// leaf id mapping (size == kTotalLeaves).
+static std::vector<UINT> build_settings_block(HMENU p_menu, unsigned p_id_base,
+                                              int max_tracks, palette_t palette,
+                                              bool show_freq, bool show_time) {
+    std::vector<UINT> leaf_idms;
+    leaf_idms.reserve(kTotalLeaves);
+
+    // Display count submenu
+    {
+        CMenu count_menu; WIN32_OP_D(count_menu.CreatePopupMenu() != NULL);
+        build_display_count_popup(count_menu, p_id_base, max_tracks, leaf_idms);
+        WIN32_OP_D(::AppendMenu(p_menu, MF_POPUP, (UINT_PTR)count_menu.m_hMenu, _T("Display count")));
+        count_menu.Detach();
+    }
+
+    WIN32_OP_D(::AppendMenu(p_menu, MF_SEPARATOR, 0, _T("")));
+
+    // Palette submenu
+    {
+        CMenu palette_menu; WIN32_OP_D(palette_menu.CreatePopupMenu() != NULL);
+        build_palette_popup(palette_menu, p_id_base, palette, leaf_idms);
+        WIN32_OP_D(::AppendMenu(p_menu, MF_POPUP, (UINT_PTR)palette_menu.m_hMenu, _T("Palette")));
+        palette_menu.Detach();
+    }
+
+    WIN32_OP_D(::AppendMenu(p_menu, MF_SEPARATOR, 0, _T("")));
+
+    // Axes submenu
+    {
+        CMenu axes_menu; WIN32_OP_D(axes_menu.CreatePopupMenu() != NULL);
+        build_axes_popup(axes_menu, p_id_base, show_freq, show_time, leaf_idms);
+        WIN32_OP_D(::AppendMenu(p_menu, MF_POPUP, (UINT_PTR)axes_menu.m_hMenu, _T("Axes")));
+        axes_menu.Detach();
+    }
+
+    // Title format submenu
+    {
+        CMenu fmt_menu; WIN32_OP_D(fmt_menu.CreatePopupMenu() != NULL);
+        build_title_format_popup(fmt_menu, p_id_base, leaf_idms);
+        WIN32_OP_D(::AppendMenu(p_menu, MF_POPUP, (UINT_PTR)fmt_menu.m_hMenu, _T("Title format")));
+        fmt_menu.Detach();
+    }
+
+    WIN32_OP_D(::AppendMenu(p_menu, MF_SEPARATOR, 0, _T("")));
+
+    // Refresh analysis (flat item) — the 12th leaf (index kRefreshIdx).
+    PFC_ASSERT(leaf_idms.size() == kRefreshIdx);
+    WIN32_OP_D(::AppendMenu(p_menu, MF_STRING, p_id_base + (unsigned)leaf_idms.size(), _T("Refresh analysis")));
+    leaf_idms.push_back(IDM_REFRESH);
+
+    PFC_ASSERT(leaf_idms.size() == kTotalLeaves);
+    return leaf_idms;
+}
+
+// ---------------------------------------------------------------------------
+// edit_mode_context_menu_* — hooks called BY the host's standard_edit_context_menu
+// ---------------------------------------------------------------------------
+
+bool SpectrumCompareWindow::edit_mode_context_menu_test(const POINT& /*p_point*/, bool /*p_fromkeyboard*/) {
+    // We always have settings to offer — our panel is one large client
+    // area with no "dead" subregions where settings would be inapplicable.
+    return true;
+}
+
+void SpectrumCompareWindow::edit_mode_context_menu_build(const POINT& /*p_point*/, bool /*p_fromkeyboard*/, HMENU p_menu, unsigned p_id_base) {
+    // Prepend a separator so the "Spectrum Compare settings" block is
+    // visually separated from the host-provided Replace / Cut / Copy /
+    // Paste section above it.
+    WIN32_OP_D(::AppendMenu(p_menu, MF_SEPARATOR, 0, _T("")));
+    m_edit_mode_cmd_to_idm = build_settings_block(
+        p_menu, p_id_base, m_max_tracks, m_palette, m_show_freq_axis, m_show_time_axis);
+}
+
+void SpectrumCompareWindow::edit_mode_context_menu_command(
+    const POINT& /*p_point*/, bool /*p_fromkeyboard*/, unsigned p_id, unsigned p_id_base)
+{
+    if ((int)p_id < (int)p_id_base) return;
+    const size_t idx = (size_t)(p_id - p_id_base);
+    if (idx >= m_edit_mode_cmd_to_idm.size()) return;
+    const UINT idm = m_edit_mode_cmd_to_idm[idx];
+    if (idm == 0) return; // should never happen for our block
+
+    // Send through the normal WM_COMMAND path so every handler keeps
+    // its existing invariants (window-created guards, cfg_* writes,
+    // selection-snapshot invalidation, analysis aborts on refresh, …).
+    if (IsWindow()) {
+        SendMessage(WM_COMMAND, MAKEWPARAM(idm, 0), 0);
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Normal-mode entry point
+// ---------------------------------------------------------------------------
 
 void SpectrumCompareWindow::OnContextMenu(CWindow wnd, CPoint point) {
     (void)wnd;
 
-    // ------------------------------------------------------------------
-    // Layout Editing Mode: do NOTHING on our side. Exactly as foo_nowbar
-    // and foo_uie_playlist_tree do (they simply don't register a
-    // MSG_WM_CONTEXTMENU handler at all).
-    //
-    // We SetMsgHandled(FALSE) so our WTL window procedure will fall
-    // through to DefWindowProc(m_hWnd, WM_CONTEXTMENU, ...), which —
-    // like ControlPanelDUI::handle_message()'s final
-    //     return DefWindowProc(m_hwnd, msg, wp, lp)
-    // branch — leaves the message on the default routing path. The
-    // Default UI / Columns UI host (which has a hook / subclass /
-    // pre-translate layer that both foo_nowbar and playlist_tree rely
-    // on) then catches the right-click event, walks our slot, and calls
-    // ui_element_edit_tools::standard_edit_context_menu with the real
-    // slot p_id — and *that* brings up a proper Replace/Cut/Copy/Paste
-    // menu whose commands actually operate on the live layout.
-    //
-    // If we were to return; here (SetMsgHandled defaulting to TRUE) or
-    // if we forwarded the message ourselves to some parent, we'd either
-    // silently swallow it → no menu, or re-route it to a splitter that
-    // shows the container-level menu instead of the element-level menu
-    // — the two bugs the user previously reported.
-    // ------------------------------------------------------------------
     if (m_callback->is_edit_mode_enabled()) {
+        // Leave WM_CONTEXTMENU on the default routing path. The host
+        // catches it, invokes standard_edit_context_menu() → which calls
+        // our edit_mode_context_menu_{test,build,command} hooks → the
+        // final shown menu combines Replace / Cut / Copy / Paste (host
+        // driven, real slot id) with our full settings block.
         SetMsgHandled(FALSE);
         return;
     }
 
-    // ------------------------------------------------------------------
-    // Normal mode: show Spectrum Compare settings menu (Display count /
-    // Palette / Axes / Title format / Refresh analysis).
-    // ------------------------------------------------------------------
     CMenu menu;
-    menu.CreatePopupMenu();
-    // (CPoint from Apps-key / Shift+F10 contains (-1,-1); pin the menu
-    // to the panel centre so it appears on-screen, matching the usual
-    // Windows convention for context-key-driven menus.)
-    CPoint pt;
-    if (point.x == -1 && point.y == -1) {
-        CRect rc; GetWindowRect(&rc); pt = rc.CenterPoint();
-    } else {
-        pt = point;
-    }
+    WIN32_OP(menu.CreatePopupMenu() != NULL);
 
-    // Display count submenu
-    CMenu count_menu;
-    count_menu.CreatePopupMenu();
-    count_menu.AppendMenu(MF_STRING | (m_max_tracks == 1 ? MF_CHECKED : 0), (UINT_PTR)IDM_SET_COUNT_1, _T("1 track"));
-    count_menu.AppendMenu(MF_STRING | (m_max_tracks == 2 ? MF_CHECKED : 0), (UINT_PTR)IDM_SET_COUNT_2, _T("2 tracks"));
-    count_menu.AppendMenu(MF_STRING | (m_max_tracks == 3 ? MF_CHECKED : 0), (UINT_PTR)IDM_SET_COUNT_3, _T("3 tracks"));
-    count_menu.AppendMenu(MF_STRING | (m_max_tracks == 4 ? MF_CHECKED : 0), (UINT_PTR)IDM_SET_COUNT_4, _T("4 tracks"));
-    menu.AppendMenu(MF_POPUP, (UINT_PTR)count_menu.m_hMenu, _T("Display count"));
-
-    menu.AppendMenu(MF_SEPARATOR);
-
-    // Palette submenu
-    CMenu palette_menu;
-    palette_menu.CreatePopupMenu();
-    palette_menu.AppendMenu(MF_STRING | (m_palette == PALETTE_SPECTRUM ? MF_CHECKED : 0), (UINT_PTR)IDM_PALETTE_SPECTRUM, _T("Spectrum (Spek)"));
-    palette_menu.AppendMenu(MF_STRING | (m_palette == PALETTE_SOX ? MF_CHECKED : 0), (UINT_PTR)IDM_PALETTE_SOX, _T("SoX"));
-    palette_menu.AppendMenu(MF_STRING | (m_palette == PALETTE_MONO ? MF_CHECKED : 0), (UINT_PTR)IDM_PALETTE_MONO, _T("Mono"));
-    menu.AppendMenu(MF_POPUP, (UINT_PTR)palette_menu.m_hMenu, _T("Palette"));
-
-    menu.AppendMenu(MF_SEPARATOR);
-
-    // Axes submenu
-    CMenu axes_menu;
-    axes_menu.CreatePopupMenu();
-    axes_menu.AppendMenu(MF_STRING | (m_show_freq_axis ? MF_CHECKED : 0), (UINT_PTR)IDM_TOGGLE_FREQ_AXIS, _T("Frequency axis (kHz)"));
-    axes_menu.AppendMenu(MF_STRING | (m_show_time_axis ? MF_CHECKED : 0), (UINT_PTR)IDM_TOGGLE_TIME_AXIS, _T("Time axis (20s)"));
-    menu.AppendMenu(MF_POPUP, (UINT_PTR)axes_menu.m_hMenu, _T("Axes"));
-
-    // Title format submenu
-    CMenu fmt_menu;
-    fmt_menu.CreatePopupMenu();
-    fmt_menu.AppendMenu(MF_STRING, (UINT_PTR)IDM_EDIT_TITLE_FORMAT, _T("Edit format..."));
-    fmt_menu.AppendMenu(MF_STRING, (UINT_PTR)IDM_RESET_TITLE_FORMAT, _T("Reset to default"));
-    menu.AppendMenu(MF_POPUP, (UINT_PTR)fmt_menu.m_hMenu, _T("Title format"));
-
-    menu.AppendMenu(MF_SEPARATOR);
-    menu.AppendMenu(MF_STRING, (UINT_PTR)IDM_REFRESH, _T("Refresh analysis"));
+    // Build settings block with id_base = 0, so each leaf's cmd id is a
+    // 0-based index we can look up in `leaf_idms`.
+    const std::vector<UINT> leaf_idms = build_settings_block(
+        menu, 0, m_max_tracks, m_palette, m_show_freq_axis, m_show_time_axis);
 
     CPoint ptShow = point;
     if (ptShow.x == -1 && ptShow.y == -1) {
@@ -957,8 +1078,7 @@ void SpectrumCompareWindow::OnContextMenu(CWindow wnd, CPoint point) {
         ptShow = rc.CenterPoint();
     }
 
-    // All submenu handles must remain valid until TrackPopupMenu returns.
-    int cmd = TrackPopupMenu(
+    const int cmd = TrackPopupMenu(
         menu,
         TPM_RETURNCMD | TPM_RIGHTBUTTON,
         ptShow.x, ptShow.y,
@@ -966,7 +1086,10 @@ void SpectrumCompareWindow::OnContextMenu(CWindow wnd, CPoint point) {
     );
 
     if (cmd > 0) {
-        SendMessage(WM_COMMAND, MAKEWPARAM(cmd, 0), 0);
+        const size_t idx = (size_t)cmd;
+        if (idx < leaf_idms.size() && leaf_idms[idx] != 0) {
+            SendMessage(WM_COMMAND, MAKEWPARAM(leaf_idms[idx], 0), 0);
+        }
     }
 }
 
@@ -1388,8 +1511,19 @@ namespace {
         "Spectrum Compare",
         "1.0",
         "Vertical spectrogram comparison panel for selected tracks. Spek-style coloring.\n\n"
+        "Authors:\n"
+        "  - TRAE AI Coding Assistant  (foobar2000 SDK integration, window & layout,\n"
+        "                               concurrency safety, DPI scaling, kHz / time\n"
+        "                               axes, configuration serialization (.fth\n"
+        "                               import / export / copy-paste), titleformat\n"
+        "                               inline editing, Layout Editing Mode context\n"
+        "                               menu routing)\n"
+        "  - always beta               (original concept, product requirements,\n"
+        "                               feature planning, UI aesthetics, DPI &\n"
+        "                               spacing feedback, integration testing &\n"
+        "                               validation)\n\n"
         "Select one or more tracks in the playlist to view their spectrograms.\n"
-        "Right-click to set display count (1-4), palette, or refresh.\n"
+        "Right-click to set display count (1-4), palette, axes, or refresh.\n"
         "Useful for comparing audio quality and frequency content across tracks."
     );
 }

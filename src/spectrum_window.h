@@ -14,7 +14,7 @@ static const wchar_t* SPECTRUM_WND_CLASS = L"{SpectrumCompare-8F3A2B1C-4D5E-6F7A
 
 // Default title format string (foobar2000 titleformat syntax)
 static const char* DEFAULT_TITLE_FORMAT =
-    "%title% \xC2\xB7 %artist% | %codec% | %bitrate% kbps"
+    "%title% | %codec% | %bitrate% kbps"
     "[ | $info(bitspersample) bit] | %samplerate% Hz | $info(channels) CH | %path%";
 
 // Config storage GUIDs
@@ -96,6 +96,39 @@ public:
     }
 
     void notify(const GUID& p_what, t_size p_param1, const void* p_param2, t_size p_param2size);
+
+    // --- ui_element_instance: Layout Editing Mode custom context menu ----
+    //
+    // Default UI / Columns UI's edit-mode right-click flow ultimately
+    // invokes ui_element_edit_tools::standard_edit_context_menu() which
+    // shows the Replace / Cut / Copy / Paste section and then uses the
+    // three hooks below to ask the *element* instance itself whether it
+    // wants to append any panel-specific settings.
+    //
+    // Previously we let those fall through to the base "return false"
+    // stubs, so the edit-mode menu was host-only — panel settings
+    // disappeared the moment the user flipped Layout Editing Mode ON.
+    // Implementing these hooks keeps the Replace / Cut / Copy / Paste
+    // section host-driven (with the REAL slot p_id, so commands really
+    // do mutate the live layout) AND appends exactly the same Display
+    // count / Palette / Axes / Title format / Refresh settings block
+    // that's visible in normal mode.
+    //
+    // Command IDs inside the appended block come from the host as a
+    // running `p_id_base + index` to avoid colliding with the host's
+    // own Replace/Cut/Copy/Paste range.  We record the index → IDM_*
+    // mapping at build time (m_edit_mode_cmd_to_idm) and translate back
+    // in the command hook, then SendMessage(WM_COMMAND, IDM_*) so the
+    // existing COMMAND_ID_HANDLER_EX handlers run entirely unchanged.
+    bool edit_mode_context_menu_test(const POINT& p_point, bool p_fromkeyboard) override;
+    void edit_mode_context_menu_build(const POINT& p_point, bool p_fromkeyboard, HMENU p_menu, unsigned p_id_base) override;
+    void edit_mode_context_menu_command(const POINT& p_point, bool p_fromkeyboard, unsigned p_id, unsigned p_id_base) override;
+
+    // Temporary mapping recorded during edit_mode_context_menu_build and
+    // consumed by edit_mode_context_menu_command.  Contents:
+    //   m_edit_mode_cmd_to_idm[idx] == the IDM_* for clickable leaf #idx.
+    // The block layout has exactly 12 leaves (see spectrum_window.cpp).
+    std::vector<UINT> m_edit_mode_cmd_to_idm;
 
     // playlist_callback_single
     void on_items_added(t_size p_base, const pfc::list_base_const_t<metadb_handle_ptr>& p_data, const bit_array& p_selection) override;
