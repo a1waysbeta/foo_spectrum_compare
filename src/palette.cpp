@@ -19,8 +19,17 @@
 
 static uint32_t spectrum(double level)
 {
-    // 8-stop linear gradient palette (user-specified colors).
-    // level 0.0 → silence (black), 1.0 → peak (yellow).
+    // 8-stop gradient palette (user-specified colors).
+    // Gamma correction applied so warm colors appear at lower signal levels
+    // — without this, most audio content falls in the blue/dark range
+    // because raw FFT magnitudes are heavily skewed toward small values.
+    if (level <= 0.0) return 0;
+    if (level >= 1.0) return (255u << 16) | (250u << 8) | 107u;
+    // gamma=0.4 compresses the dark range (0.0-0.15) and expands the
+    // warm range (0.15-1.0), so typical -40dB signals land in red/orange
+    // instead of stuck in blue.
+    level = pow(level, 0.4);
+
     struct Stop { double pos; uint8_t r, g, b; };
     static const Stop stops[] = {
         { 0.00,   0,   0,   0 },  // #000000
@@ -33,8 +42,6 @@ static uint32_t spectrum(double level)
         { 1.00,   255,250,107 },  // #FFFA6B
     };
     const int n = sizeof(stops) / sizeof(stops[0]);
-    if (level <= 0.0) return 0;
-    if (level >= 1.0) return (255u << 16) | (250u << 8) | 107u;
 
     // Find segment
     int i = 0;
