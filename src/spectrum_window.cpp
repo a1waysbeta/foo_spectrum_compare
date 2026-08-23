@@ -13,6 +13,7 @@ cfg_string g_cfg_title_format(guid_cfg_title_format, DEFAULT_TITLE_FORMAT);
 cfg_int g_cfg_max_tracks(guid_cfg_max_tracks, 4);
 cfg_int g_cfg_palette(guid_cfg_palette, (int)PALETTE_SOX);
 cfg_int g_cfg_language(guid_cfg_language, (int)LANG_DEFAULT);
+cfg_bool g_cfg_show_db_scale(guid_cfg_show_db_scale, true);
 
 SpectrumCompareWindow::SpectrumCompareWindow(
     ui_element_config::ptr config,
@@ -33,6 +34,7 @@ SpectrumCompareWindow::SpectrumCompareWindow(
     //   * Imported .fth / pasted settings from Scratchbox win over cfg_*.
     m_show_freq_axis = g_cfg_show_freq_axis;
     m_show_time_axis = g_cfg_show_time_axis;
+    m_show_db_scale = g_cfg_show_db_scale;
     m_title_format = g_cfg_title_format.get();
     m_max_tracks = (int)g_cfg_max_tracks;
     m_palette = (palette_t)pfc::clip_t<int>(
@@ -128,18 +130,21 @@ void SpectrumCompareWindow::initialize_window(HWND parent) {
 // Binary layout of the ui_element_config payload we write / read.
 // Versioned so we can append fields without breaking old .fth files.
 //
-//   uint32_t version         ; 2 (v1 = no language field)
+//   uint32_t version         ; 3 (v1 = no language, v2 = no db_scale)
 //   uint32_t max_tracks      ; 1..4
 //   uint32_t palette         ; palette_t (0..PALETTE_COUNT-1)
 //   uint8_t  show_freq_axis  ; 0 / 1
 //   uint8_t  show_time_axis  ; 0 / 1
 //   string8  title_format    ; raw bytes (UTF-8 titleformat expression)
 //   uint8_t  language        ; language_t (0=EN, 1=ZH)  [v2+]
+//   uint8_t  show_db_scale   ; 0 / 1                      [v3+]
 //
 // v1 readers stop after title_format and ignore the language byte,
 // which is fine — language defaults to English on old .fth files.
+// v2 readers stop after language and ignore show_db_scale, which
+// defaults to true (dB axis visible).
 // ============================================================
-static constexpr uint32_t kConfigMagicVersion = 2u;
+static constexpr uint32_t kConfigMagicVersion = 3u;
 static constexpr int        kMinMaxTracks = 1;
 static constexpr int        kMaxMaxTracks = 4;
 
@@ -153,7 +158,8 @@ static ui_element_config::ptr build_instance_config(
     bool show_freq_axis,
     bool show_time_axis,
     const char* title_format,
-    language_t language)
+    language_t language,
+    bool show_db_scale)
 {
     ui_element_config_builder b;
     b << kConfigMagicVersion;
@@ -169,6 +175,7 @@ static ui_element_config::ptr build_instance_config(
     }
     b << (uint8_t)pfc::clip_t<int>(
         (int)language, 0, (int)LANG_COUNT - 1);
+    b << (uint8_t)(show_db_scale ? 1u : 0u);
     return b.finish(SpectrumCompareWindow::g_get_guid());
 }
 
@@ -183,6 +190,7 @@ void SpectrumCompareWindow::set_configuration(ui_element_config::ptr config) {
     palette_t new_palette = m_palette;
     bool new_show_freq = m_show_freq_axis;
     bool new_show_time = m_show_time_axis;
+    bool new_show_db = m_show_db_scale;
     pfc::string8 new_title = m_title_format;
     language_t new_language = m_language;
 
@@ -211,6 +219,12 @@ void SpectrumCompareWindow::set_configuration(ui_element_config::ptr config) {
                     parser >> lang;
                     new_language = (language_t)pfc::clip_t<int>(
                         (int)lang, 0, (int)LANG_COUNT - 1);
+                }
+                // v3+ adds show_db_scale after language.
+                if (version >= 3u) {
+                    uint8_t sdb = 0;
+                    parser >> sdb;
+                    new_show_db = (sdb != 0);
                 }
             }
             // (Earlier experimental versions of this file wrote extra
@@ -246,6 +260,11 @@ void SpectrumCompareWindow::set_configuration(ui_element_config::ptr config) {
         g_cfg_show_time_axis = new_show_time;
         changed_something = true;
     }
+    if (new_show_db != m_show_db_scale) {
+        m_show_db_scale = new_show_db;
+        g_cfg_show_db_scale = new_show_db;
+        changed_something = true;
+    }
     if (strcmp(new_title.get_ptr(), m_title_format.get_ptr()) != 0) {
         m_title_format = new_title;
         g_cfg_title_format.set(new_title);
@@ -274,7 +293,7 @@ ui_element_config::ptr SpectrumCompareWindow::get_configuration() {
     ui_element_config::ptr fresh = build_instance_config(
         m_max_tracks, m_palette,
         m_show_freq_axis, m_show_time_axis,
-        m_title_format.get_ptr(), m_language);
+        m_title_format.get_ptr(), m_language, m_show_db_scale);
     m_config = fresh;
     return fresh;
 }
@@ -288,7 +307,8 @@ ui_element_config::ptr SpectrumCompareWindow::g_get_default_configuration() {
         (bool)g_cfg_show_time_axis,
         g_cfg_title_format.get_ptr(),
         (language_t)pfc::clip_t<int>(
-            (int)g_cfg_language, 0, (int)LANG_COUNT - 1));
+            (int)g_cfg_language, 0, (int)LANG_COUNT - 1),
+        (bool)g_cfg_show_db_scale);
 }
 
 void SpectrumCompareWindow::notify(const GUID& p_what, t_size p_param1, const void* p_param2, t_size p_param2size) {
@@ -604,7 +624,7 @@ void SpectrumCompareWindow::OnPaint(CDCHandle) {
     const int db_bar_width = scale(10);      // 右侧色条宽度
     const int db_label_gap = scale(3);       // 色条和 dB 数字之间的 gap
     const int db_label_width = scale(46);    // dB 数字宽度 ("-85" / "0 dB")
-    const int db_scale_total = db_bar_width + db_label_gap + db_label_width;
+    const int db_scale_total = m_show_db_scale ? (db_bar_width + db_label_gap + db_label_width) : 0;
 
     int track_count = (int)m_tracks.size();
     int total_track_gap = track_gap * (track_count - 1);
@@ -665,10 +685,12 @@ void SpectrumCompareWindow::OnPaint(CDCHandle) {
             render_time_axis(dc.m_hDC, time_rc, m_tracks[i]->data.duration);
         }
 
-        // dB 色条 + 标签（频谱右侧）
-        CRect db_bar_rc(spec_right + db_label_gap, spec_top, spec_right + db_label_gap + db_bar_width, spec_bottom);
-        CRect db_label_rc(db_bar_rc.right + db_label_gap, spec_top, db_bar_rc.right + db_label_gap + db_label_width, spec_bottom);
-        render_db_scale(dc.m_hDC, db_bar_rc, db_label_rc, m_palette);
+        // dB 色条 + 标签（频谱右侧，可由右键菜单开关）
+        if (m_show_db_scale) {
+            CRect db_bar_rc(spec_right + db_label_gap, spec_top, spec_right + db_label_gap + db_bar_width, spec_bottom);
+            CRect db_label_rc(db_bar_rc.right + db_label_gap, spec_top, db_bar_rc.right + db_label_gap + db_label_width, spec_bottom);
+            render_db_scale(dc.m_hDC, db_bar_rc, db_label_rc, m_palette);
+        }
     }
     } // end else (m_tracks not empty)
 
@@ -1230,16 +1252,17 @@ LRESULT SpectrumCompareWindow::OnSpectrumReady(UINT uMsg, WPARAM wParam, LPARAM 
 // Flat layout (indexed 0..N-1):
 //   [0..3]   Display count  ▶  1 / 2 / 3 / 4 tracks        (4 leaves)
 //   [4..6]   Palette        ▶  Spectrum / SoX / Mono       (3 leaves)
-//   [7..8]   Axes           ▶  Freq / Time                 (2 leaves)
-//   [9..10]  Title format   ▶  Edit / Reset                (2 leaves)
-//   [11]     Refresh analysis                              (1 leaf)
+//   [7..9]   Axes           ▶  Freq / Time / dB            (3 leaves)
+//   [10..11] Title format   ▶  Edit / Reset                (2 leaves)
+//   [12..13] Language       ▶  English / Chinese           (2 leaves)
+//   [14]     Refresh analysis                              (1 leaf)
 static constexpr size_t kCountIdx    = 0;
 static constexpr size_t kPaletteIdx  = 4;
 static constexpr size_t kAxesIdx     = 7;
-static constexpr size_t kTitleIdx    = 9;
-static constexpr size_t kLangIdx     = 11;
-static constexpr size_t kRefreshIdx  = 13;
-static constexpr size_t kTotalLeaves = 14;
+static constexpr size_t kTitleIdx    = 10;
+static constexpr size_t kLangIdx     = 12;
+static constexpr size_t kRefreshIdx  = 14;
+static constexpr size_t kTotalLeaves = 15;
 
 // Helper: narrow UTF-8 -> wide for Win32 menu APIs.
 static void append_menu_i18n(HMENU hmenu, UINT flags, UINT id, strid_t sid, language_t lang) {
@@ -1276,7 +1299,7 @@ static void build_palette_popup(HMENU hmenu, unsigned base, palette_t current,
 }
 
 static void build_axes_popup(HMENU hmenu, unsigned base, bool show_freq, bool show_time,
-                             language_t lang, std::vector<UINT>& leaf_idms) {
+                             bool show_db, language_t lang, std::vector<UINT>& leaf_idms) {
     PFC_ASSERT(leaf_idms.size() == kAxesIdx);
     append_menu_i18n(hmenu, MF_STRING | (show_freq ? MF_CHECKED : 0),
                      base + (unsigned)leaf_idms.size(), S_FREQ_AXIS, lang);
@@ -1284,6 +1307,9 @@ static void build_axes_popup(HMENU hmenu, unsigned base, bool show_freq, bool sh
     append_menu_i18n(hmenu, MF_STRING | (show_time ? MF_CHECKED : 0),
                      base + (unsigned)leaf_idms.size(), S_TIME_AXIS, lang);
     leaf_idms.push_back(IDM_TOGGLE_TIME_AXIS);
+    append_menu_i18n(hmenu, MF_STRING | (show_db ? MF_CHECKED : 0),
+                     base + (unsigned)leaf_idms.size(), S_DB_SCALE, lang);
+    leaf_idms.push_back(IDM_TOGGLE_DB_SCALE);
 }
 
 static void build_title_format_popup(HMENU hmenu, unsigned base,
@@ -1315,7 +1341,7 @@ static void build_language_popup(HMENU hmenu, unsigned base, language_t current,
 static std::vector<UINT> build_settings_block(HMENU p_menu, unsigned p_id_base,
                                               int max_tracks, palette_t palette,
                                               bool show_freq, bool show_time,
-                                              language_t lang) {
+                                              bool show_db, language_t lang) {
     std::vector<UINT> leaf_idms;
     leaf_idms.reserve(kTotalLeaves);
 
@@ -1344,7 +1370,7 @@ static std::vector<UINT> build_settings_block(HMENU p_menu, unsigned p_id_base,
     // Axes submenu
     {
         CMenu axes_menu; WIN32_OP_D(axes_menu.CreatePopupMenu() != NULL);
-        build_axes_popup(axes_menu, p_id_base, show_freq, show_time, lang, leaf_idms);
+        build_axes_popup(axes_menu, p_id_base, show_freq, show_time, show_db, lang, leaf_idms);
         pfc::stringcvt::string_wide_from_utf8 w(i18n(S_AXES, lang));
         WIN32_OP_D(::AppendMenuW(p_menu, MF_POPUP, (UINT_PTR)axes_menu.m_hMenu, w));
         axes_menu.Detach();
@@ -1453,7 +1479,7 @@ void SpectrumCompareWindow::edit_mode_context_menu_build(const POINT& /*p_point*
 
     m_edit_mode_cmd_to_idm = build_settings_block(
         p_menu, p_id_base, m_max_tracks, m_palette,
-        m_show_freq_axis, m_show_time_axis, m_language);
+        m_show_freq_axis, m_show_time_axis, m_show_db_scale, m_language);
 }
 
 void SpectrumCompareWindow::edit_mode_context_menu_command(
@@ -1497,7 +1523,7 @@ void SpectrumCompareWindow::OnContextMenu(CWindow wnd, CPoint point) {
     // 0-based index we can look up in `leaf_idms`.
     const std::vector<UINT> leaf_idms = build_settings_block(
         menu, 0, m_max_tracks, m_palette,
-        m_show_freq_axis, m_show_time_axis, m_language);
+        m_show_freq_axis, m_show_time_axis, m_show_db_scale, m_language);
 
     CPoint ptShow = point;
     if (ptShow.x == -1 && ptShow.y == -1) {
@@ -1616,6 +1642,13 @@ void SpectrumCompareWindow::OnToggleFreqAxis(UINT uNotifyCode, int nID, CWindow 
 void SpectrumCompareWindow::OnToggleTimeAxis(UINT uNotifyCode, int nID, CWindow wndCtl) {
     m_show_time_axis = !m_show_time_axis;
     g_cfg_show_time_axis = m_show_time_axis;
+    Invalidate();
+}
+
+void SpectrumCompareWindow::OnToggleDbScale(UINT uNotifyCode, int nID, CWindow wndCtl) {
+    (void)uNotifyCode; (void)nID; (void)wndCtl;
+    m_show_db_scale = !m_show_db_scale;
+    g_cfg_show_db_scale = m_show_db_scale;
     Invalidate();
 }
 

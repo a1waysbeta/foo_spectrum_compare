@@ -21,9 +21,10 @@ static const char* const g_strings[STRID_COUNT][LANG_COUNT] = {
     { "Mono",                "\xe5\x8d\x95\xe8\x89\xb2" },
     // S_AXES
     { "Axes",                "\xe5\x9d\x90\xe6\xa0\x87\xe8\xbd\xb4" },
-    // S_FREQ_AXIS, S_TIME_AXIS
+    // S_FREQ_AXIS, S_TIME_AXIS, S_DB_SCALE
     { "Frequency axis (kHz)", "\xe9\xa2\x91\xe7\x8e\x87\xe8\xbd\xb4 (kHz)" },
     { "Time axis (20s)",      "\xe6\x97\xb6\xe9\x97\xb4\xe8\xbd\xb4 (20\xe7\xa7\x92)" },
+    { "dB scale",              "dB \xe5\x88\xbb\xe5\xba\xa6" },
     // S_TITLE_FORMAT
     { "Title format",        "\xe6\xa0\x87\xe9\xa2\x98\xe6\xa0\xbc\xe5\xbc\x8f" },
     // S_EDIT_FORMAT, S_RESET_DEFAULT

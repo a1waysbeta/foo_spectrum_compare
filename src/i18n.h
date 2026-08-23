@@ -27,8 +27,9 @@ enum strid_t {
     S_SOX,
     S_MONO,
     S_AXES,                  // submenu title
-    S_FREQ_AXIS,             // 2 axis toggles
+    S_FREQ_AXIS,             // 3 axis toggles
     S_TIME_AXIS,
+    S_DB_SCALE,
     S_TITLE_FORMAT,          // submenu title
     S_EDIT_FORMAT,           // 2 title format actions
     S_RESET_DEFAULT,
