@@ -1983,7 +1983,7 @@ namespace {
     // Component version info
     DECLARE_COMPONENT_VERSION(
         "Spectrum Compare",
-        "1.1",
+        "1.2",
         "Vertical spectrogram comparison panel for selected tracks. Spek-style coloring.\n\n"
         "Authors: TRAE AI Coding Assistant, always beta, Asion\n\n"
         "Select one or more tracks in the playlist to view their spectrograms.\n"
