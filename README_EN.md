@@ -43,4 +43,5 @@ This component is provided as-is for personal use with foobar2000.
 - **[WTL](https://github.com/Win32-WTL/WTL)** — Windows Template Library for window and UI implementation.
 - **[foo_nowbar](https://github.com/jame25/foo_nowbar)** — README layout and bilingual toggle design reference.
 - **TRAE AI Coding Assistant** — Code implementation, debugging, build fixes, and refactoring.
+- **Asion** — Color scheme refinement, feature fine-tuning, and visual experience enhancement.
 - **always beta** — Product design, requirements, UI aesthetics, and integration testing.

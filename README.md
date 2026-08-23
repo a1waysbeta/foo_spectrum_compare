@@ -43,4 +43,5 @@
 - **[WTL](https://github.com/Win32-WTL/WTL)** — Windows Template Library，窗口与 UI 实现。
 - **[foo_nowbar](https://github.com/jame25/foo_nowbar)** — README 排版与双语切换设计参考。
 - **TRAE AI Coding Assistant** — 代码实现、调试、编译修复与重构。
+- **Asion** — 配色方案精细化、功能细节优化与视觉体验提升。
 - **always beta** — 产品设计、需求定义、UI 美学优化与集成测试。
