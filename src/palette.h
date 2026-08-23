@@ -22,7 +22,7 @@ enum palette_t {
                           // for printing / side-by-side comparisons.
 
     PALETTE_COUNT,
-    PALETTE_DEFAULT = PALETTE_SPECTRUM,
+    PALETTE_DEFAULT = PALETTE_SOX,
 };
 
 // level: 0.0 (silence / noise floor) → 1.0 (normalised peak)

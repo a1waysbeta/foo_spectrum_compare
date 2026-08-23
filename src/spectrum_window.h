@@ -202,6 +202,7 @@ private:
     void render_track_label(CDCHandle dc, const RECT& rc, const TrackSpectrum& track);
     void render_freq_axis(CDCHandle dc, const RECT& rc, int sample_rate);
     void render_time_axis(CDCHandle dc, const RECT& rc, double duration);
+    void render_db_scale(CDCHandle dc, const RECT& bar_rc, const RECT& label_rc, palette_t palette);
 
     // Selection management
     void update_selection();
@@ -213,11 +214,21 @@ private:
 
     // Runtime config (mirrors of cfg vars for fast access)
     int m_max_tracks = 4;
-    palette_t m_palette = PALETTE_SPECTRUM;
+    palette_t m_palette = PALETTE_SOX;
     bool m_show_freq_axis = true;
     bool m_show_time_axis = true;
     pfc::string8 m_title_format = DEFAULT_TITLE_FORMAT;
     language_t m_language = LANG_DEFAULT;
+
+    // Post-processing soften/smooth strength for the rendered spectrum DIB.
+    //   0 = OFF (default)  : no blur at all, pure bilinear. Best match for
+    //                         spek which gets its silkiness from Hann window
+    //                         + 75% FFT overlap (4x time oversample in the
+    //                         analysis stage), not from post-filtering.
+    //   1 = LIGHT          : [1,6,1]/8 per-axis, polishes 1px hard edges only
+    //   2 = NORMAL         : [1,2,1]/4 per-axis, genuine spek-ish smear
+    //                         (but visibly blurs drum-kit transients)
+    int m_soften_strength = 0;
 
     ui_element_config::ptr m_config;
     const ui_element_instance_callback_ptr m_callback;

@@ -86,6 +86,29 @@ bool SpectrumAnalyzer::analyze(metadb_handle_ptr track, SpectrumData& out, abort
         int nbins = fft.get_output_size();
         out.fft_bins = nbins;
 
+        // ================================================================
+        // Magnitude → amplitude (dBFS) normalization.
+        //
+        // Our FFT outputs raw |X[k]| (no scaling). To map onto Spek's
+        // absolute dBFS scale we need two compensations:
+        //
+        //   1) DFT magnitude to linear amplitude for real signals:
+        //      A_amp[k] = 2 * |X[k]| / N     (positive freq portion)
+        //   2) Window coherent-gain compensation for Hann window:
+        //      sum_n w[n] / N = 0.5 for Hann, so actual windowed peak
+        //      amplitude seen by FFT = A_true * 0.5.  We divide by 0.5
+        //      to recover the true sinusoidal amplitude.
+        //
+        // Combined: out[k] = |X[k]| * 2 / (N * 0.5) = |X[k]| * 4 / N.
+        // With N=2048 this is exactly 1/512 = 0.001953125.  After this
+        // scaling, a true digital full-scale sine (peak ±1.0) will show
+        // up in its peak FFT bin as ~1.0, which maps to 0 dBFS via
+        // 20*log10(val / 1.0) in the renderer.  16-bit noise floor at
+        // -96 dBFS correctly lands around level 0.20 → deep blue on
+        // the palette, matching Spek.
+        // ================================================================
+        const float mag_to_amp = 4.0f / (float)nfft;
+
         // Decide hop size and number of time columns.
         //
         // Performance-tuned fast path (matches the pre-FFT-menu "秒加载"
@@ -196,9 +219,9 @@ bool SpectrumAnalyzer::analyze(metadb_handle_ptr track, SpectrumData& out, abort
                         }
                         fft.execute();
 
-                        // 1 FFT → 1 time column, direct write
+                        // 1 FFT → 1 time column, amplitude-normalized
                         for (int j = 0; j < nbins; j++) {
-                            frame_data.push_back(fft.get_output(j));
+                            frame_data.push_back(fft.get_output(j) * mag_to_amp);
                         }
                     }
                 }
@@ -220,7 +243,7 @@ bool SpectrumAnalyzer::analyze(metadb_handle_ptr track, SpectrumData& out, abort
             }
             fft.execute();
             for (int j = 0; j < nbins; j++) {
-                frame_data.push_back(fft.get_output(j));
+                frame_data.push_back(fft.get_output(j) * mag_to_amp);
             }
         }
 

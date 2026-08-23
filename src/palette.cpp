@@ -10,11 +10,14 @@
 // =====================================================================
 // The three palette functions below are literal, byte-for-byte C++
 // ports of the corresponding functions in:
-//   spek-master/src/spek-palette.cc  AND  spek-X-main/src/spek-palette.cc
-// Both repositories share an identical palette implementation (the
-// only real difference is their PALETTE_DEFAULT setting).  We keep
-// these three entries because their numeric values (0, 1, 2) are
-// persisted in .fth / layout config blobs and must not be reordered.
+//   spek-0.8.5/src/spek-palette.cc
+//
+// They produce numerically identical output to Spek — any hand-tuned
+// anchor table will deviate from Rob Sykes' sin() curves because the
+// G and B ramps are non-linear S-shaped (sin π/2 t) and have dead
+// bands (e.g. G stays strictly zero below level=0.6 ≈ -48 dB, which
+// is why Spek keeps 2-10kHz mid-band strictly red/pink instead of
+// prematurely going orange).
 // =====================================================================
 
 static uint32_t spectrum(double level)
@@ -45,10 +48,7 @@ static uint32_t spectrum(double level)
         b = 0.0;
     }
 
-    // Intensity correction — linear black-ramp for level < 0.1 so the
-    // very quiet noise floor drifts smoothly to pure black instead of
-    // getting stuck on the darkest available blue (which otherwise
-    // produces a "spurious blue band" at the bottom of every track).
+    // Intensity correction.
     double cf = 1.0;
     if (level >= 0.0 && level < 0.1) {
         cf = level / 0.1;
@@ -63,20 +63,33 @@ static uint32_t spectrum(double level)
 
 static uint32_t sox(double level)
 {
+    // The default palette used by SoX, written by Rob Sykes.
+    // Exact 1:1 port of spek-palette.cc sox() from Spek 0.8.5.
+    //
+    // Key characteristics vs our old anchor-table version:
+    //   * R starts rising only at level=0.13 (≈ -104 dB) not at -120 dB,
+    //     which makes the lowest noise band pure blue instead of purple.
+    //   * G stays strictly 0 until level=0.6 (≈ -48 dB) — this single
+    //     line is why Spek keeps its mid-band (2-10 kHz, -48..-72 dB)
+    //     strictly red/pink instead of prematurely turning orange.
+    //   * B goes through a sin-peak at level=0.3 then drops to 0 in
+    //     [0.60, 0.78] before climbing linearly to white at level=1.
+    //
+    // None of these subtle features can be reproduced with a 13-point
+    // linear anchor table; the sin curves produce a visibly smoother
+    // gradient with no colour banding.
     double r = 0.0;
     if (level >= 0.13 && level < 0.73) {
         r = sin((level - 0.13) / 0.60 * M_PI / 2.0);
     } else if (level >= 0.73) {
         r = 1.0;
     }
-
     double g = 0.0;
     if (level >= 0.6 && level < 0.91) {
         g = sin((level - 0.6) / 0.31 * M_PI / 2.0);
     } else if (level >= 0.91) {
         g = 1.0;
     }
-
     double b = 0.0;
     if (level < 0.60) {
         b = 0.5 * sin(level / 0.6 * M_PI);

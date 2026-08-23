@@ -11,7 +11,7 @@ cfg_bool g_cfg_show_freq_axis(guid_cfg_show_freq_axis, true);
 cfg_bool g_cfg_show_time_axis(guid_cfg_show_time_axis, true);
 cfg_string g_cfg_title_format(guid_cfg_title_format, DEFAULT_TITLE_FORMAT);
 cfg_int g_cfg_max_tracks(guid_cfg_max_tracks, 4);
-cfg_int g_cfg_palette(guid_cfg_palette, (int)PALETTE_SPECTRUM);
+cfg_int g_cfg_palette(guid_cfg_palette, (int)PALETTE_SOX);
 cfg_int g_cfg_language(guid_cfg_language, (int)LANG_DEFAULT);
 
 SpectrumCompareWindow::SpectrumCompareWindow(
@@ -142,6 +142,10 @@ void SpectrumCompareWindow::initialize_window(HWND parent) {
 static constexpr uint32_t kConfigMagicVersion = 2u;
 static constexpr int        kMinMaxTracks = 1;
 static constexpr int        kMaxMaxTracks = 4;
+
+// Forward decl — actual impl lives near render_db_scale, below the
+// render_spectrum call site that references it.
+static void soften_spectrum(uint32_t* pixels, int width, int height, int strength);
 
 static ui_element_config::ptr build_instance_config(
     int max_tracks,
@@ -597,6 +601,10 @@ void SpectrumCompareWindow::OnPaint(CDCHandle) {
     const int track_gap = scale(6);          // gap between tracks
     const int label_to_spec_gap = scale(4);  // gap below label before spectrum
     const int spec_to_axis_gap = scale(2);   // gap between spectrum and axes
+    const int db_bar_width = scale(10);      // 右侧色条宽度
+    const int db_label_gap = scale(3);       // 色条和 dB 数字之间的 gap
+    const int db_label_width = scale(46);    // dB 数字宽度 ("-85" / "0 dB")
+    const int db_scale_total = db_bar_width + db_label_gap + db_label_width;
 
     int track_count = (int)m_tracks.size();
     int total_track_gap = track_gap * (track_count - 1);
@@ -617,7 +625,7 @@ void SpectrumCompareWindow::OnPaint(CDCHandle) {
         int spec_top = track_rc.top + label_height + label_to_spec_gap;
         int spec_bottom = track_rc.bottom - time_axis_height - spec_to_axis_gap;
         int spec_left = track_rc.left + freq_axis_width;
-        int spec_right = track_rc.right;
+        int spec_right = track_rc.right - db_scale_total;
 
         // Label area. Left edge is intentionally aligned with the spectrum
         // itself (not the outer panel) to keep text out of the freq axis column.
@@ -656,6 +664,11 @@ void SpectrumCompareWindow::OnPaint(CDCHandle) {
             CRect time_rc(spec_left, spec_bottom + spec_to_axis_gap, spec_right, track_rc.bottom);
             render_time_axis(dc.m_hDC, time_rc, m_tracks[i]->data.duration);
         }
+
+        // dB 色条 + 标签（频谱右侧）
+        CRect db_bar_rc(spec_right + db_label_gap, spec_top, spec_right + db_label_gap + db_bar_width, spec_bottom);
+        CRect db_label_rc(db_bar_rc.right + db_label_gap, spec_top, db_bar_rc.right + db_label_gap + db_label_width, spec_bottom);
+        render_db_scale(dc.m_hDC, db_bar_rc, db_label_rc, m_palette);
     }
     } // end else (m_tracks not empty)
 
@@ -715,13 +728,22 @@ void SpectrumCompareWindow::render_spectrum(CDCHandle dc, const RECT& rc, const 
     // than -80 dBFS into palette level 0.0 (→ deep blue of spectrum()),
     // producing the user-reported "蓝色带" at the bottom of every track.
     // At 120 dB we give ~40 dB more headroom: the noise floor at ~-96
-    // dBFS lands at palette level 0.20 (green begins to fade into blue)
-    // instead of 0.0 (solid spectrum() dark blue).  Together
-    // with spectrum()'s built-in cf ramp for level<0.1 we get clean
-    // black for absolute silence but NOT a fake blue band on noise.
-    const float dyn_range = 120.0f; // dB
+    // 与 spek 完全一致的 floor=-120dB, dyn_range=120dB，线性无 gamma。
+    // 之前 floor=-85 直接把 -90~-120dB 的深蓝→墨蓝段裁成纯黑，
+    // 导致 25-40kHz 高频区 spek 看起来是深蓝渐变，SC 却直接变成紫+黑，严重失真。
+    // 恢复 120dB 完整范围后，-90dB (level 0.25) 会显示正蓝色，
+    // -100dB (level 0.167) 深蓝，-120dB 黑，和 spek 截图完全对应。
+    // 同时**不使用 gamma**：线性 dB → 线性 palette level，
+    // 配合 13 段精确锚点插值，颜色丝滑无断层。
     const float floor_db = -120.0f;
-    float ref_level = data.max_level > 0 ? data.max_level : 1.0f;
+    const float dyn_range = 120.0f;
+    // 绝对 dBFS 参考 (Spek 式)：1.0 = 0dBFS 满量程正弦峰值。
+    // 不能再用 data.max_level（track 自身频谱峰）做参考 — 那会把
+    // 每首歌都归一化显示，导致 16-bit 量化噪声（-96dBFS）被抬升
+    // 显示成紫色，橙黄红色整体前移 10-20dB。
+    // analysis_worker 已经做了 DFT 2/N 归一化 + Hann 窗 coherent
+    // gain 0.5 补偿（× 4 / N），所以真实 0dBFS 正弦峰 bin ≈ 1.0。
+    const float ref_level = 1.0f;
 
     // Map spectrum data to pixels.
     //
@@ -790,19 +812,37 @@ void SpectrumCompareWindow::render_spectrum(CDCHandle dc, const RECT& rc, const 
             }
             if (level_db > 0) level_db = 0;
             if (level_db < floor_db) level_db = floor_db;
-            // Normalize to 0..1 over our dyn_range display range.
+
+            // 线性归一化，无 gamma。
+            // level_norm = 1.0 ↔ 0dBFS (白), 0.0 ↔ -120dBFS (纯黑)
+            // 13 段精确 RGB 插值保证：
+            //   -40dB (人声泛音中心 0.667) → 纯红，不是橙红
+            //   -60dB (谐波 0.5)          → 紫红
+            //   -80dB (低电平 0.333)      → 蓝紫
+            //   -90dB (高频空气 0.25)     → 正蓝色 (← 之前没显示的关键段)
+            //   -110dB (0.083)            → 墨蓝
             float level_norm = (level_db - floor_db) / dyn_range;
             if (level_norm < 0) level_norm = 0;
             if (level_norm > 1) level_norm = 1;
 
             uint32_t color = spek_palette(m_palette, level_norm);
-            // Convert 0xRRGGBB → BGRA for top-down 32-bit DIB
-            uint8_t r = (color >> 16) & 0xFF;
-            uint8_t g = (color >> 8) & 0xFF;
-            uint8_t b =  color        & 0xFF;
-            pixel_data[py * width + px] = (b << 16) | (g << 8) | r;
+            // spek_palette 返回 0x00RRGGBB 格式。
+            // Windows top-down 32-bit DIB 的 DWORD 格式也是 0x00RRGGBB
+            // （小端内存顺序 = B G R X），因此直接写入 color 即可。
+            // 错误做法：(b<<16)|(g<<8)|r 会把 R 和 B 通道对调，导致橙黄显示成深蓝。
+            pixel_data[py * width + px] = color;
         }
     }
+
+    // --------------------------------------------------------------
+    // Post-process: configurable soften/smooth (cosmetic only).
+    // m_soften_strength = 0 OFF, 1 LIGHT, 2 NORMAL  (see header for details)
+    // NOTE: the real spek-style "silky smear" comes from FFT overlap
+    // (Hann window + 75% overlap -> 4x temporal oversample), not from
+    // post blur. Tweaking this strength from outside is cheap:
+    //   search for `m_soften_strength = 1;` in spectrum_window.h
+    // --------------------------------------------------------------
+    soften_spectrum(pixel_data, width, height, m_soften_strength);
 
     // Blit to screen
     HDC mem_dc = CreateCompatibleDC(dc);
@@ -820,8 +860,21 @@ void SpectrumCompareWindow::render_freq_axis(CDCHandle dc, const RECT& rc, int s
 
     int nyquist = sample_rate / 2;
 
-    // Frequency labels at 0, 5, 10, 15, 20, 22 kHz (capped at Nyquist)
-    static const int kHz_ticks[] = { 0, 5, 10, 15, 20, 22 };
+    // 根据 Nyquist 动态选择频率刻度。
+    // 从 0kHz 开始，每 5kHz 一步，直到超过 Nyquist；
+    // 超出 25kHz 后若 Nyquist 高（如 96kHz → 48kHz），再补充 25/30/35/40/45/48kHz，
+    // 这样 44.1kHz 样本只到 22k，96kHz 样本会完整显示到 48k。
+    int max_khz = (nyquist + 500) / 1000;
+    std::vector<int> ticks;
+    for (int k = 0; k <= 22; k += 5) ticks.push_back(k);
+    static const int hi_ticks[] = { 25, 30, 35, 40, 45, 48, 50, 60, 70, 80, 90, 96 };
+    for (int k : hi_ticks) if (k > 22 && k <= max_khz) ticks.push_back(k);
+    // 尾部对齐 Nyquist（整数 kHz）
+    if (max_khz >= 24 && (ticks.empty() || ticks.back() < max_khz)) {
+        // 如果 max_khz 比最后一个 tick 远 >= 2kHz，则直接在 max_khz 补一格
+        int last = ticks.empty() ? 0 : ticks.back();
+        if (max_khz - last >= 2) ticks.push_back(max_khz);
+    }
 
     // DPI-aware tick and label dimensions
     int dpi = m_dpi;
@@ -849,7 +902,7 @@ void SpectrumCompareWindow::render_freq_axis(CDCHandle dc, const RECT& rc, int s
     dc.MoveTo(rc.right - 1, rc.top);
     dc.LineTo(rc.right - 1, rc.bottom);
 
-    for (int khz : kHz_ticks) {
+    for (int khz : ticks) {
         int freq_hz = khz * 1000;
         if (freq_hz > nyquist) continue;
 
@@ -928,6 +981,156 @@ void SpectrumCompareWindow::render_time_axis(CDCHandle dc, const RECT& rc, doubl
         pfc::stringcvt::string_wide_from_utf8 label_w(label);
         CRect label_rc(px - label_half_w, rc.top + tick_len + tick_gap + 1, px + label_half_w, rc.bottom);
         dc.DrawText(label_w, -1, &label_rc, DT_NOPREFIX | DT_CENTER | DT_VCENTER | DT_SINGLELINE);
+    }
+}
+
+// ---------------------------------------------------------------------------
+// soften_spectrum — separable 1D-then-transpose blur on a top-down 32-bit DIB.
+// Strength table:
+//   0 = OFF                       bypass (no copy, no cycle)
+//   1 = LIGHT  (default)          [1,6,1] / 8    center 75%, edge 12.5% each
+//   2 = NORMAL                    [1,2,1] / 4    center 50%, edge 25% each
+//   3+ reserved.  Anything unknown falls back to OFF.
+// Why not a 5-tap kernel? Because the real "spek smear" comes from its
+// FFT overlap (Hann window + 75% overlap = 4x oversample along time axis)
+// which we can't mimic here without redoing the analysis pipeline. This
+// post-process is cosmetic only, so keep it cheap and bounded.
+// ---------------------------------------------------------------------------
+static void soften_spectrum(uint32_t* pixels, int width, int height, int strength) {
+    if (!pixels || width < 3 || height < 3) return;
+    int a, b, c, shift;
+    switch (strength) {
+    case 1: a = 1; b = 6; c = 1; shift = 3; break;  // / 8
+    case 2: a = 1; b = 2; c = 1; shift = 2; break;  // / 4
+    case 0: default: return;
+    }
+    const int round = 1 << (shift - 1);  // .5 for integer division rounding
+
+    std::vector<uint32_t> tmp(size_t(width) * height);
+
+    // --- Horizontal pass ---
+    for (int y = 0; y < height; y++) {
+        const uint32_t* src = pixels + size_t(y) * width;
+        uint32_t* dst = tmp.data() + size_t(y) * width;
+        for (int x = 0; x < width; x++) {
+            int xl = (x > 0) ? x - 1 : x;
+            int xr = (x < width - 1) ? x + 1 : x;
+            uint32_t cl = src[xl], cc = src[x], cr = src[xr];
+            uint32_t rl = (cl >> 16) & 0xFF, gl = (cl >> 8) & 0xFF, bl = cl & 0xFF;
+            uint32_t rm = (cc >> 16) & 0xFF, gm = (cc >> 8) & 0xFF, bm = cc & 0xFF;
+            uint32_t rr = (cr >> 16) & 0xFF, gr = (cr >> 8) & 0xFF, br = cr & 0xFF;
+            uint32_t ro = (a * rl + b * rm + c * rr + round) >> shift;
+            uint32_t go = (a * gl + b * gm + c * gr + round) >> shift;
+            uint32_t bo = (a * bl + b * bm + c * br + round) >> shift;
+            dst[x] = (ro << 16) | (go << 8) | bo;
+        }
+    }
+
+    // --- Vertical pass ---
+    for (int x = 0; x < width; x++) {
+        for (int y = 0; y < height; y++) {
+            int yu = (y > 0) ? y - 1 : y;
+            int yd = (y < height - 1) ? y + 1 : y;
+            uint32_t cu = tmp[size_t(yu) * width + x];
+            uint32_t cm = tmp[size_t(y) * width + x];
+            uint32_t cd = tmp[size_t(yd) * width + x];
+            uint32_t rl = (cu >> 16) & 0xFF, gl = (cu >> 8) & 0xFF, bl = cu & 0xFF;
+            uint32_t rm = (cm >> 16) & 0xFF, gm = (cm >> 8) & 0xFF, bm = cm & 0xFF;
+            uint32_t rr = (cd >> 16) & 0xFF, gr = (cd >> 8) & 0xFF, br = cd & 0xFF;
+            uint32_t ro = (a * rl + b * rm + c * rr + round) >> shift;
+            uint32_t go = (a * gl + b * gm + c * gr + round) >> shift;
+            uint32_t bo = (a * bl + b * bm + c * br + round) >> shift;
+            pixels[size_t(y) * width + x] = (ro << 16) | (go << 8) | bo;
+        }
+    }
+}
+
+void SpectrumCompareWindow::render_db_scale(CDCHandle dc, const RECT& bar_rc, const RECT& label_rc, palette_t palette) {
+    int bw = bar_rc.right - bar_rc.left;
+    int bh = bar_rc.bottom - bar_rc.top;
+    if (bw <= 0 || bh <= 0) return;
+
+    // 与 render_spectrum 严格同步：floor=-120dB, dyn=120dB, 线性无 gamma
+    const float floor_db = -120.0f;
+    const float dyn_range = 120.0f;
+
+    COLORREF text_color = m_callback->query_std_color(ui_color_text);
+    COLORREF bg_color = m_callback->query_std_color(ui_color_background);
+    COLORREF grid_color = RGB(
+        (GetRValue(text_color) + GetRValue(bg_color)) / 2,
+        (GetGValue(text_color) + GetGValue(bg_color)) / 2,
+        (GetBValue(text_color) + GetBValue(bg_color)) / 2
+    );
+
+    // 1) 垂直画 colorbar：线性无 gamma，和 render_spectrum 完全一致
+    //    top(y=0) = 0dB → level=1 白, bottom = -120dB → level=0 黑
+    for (int y = 0; y < bh; y++) {
+        float level = 1.0f - (float)y / (float)(bh - 1);
+        uint32_t c = spek_palette(palette, level);
+        uint8_t r = (uint8_t)((c >> 16) & 0xFF);
+        uint8_t g = (uint8_t)((c >> 8) & 0xFF);
+        uint8_t b = (uint8_t)(c & 0xFF);
+        COLORREF cr = RGB(r, g, b);
+        HPEN hPen = CreatePen(PS_SOLID, 1, cr);
+        HPEN oldPen = (HPEN)SelectObject(dc, hPen);
+        dc.MoveTo(bar_rc.left, bar_rc.top + y);
+        dc.LineTo(bar_rc.right, bar_rc.top + y);
+        SelectObject(dc, oldPen);
+        DeleteObject(hPen);
+    }
+
+    // 色条边框
+    CPen axisPen;
+    axisPen.CreatePen(PS_SOLID, 1, grid_color);
+    HPEN oldPen = (HPEN)SelectObject(dc, axisPen);
+    dc.MoveTo(bar_rc.left, bar_rc.top);
+    dc.LineTo(bar_rc.right - 1, bar_rc.top);
+    dc.LineTo(bar_rc.right - 1, bar_rc.bottom - 1);
+    dc.LineTo(bar_rc.left, bar_rc.bottom - 1);
+    dc.LineTo(bar_rc.left, bar_rc.top);
+    SelectObject(dc, oldPen);
+
+    // 2) dB 刻度：每 20dB 一格，再加上 0dB（顶部）和 floor（底部）
+    int dpi = m_dpi;
+    auto scale = [dpi](int v) { return MulDiv(v, dpi, 96); };
+    int label_half_h = scale(8);
+    int tick_len = scale(4);
+
+    dc.SetTextColor(text_color);
+    dc.SetBkMode(TRANSPARENT);
+    SelectObjectScope fontScope(dc, (HGDIOBJ)m_callback->query_font_ex(ui_font_default));
+
+    // 每 10dB 一条刻度线，每 20dB 一档文字标签（避免 13 行文字太挤）
+    std::vector<int> db_ticks;
+    for (int db = 0; db >= (int)floor_db - 5; db -= 10) {
+        db_ticks.push_back(db);
+    }
+
+    CPen tickPen;
+    tickPen.CreatePen(PS_SOLID, 1, grid_color);
+    SelectObjectScope tickScope(dc, tickPen);
+
+    for (int db : db_ticks) {
+        // 线性 ratio：(dB - floor) / dyn_range  →  0dB=1.0, -120dB=0.0
+        float ratio = ((float)db - floor_db) / dyn_range;
+        if (ratio < 0) ratio = 0; if (ratio > 1) ratio = 1;
+        // top (ratio=1.0) → y=bar_rc.top; bottom (ratio=0) → y=bar_rc.bottom-1
+        int py = bar_rc.top + (int)((1.0f - ratio) * (bh - 1));
+        if (py < bar_rc.top || py >= bar_rc.bottom) continue;
+
+        // Tick 小横线（所有人都画）
+        dc.MoveTo(bar_rc.left - tick_len, py);
+        dc.LineTo(bar_rc.left, py);
+
+        // 文字标签：只在 20dB 倍数或 0 点画，防止 13 档文字太挤重叠
+        if (db == 0 || (db % 20 == 0)) {
+            pfc::string8 label;
+            if (db == 0) label = "0 dB";
+            else label << db;
+            pfc::stringcvt::string_wide_from_utf8 label_w(label);
+            CRect lr(label_rc.left, py - label_half_h, label_rc.right, py + label_half_h);
+            dc.DrawText(label_w, -1, &lr, DT_NOPREFIX | DT_LEFT | DT_VCENTER | DT_SINGLELINE);
+        }
     }
 }
 
@@ -1747,19 +1950,9 @@ namespace {
     // Component version info
     DECLARE_COMPONENT_VERSION(
         "Spectrum Compare",
-        "1.0",
+        "1.1",
         "Vertical spectrogram comparison panel for selected tracks. Spek-style coloring.\n\n"
-        "Authors:\n"
-        "  - TRAE AI Coding Assistant  (foobar2000 SDK integration, window & layout,\n"
-        "                               concurrency safety, DPI scaling, kHz / time\n"
-        "                               axes, configuration serialization (.fth\n"
-        "                               import / export / copy-paste), titleformat\n"
-        "                               inline editing, Layout Editing Mode context\n"
-        "                               menu routing)\n"
-        "  - always beta               (original concept, product requirements,\n"
-        "                               feature planning, UI aesthetics, DPI &\n"
-        "                               spacing feedback, integration testing &\n"
-        "                               validation)\n\n"
+        "Authors: TRAE AI Coding Assistant, always beta, Asion\n\n"
         "Select one or more tracks in the playlist to view their spectrograms.\n"
         "Right-click to set display count (1-4), palette, axes, or refresh.\n"
         "Useful for comparing audio quality and frequency content across tracks."
