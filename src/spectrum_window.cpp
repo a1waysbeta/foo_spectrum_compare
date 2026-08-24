@@ -14,6 +14,7 @@ cfg_int g_cfg_max_tracks(guid_cfg_max_tracks, 4);
 cfg_int g_cfg_palette(guid_cfg_palette, (int)PALETTE_SOX);
 cfg_int g_cfg_language(guid_cfg_language, (int)LANG_DEFAULT);
 cfg_bool g_cfg_show_db_scale(guid_cfg_show_db_scale, true);
+cfg_bool g_cfg_pseudo_transparency(guid_cfg_pseudo_transparency, false);
 
 SpectrumCompareWindow::SpectrumCompareWindow(
     ui_element_config::ptr config,
@@ -35,6 +36,7 @@ SpectrumCompareWindow::SpectrumCompareWindow(
     m_show_freq_axis = g_cfg_show_freq_axis;
     m_show_time_axis = g_cfg_show_time_axis;
     m_show_db_scale = g_cfg_show_db_scale;
+    m_pseudo_transparency = g_cfg_pseudo_transparency;
     m_title_format = g_cfg_title_format.get();
     m_max_tracks = (int)g_cfg_max_tracks;
     m_palette = (palette_t)pfc::clip_t<int>(
@@ -130,7 +132,8 @@ void SpectrumCompareWindow::initialize_window(HWND parent) {
 // Binary layout of the ui_element_config payload we write / read.
 // Versioned so we can append fields without breaking old .fth files.
 //
-//   uint32_t version         ; 3 (v1 = no language, v2 = no db_scale)
+//   uint32_t version         ; 4 (v1 = no language, v2 = no db_scale,
+//                                    v3 = no pseudo_transparency)
 //   uint32_t max_tracks      ; 1..4
 //   uint32_t palette         ; palette_t (0..PALETTE_COUNT-1)
 //   uint8_t  show_freq_axis  ; 0 / 1
@@ -138,13 +141,16 @@ void SpectrumCompareWindow::initialize_window(HWND parent) {
 //   string8  title_format    ; raw bytes (UTF-8 titleformat expression)
 //   uint8_t  language        ; language_t (0=EN, 1=ZH)  [v2+]
 //   uint8_t  show_db_scale   ; 0 / 1                      [v3+]
+//   uint8_t  pseudo_transparency ; 0 / 1                  [v4+]
 //
 // v1 readers stop after title_format and ignore the language byte,
 // which is fine — language defaults to English on old .fth files.
 // v2 readers stop after language and ignore show_db_scale, which
 // defaults to true (dB axis visible).
+// v3 readers stop after show_db_scale and ignore pseudo_transparency,
+// which defaults to false (opaque background).
 // ============================================================
-static constexpr uint32_t kConfigMagicVersion = 3u;
+static constexpr uint32_t kConfigMagicVersion = 4u;
 static constexpr int        kMinMaxTracks = 1;
 static constexpr int        kMaxMaxTracks = 4;
 
@@ -159,7 +165,8 @@ static ui_element_config::ptr build_instance_config(
     bool show_time_axis,
     const char* title_format,
     language_t language,
-    bool show_db_scale)
+    bool show_db_scale,
+    bool pseudo_transparency)
 {
     ui_element_config_builder b;
     b << kConfigMagicVersion;
@@ -176,6 +183,7 @@ static ui_element_config::ptr build_instance_config(
     b << (uint8_t)pfc::clip_t<int>(
         (int)language, 0, (int)LANG_COUNT - 1);
     b << (uint8_t)(show_db_scale ? 1u : 0u);
+    b << (uint8_t)(pseudo_transparency ? 1u : 0u);
     return b.finish(SpectrumCompareWindow::g_get_guid());
 }
 
@@ -191,6 +199,7 @@ void SpectrumCompareWindow::set_configuration(ui_element_config::ptr config) {
     bool new_show_freq = m_show_freq_axis;
     bool new_show_time = m_show_time_axis;
     bool new_show_db = m_show_db_scale;
+    bool new_pseudo = m_pseudo_transparency;
     pfc::string8 new_title = m_title_format;
     language_t new_language = m_language;
 
@@ -225,6 +234,12 @@ void SpectrumCompareWindow::set_configuration(ui_element_config::ptr config) {
                     uint8_t sdb = 0;
                     parser >> sdb;
                     new_show_db = (sdb != 0);
+                }
+                // v4+ adds pseudo_transparency after show_db_scale.
+                if (version >= 4u) {
+                    uint8_t pt = 0;
+                    parser >> pt;
+                    new_pseudo = (pt != 0);
                 }
             }
             // (Earlier experimental versions of this file wrote extra
@@ -265,6 +280,11 @@ void SpectrumCompareWindow::set_configuration(ui_element_config::ptr config) {
         g_cfg_show_db_scale = new_show_db;
         changed_something = true;
     }
+    if (new_pseudo != m_pseudo_transparency) {
+        m_pseudo_transparency = new_pseudo;
+        g_cfg_pseudo_transparency = new_pseudo;
+        changed_something = true;
+    }
     if (strcmp(new_title.get_ptr(), m_title_format.get_ptr()) != 0) {
         m_title_format = new_title;
         g_cfg_title_format.set(new_title);
@@ -293,7 +313,8 @@ ui_element_config::ptr SpectrumCompareWindow::get_configuration() {
     ui_element_config::ptr fresh = build_instance_config(
         m_max_tracks, m_palette,
         m_show_freq_axis, m_show_time_axis,
-        m_title_format.get_ptr(), m_language, m_show_db_scale);
+        m_title_format.get_ptr(), m_language, m_show_db_scale,
+        m_pseudo_transparency);
     m_config = fresh;
     return fresh;
 }
@@ -308,7 +329,8 @@ ui_element_config::ptr SpectrumCompareWindow::g_get_default_configuration() {
         g_cfg_title_format.get_ptr(),
         (language_t)pfc::clip_t<int>(
             (int)g_cfg_language, 0, (int)LANG_COUNT - 1),
-        (bool)g_cfg_show_db_scale);
+        (bool)g_cfg_show_db_scale,
+        (bool)g_cfg_pseudo_transparency);
 }
 
 void SpectrumCompareWindow::notify(const GUID& p_what, t_size p_param1, const void* p_param2, t_size p_param2size) {
@@ -590,11 +612,34 @@ void SpectrumCompareWindow::OnPaint(CDCHandle) {
     HBITMAP old_bmp = (HBITMAP)SelectObject(mem_dc, mem_bmp);
     CDCHandle dc = mem_dc;
 
-    // Fill background
-    COLORREF bg_color = m_callback->query_std_color(ui_color_background);
-    CBrush bg_brush;
-    bg_brush.CreateSolidBrush(bg_color);
-    dc.FillRect(&rc, bg_brush);
+    // Fill background — pseudo-transparency asks the parent window to
+    // paint its own background into our memory DC, so any spectrum-free
+    // areas show the parent's background instead of a flat colour.
+    // Technique borrowed from foo_spider_monkey_panel: map our origin
+    // into parent coordinates, send WM_ERASEBKGND to the parent with
+    // our DC, then restore the origin.  When off (or no parent), fall
+    // back to the standard fb2k background colour fill.
+    if (m_pseudo_transparency) {
+        HWND parent = ::GetParent(m_hWnd);
+        if (parent) {
+            POINT tl = { 0, 0 };
+            POINT prev_org;
+            ::MapWindowPoints(m_hWnd, parent, &tl, 1);
+            ::OffsetWindowOrgEx(dc, tl.x, tl.y, &prev_org);
+            ::SendMessage(parent, WM_ERASEBKGND, (WPARAM)(HDC)dc, 0);
+            ::SetWindowOrgEx(dc, prev_org.x, prev_org.y, nullptr);
+        } else {
+            COLORREF bg_color = m_callback->query_std_color(ui_color_background);
+            CBrush bg_brush;
+            bg_brush.CreateSolidBrush(bg_color);
+            dc.FillRect(&rc, bg_brush);
+        }
+    } else {
+        COLORREF bg_color = m_callback->query_std_color(ui_color_background);
+        CBrush bg_brush;
+        bg_brush.CreateSolidBrush(bg_color);
+        dc.FillRect(&rc, bg_brush);
+    }
 
     std::lock_guard<std::mutex> lock(m_tracks_mutex);
 
@@ -1253,16 +1298,18 @@ LRESULT SpectrumCompareWindow::OnSpectrumReady(UINT uMsg, WPARAM wParam, LPARAM 
 //   [0..3]   Display count  ▶  1 / 2 / 3 / 4 tracks        (4 leaves)
 //   [4..6]   Palette        ▶  Spectrum / SoX / Mono       (3 leaves)
 //   [7..9]   Axes           ▶  Freq / Time / dB            (3 leaves)
-//   [10..11] Title format   ▶  Edit / Reset                (2 leaves)
-//   [12..13] Language       ▶  English / Chinese           (2 leaves)
-//   [14]     Refresh analysis                              (1 leaf)
-static constexpr size_t kCountIdx    = 0;
-static constexpr size_t kPaletteIdx  = 4;
-static constexpr size_t kAxesIdx     = 7;
-static constexpr size_t kTitleIdx    = 10;
-static constexpr size_t kLangIdx     = 12;
-static constexpr size_t kRefreshIdx  = 14;
-static constexpr size_t kTotalLeaves = 15;
+//   [10]     Pseudo-transparency                            (1 leaf)
+//   [11..12] Title format   ▶  Edit / Reset                (2 leaves)
+//   [13..14] Language       ▶  English / Chinese           (2 leaves)
+//   [15]     Refresh analysis                              (1 leaf)
+static constexpr size_t kCountIdx     = 0;
+static constexpr size_t kPaletteIdx   = 4;
+static constexpr size_t kAxesIdx      = 7;
+static constexpr size_t kPseudoIdx    = 10;
+static constexpr size_t kTitleIdx     = 11;
+static constexpr size_t kLangIdx      = 13;
+static constexpr size_t kRefreshIdx   = 15;
+static constexpr size_t kTotalLeaves  = 16;
 
 // Helper: narrow UTF-8 -> wide for Win32 menu APIs.
 static void append_menu_i18n(HMENU hmenu, UINT flags, UINT id, strid_t sid, language_t lang) {
@@ -1341,7 +1388,8 @@ static void build_language_popup(HMENU hmenu, unsigned base, language_t current,
 static std::vector<UINT> build_settings_block(HMENU p_menu, unsigned p_id_base,
                                               int max_tracks, palette_t palette,
                                               bool show_freq, bool show_time,
-                                              bool show_db, language_t lang) {
+                                              bool show_db, bool pseudo_transparency,
+                                              language_t lang) {
     std::vector<UINT> leaf_idms;
     leaf_idms.reserve(kTotalLeaves);
 
@@ -1375,6 +1423,14 @@ static std::vector<UINT> build_settings_block(HMENU p_menu, unsigned p_id_base,
         WIN32_OP_D(::AppendMenuW(p_menu, MF_POPUP, (UINT_PTR)axes_menu.m_hMenu, w));
         axes_menu.Detach();
     }
+
+    // Pseudo-transparency — standalone checked toggle (no submenu)
+    PFC_ASSERT(leaf_idms.size() == kPseudoIdx);
+    append_menu_i18n(p_menu, MF_STRING | (pseudo_transparency ? MF_CHECKED : 0),
+                     p_id_base + (unsigned)leaf_idms.size(), S_PSEUDO_TRANSPARENCY, lang);
+    leaf_idms.push_back(IDM_TOGGLE_PSEUDO_TRANSPARENCY);
+
+    WIN32_OP_D(::AppendMenu(p_menu, MF_SEPARATOR, 0, _T("")));
 
     // Title format submenu
     {
@@ -1479,7 +1535,8 @@ void SpectrumCompareWindow::edit_mode_context_menu_build(const POINT& /*p_point*
 
     m_edit_mode_cmd_to_idm = build_settings_block(
         p_menu, p_id_base, m_max_tracks, m_palette,
-        m_show_freq_axis, m_show_time_axis, m_show_db_scale, m_language);
+        m_show_freq_axis, m_show_time_axis, m_show_db_scale,
+        m_pseudo_transparency, m_language);
 }
 
 void SpectrumCompareWindow::edit_mode_context_menu_command(
@@ -1523,7 +1580,8 @@ void SpectrumCompareWindow::OnContextMenu(CWindow wnd, CPoint point) {
     // 0-based index we can look up in `leaf_idms`.
     const std::vector<UINT> leaf_idms = build_settings_block(
         menu, 0, m_max_tracks, m_palette,
-        m_show_freq_axis, m_show_time_axis, m_show_db_scale, m_language);
+        m_show_freq_axis, m_show_time_axis, m_show_db_scale,
+        m_pseudo_transparency, m_language);
 
     CPoint ptShow = point;
     if (ptShow.x == -1 && ptShow.y == -1) {
@@ -1649,6 +1707,13 @@ void SpectrumCompareWindow::OnToggleDbScale(UINT uNotifyCode, int nID, CWindow w
     (void)uNotifyCode; (void)nID; (void)wndCtl;
     m_show_db_scale = !m_show_db_scale;
     g_cfg_show_db_scale = m_show_db_scale;
+    Invalidate();
+}
+
+void SpectrumCompareWindow::OnTogglePseudoTransparency(UINT uNotifyCode, int nID, CWindow wndCtl) {
+    (void)uNotifyCode; (void)nID; (void)wndCtl;
+    m_pseudo_transparency = !m_pseudo_transparency;
+    g_cfg_pseudo_transparency = m_pseudo_transparency;
     Invalidate();
 }
 

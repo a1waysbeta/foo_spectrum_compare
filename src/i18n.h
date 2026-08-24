@@ -30,6 +30,7 @@ enum strid_t {
     S_FREQ_AXIS,             // 3 axis toggles
     S_TIME_AXIS,
     S_DB_SCALE,
+    S_PSEUDO_TRANSPARENCY,   // standalone toggle
     S_TITLE_FORMAT,          // submenu title
     S_EDIT_FORMAT,           // 2 title format actions
     S_RESET_DEFAULT,

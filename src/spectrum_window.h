@@ -37,6 +37,8 @@ static const GUID guid_cfg_language =
     { 0x6f708192, 0xa3b4, 0xc5d6, { 0xe7, 0xf8, 0x09, 0x1a, 0x2b, 0x3c, 0x4d, 0x5e } };
 static const GUID guid_cfg_show_db_scale =
     { 0x71829304, 0xb5c6, 0xd7e8, { 0xf9, 0x0a, 0x1b, 0x2c, 0x3d, 0x4e, 0x5f, 0x70 } };
+static const GUID guid_cfg_pseudo_transparency =
+    { 0x82930415, 0xc6d7, 0xe8f9, { 0x0a, 0x1b, 0x2c, 0x3d, 0x4e, 0x5f, 0x70, 0x81 } };
 
 // Persistent config storage (static globals, registered once at startup).
 // Defined as static so they persist across window creation/destruction.
@@ -47,6 +49,7 @@ extern cfg_int g_cfg_max_tracks;
 extern cfg_int g_cfg_palette;
 extern cfg_int g_cfg_language;
 extern cfg_bool g_cfg_show_db_scale;
+extern cfg_bool g_cfg_pseudo_transparency;
 
 // Menu command IDs — values are arbitrary but unique within this window's
 // command range.  Do NOT reuse numbers across different IDs because
@@ -68,6 +71,7 @@ extern cfg_bool g_cfg_show_db_scale;
 #define IDM_LANG_ENGLISH  1030
 #define IDM_LANG_CHINESE  1031
 #define IDM_TOGGLE_DB_SCALE 1024
+#define IDM_TOGGLE_PSEUDO_TRANSPARENCY 1025
 
 // Holds per-track spectrum state
 struct TrackSpectrum {
@@ -162,6 +166,7 @@ public:
         COMMAND_ID_HANDLER_EX(IDM_TOGGLE_FREQ_AXIS, OnToggleFreqAxis)
         COMMAND_ID_HANDLER_EX(IDM_TOGGLE_TIME_AXIS, OnToggleTimeAxis)
         COMMAND_ID_HANDLER_EX(IDM_TOGGLE_DB_SCALE, OnToggleDbScale)
+        COMMAND_ID_HANDLER_EX(IDM_TOGGLE_PSEUDO_TRANSPARENCY, OnTogglePseudoTransparency)
         COMMAND_ID_HANDLER_EX(IDM_EDIT_TITLE_FORMAT,  OnEditTitleFormat)
         COMMAND_ID_HANDLER_EX(IDM_RESET_TITLE_FORMAT, OnResetTitleFormat)
         COMMAND_ID_HANDLER_EX(IDM_LANG_ENGLISH,  OnLanguage)
@@ -185,6 +190,7 @@ private:
     void OnToggleFreqAxis(UINT uNotifyCode, int nID, CWindow wndCtl);
     void OnToggleTimeAxis(UINT uNotifyCode, int nID, CWindow wndCtl);
     void OnToggleDbScale(UINT uNotifyCode, int nID, CWindow wndCtl);
+    void OnTogglePseudoTransparency(UINT uNotifyCode, int nID, CWindow wndCtl);
     void OnEditTitleFormat(UINT uNotifyCode, int nID, CWindow wndCtl);
     void OnResetTitleFormat(UINT uNotifyCode, int nID, CWindow wndCtl);
     void OnLanguage(UINT uNotifyCode, int nID, CWindow wndCtl);
@@ -224,6 +230,7 @@ private:
     bool m_show_freq_axis = true;
     bool m_show_time_axis = true;
     bool m_show_db_scale = true;
+    bool m_pseudo_transparency = false;
     pfc::string8 m_title_format = DEFAULT_TITLE_FORMAT;
     language_t m_language = LANG_DEFAULT;
 
