@@ -747,11 +747,18 @@ void SpectrumCompareWindow::OnPaint(CDCHandle) {
 }
 
 void SpectrumCompareWindow::render_track_label(CDCHandle dc, const RECT& rc, const TrackSpectrum& track) {
-    // Draw label background
-    COLORREF bg = m_callback->query_std_color(ui_color_background);
-    CBrush brush;
-    brush.CreateSolidBrush(bg);
-    dc.FillRect(&rc, brush);
+    // Draw label background — skip when pseudo-transparency is on, since
+    // the parent's background was already painted into our memory DC in
+    // OnPaint.  Filling here would overwrite it with ui_color_background
+    // (foobar2000 theme panel colour), which differs from the parent's
+    // actual background and produces a visible colour mismatch (e.g.
+    // "light green" vs "green" when the host background is green).
+    if (!m_pseudo_transparency) {
+        COLORREF bg = m_callback->query_std_color(ui_color_background);
+        CBrush brush;
+        brush.CreateSolidBrush(bg);
+        dc.FillRect(&rc, brush);
+    }
 
     // Draw track title (already formatted by analyzer using configured titleformat string)
     dc.SetTextColor(m_callback->query_std_color(ui_color_text));
