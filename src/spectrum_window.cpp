@@ -933,22 +933,7 @@ void SpectrumCompareWindow::render_freq_axis(CDCHandle dc, const RECT& rc, int s
     if (width <= 0 || height <= 0 || sample_rate <= 0) return;
 
     int nyquist = sample_rate / 2;
-
-    // 根据 Nyquist 动态选择频率刻度。
-    // 从 0kHz 开始，每 5kHz 一步，直到超过 Nyquist；
-    // 超出 25kHz 后若 Nyquist 高（如 96kHz → 48kHz），再补充 25/30/35/40/45/48kHz，
-    // 这样 44.1kHz 样本只到 22k，96kHz 样本会完整显示到 48k。
     int max_khz = (nyquist + 500) / 1000;
-    std::vector<int> ticks;
-    for (int k = 0; k <= 22; k += 5) ticks.push_back(k);
-    static const int hi_ticks[] = { 25, 30, 35, 40, 45, 48, 50, 60, 70, 80, 90, 96 };
-    for (int k : hi_ticks) if (k > 22 && k <= max_khz) ticks.push_back(k);
-    // 尾部对齐 Nyquist（整数 kHz）
-    if (max_khz >= 24 && (ticks.empty() || ticks.back() < max_khz)) {
-        // 如果 max_khz 比最后一个 tick 远 >= 2kHz，则直接在 max_khz 补一格
-        int last = ticks.empty() ? 0 : ticks.back();
-        if (max_khz - last >= 2) ticks.push_back(max_khz);
-    }
 
     // DPI-aware tick and label dimensions
     int dpi = m_dpi;
@@ -956,6 +941,41 @@ void SpectrumCompareWindow::render_freq_axis(CDCHandle dc, const RECT& rc, int s
     int tick_len = scale(4);
     int label_half_h = scale(8);
     int tick_gap = scale(2);
+
+    // Adaptively choose frequency ticks based on Nyquist and available
+    // height.  Spek uses ~20 kHz spacing for high-sample-rate files;
+    // we do the same and extend to even larger steps for DSD (>1 MHz).
+    //
+    //   44.1 kHz file  (Nyquist 22 kHz)  →  0, 5, 10, 15, 20       (keep original)
+    //   96  kHz file  (Nyquist 48 kHz)  →  0, 20, 40, 48             (like Spek)
+    //   192 kHz file  (Nyquist 96 kHz)  →  0, 20, 40, 60, 80, 96    (like Spek)
+    //   DSD64         (Nyquist 1411 kHz) → 0, 200, 400, …, 1400    (adaptive)
+    int label_h = 2 * label_half_h;
+    int max_labels = height / label_h;
+    if (max_labels < 4) max_labels = 4;
+
+    std::vector<int> ticks;
+    if (max_khz <= 22) {
+        // 44.1 kHz / 48 kHz files: keep original 5 kHz spacing
+        for (int k = 0; k <= 20; k += 5) ticks.push_back(k);
+    } else {
+        // Higher sample rates: pick the smallest "nice" step whose
+        // tick count fits the available height.
+        static const int nice_steps[] = {20, 50, 100, 200, 500, 1000, 2000};
+        int step = 20;
+        for (int s : nice_steps) {
+            int count = max_khz / s + 2;   // +2 for Nyquist tail margin
+            if (count <= max_labels) { step = s; break; }
+            step = s;                       // fallback to largest
+        }
+        for (int k = 0; k <= max_khz; k += step) ticks.push_back(k);
+        // Append exact Nyquist if there's enough pixel space for a label
+        if (!ticks.empty() && ticks.back() < max_khz) {
+            int gap_khz = max_khz - ticks.back();
+            int gap_px = (int)((float)gap_khz / max_khz * height);
+            if (gap_px >= label_h) ticks.push_back(max_khz);
+        }
+    }
 
     COLORREF text_color = m_callback->query_std_color(ui_color_text);
     COLORREF bg_color = m_callback->query_std_color(ui_color_background);
@@ -2055,7 +2075,7 @@ namespace {
     // Component version info
     DECLARE_COMPONENT_VERSION(
         "Spectrum Compare",
-        "1.2",
+        "1.4",
         "Vertical spectrogram comparison panel for selected tracks. Spek-style coloring.\n\n"
         "Authors: TRAE AI Coding Assistant, always beta, Asion\n\n"
         "Select one or more tracks in the playlist to view their spectrograms.\n"
