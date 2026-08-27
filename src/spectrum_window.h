@@ -1,4 +1,4 @@
-#pragma once
+﻿#pragma once
 
 #include "stdafx.h"
 #include "spectrum_analyzer.h"
@@ -80,6 +80,44 @@ struct TrackSpectrum {
     std::atomic<bool> analyzing{ false };
     std::atomic<bool> needs_repaint{ false };
     abort_callback_impl abort; // per-track abort, triggered when track is removed or component shuts down
+
+    // ================= 渐进渲染位图缓存 =================
+    // 只由 GUI 线程在持有 m_tracks_mutex 时访问。
+    //
+    // 【为什么必须有】
+    // render_spectrum 每个像素含一次 log10f + palette 求值，还要对源数据
+    // 做区间面积平均。分析过程中每次重绘都把整幅 W×H 重算一遍，这就是
+    // 渐进显示不丝滑的根因：单帧成本 O(W×H) 决定了刷新率上不去，只能靠
+    // 100ms/200ms 节流硬压帧数，看起来就是"一块一块蹦出来"。
+    //
+    // 【为什么能缓存】
+    // 时间轴分母固定为 total_frames（见 render_spectrum 开头的长注释），
+    // 所以第 k 列永远落在同一个像素 x 上，已经画出的像素永远不会移动 ——
+    // 新数据只是向右接续。于是可以把位图留下来，每帧只算右边新长出的列，
+    // 成本从 O(W×H) 降到 O(新增列×H)。
+    //
+    // 位图始终按**完整** rect 宽度分配（而不是当前 draw_width），
+    // 这样生长过程中行距恒定，老像素一次都不用搬移。
+    HBITMAP   cache_bmp = nullptr;
+    uint32_t* cache_pixels = nullptr; // 指向 cache_bmp 像素，top-down 32bpp，行距 = cache_w
+    int cache_w = 0;                  // 建缓存时的 spec rect 宽/高
+    int cache_h = 0;
+    int cache_total = 0;              // 建缓存时的时间轴分母 total_frames
+    int cache_bins = 0;               // 建缓存时的 fft_bins
+    int cache_palette = -1;           // 建缓存时的调色板
+    int cache_cols = 0;               // 已算进位图的像素列数，下一列从这里开始
+
+    void discard_render_cache() {
+        if (cache_bmp) { DeleteObject(cache_bmp); cache_bmp = nullptr; }
+        cache_pixels = nullptr;
+        cache_w = cache_h = cache_total = cache_bins = cache_cols = 0;
+        cache_palette = -1;
+    }
+
+    // 轨道被取消选中 / 组件关闭时释放 GDI 位图。
+    // DIB section 是进程级 GDI 资源，从任何线程 DeleteObject 都合法；
+    // 而且能走到析构说明引用计数已归零，不可能与 GUI 线程并发。
+    ~TrackSpectrum() { discard_render_cache(); }
 };
 
 // Main UI element window
@@ -210,7 +248,10 @@ private:
         UINT_PTR uIdSubclass, DWORD_PTR dwRefData);
 
     // Spectrum rendering
-    void render_spectrum(CDCHandle dc, const RECT& rc, const SpectrumData& data);
+    // 返回实际绘制出的像素宽度（渐进显示时可能小于 rc 宽度），
+    // 让 OnPaint 知道右侧哪一段还是空白、可以放进度提示。
+    // 取 TrackSpectrum& 而非 const SpectrumData&：需要读写该轨道的位图缓存。
+    int render_spectrum(CDCHandle dc, const RECT& rc, TrackSpectrum& track);
     void render_track_label(CDCHandle dc, const RECT& rc, const TrackSpectrum& track);
     void render_freq_axis(CDCHandle dc, const RECT& rc, int sample_rate);
     void render_time_axis(CDCHandle dc, const RECT& rc, double duration);
@@ -234,15 +275,10 @@ private:
     pfc::string8 m_title_format = DEFAULT_TITLE_FORMAT;
     language_t m_language = LANG_DEFAULT;
 
-    // Post-processing soften/smooth strength for the rendered spectrum DIB.
-    //   0 = OFF (default)  : no blur at all, pure bilinear. Best match for
-    //                         spek which gets its silkiness from Hann window
-    //                         + 75% FFT overlap (4x time oversample in the
-    //                         analysis stage), not from post-filtering.
-    //   1 = LIGHT          : [1,6,1]/8 per-axis, polishes 1px hard edges only
-    //   2 = NORMAL         : [1,2,1]/4 per-axis, genuine spek-ish smear
-    //                         (but visibly blurs drum-kit transients)
-    int m_soften_strength = 0;
+    // 说明：这里原有一个 m_soften_strength（后置 RGB 模糊强度）成员。
+    // P2 优化已移除该机制 —— render_spectrum 现在在**线性幅度域**做
+    // 区间面积平均（box filter），是数学上正确的抗锯齿；
+    // 而在 palette 映射之后再模糊 RGB 属于错误的域，只会损失清晰度。
 
     ui_element_config::ptr m_config;
     const ui_element_instance_callback_ptr m_callback;

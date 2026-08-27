@@ -1,4 +1,4 @@
-#include "stdafx.h"
+﻿#include "stdafx.h"
 #include "spectrum_window.h"
 #include "i18n.h"
 #include <helpers/BumpableElem.h>
@@ -116,7 +116,13 @@ void SpectrumCompareWindow::initialize_window(HWND parent) {
     );
 
     // Start repaint timer for progressive rendering
-    SetTimer(TIMER_REPAINT, 200, NULL);
+    // R3：200ms → 33ms（约 30fps）。
+    // 原来必须用 200ms 是因为 render_spectrum 每帧重算整幅 W×H 像素，
+    // 刷太快会把 GUI 线程打满。R2 加了位图缓存后单帧只算新增的几列，
+    // 成本降了一两个数量级，才有条件把刷新率提到肉眼连续的水平。
+    // 定时器只在真有轨道置了 needs_repaint 时才 Invalidate，
+    // 空闲时这个回调就是一次加锁 + 遍历 ≤4 个元素，可以忽略。
+    SetTimer(TIMER_REPAINT, 33, NULL);
 
     // Subclass the popup host (parent) window to strip "Export settings" etc.
     // from its system menu. This runs after Create(parent) so m_hWnd is valid.
@@ -153,10 +159,6 @@ void SpectrumCompareWindow::initialize_window(HWND parent) {
 static constexpr uint32_t kConfigMagicVersion = 4u;
 static constexpr int        kMinMaxTracks = 1;
 static constexpr int        kMaxMaxTracks = 4;
-
-// Forward decl — actual impl lives near render_db_scale, below the
-// render_spectrum call site that references it.
-static void soften_spectrum(uint32_t* pixels, int width, int height, int strength);
 
 static ui_element_config::ptr build_instance_config(
     int max_tracks,
@@ -511,8 +513,102 @@ void SpectrumCompareWindow::analysis_worker(metadb_handle_ptr handle, std::share
     if (m_shutdown) return;
 
     SpectrumData data;
+
+    // ================================================================
+    // 渐进发布 —— 对应 Spek 的 pipeline_cb → on_have_sample 那一环
+    // ================================================================
+    //
+    // Spek 的做法：worker 每算完一个像素列就 wxPostEvent 一个
+    // SpekHaveSampleEvent，GUI 线程在 on_have_sample 里把这一列写进
+    // 常驻的 wxImage 然后 Refresh()（spek-spectrogram.cc:178）。
+    // 因为它「一列 == 一个屏幕像素列」，单列事件的代价极小。
+    //
+    // 我们不能照抄「一列一次通知」：
+    //   1) 我们一轨固定 800 列，但屏幕上一轨往往只有几百像素高、
+    //      几百像素宽，源列和像素列不是一一对应；单列通知没有意义，
+    //      而 800 次 Invalidate 的消息往返本身就够贵。
+    //   2) 最多 4 轨并行分析，通知量再乘 4。
+    //
+    // 所以这里做两级节流：
+    //   * 时间节流：至多每 publish_interval_ms 加锁发布一次，
+    //     把 800 次回调压到几十次；
+    //   * 帧合并：发布时只置 needs_repaint，由 TIMER_REPAINT
+    //     统一合并成一次 Invalidate（见 OnTimer）。多轨同时在跑时，
+    //     它们的进度会自动并到同一帧里，不会互相放大重绘次数。
+    //     真正结束时才 PostMessage(WM_SPECTRUM_READY) 立即刷新。
+    //   （R2 之前还有第三个理由：render_spectrum 每帧重算整幅 W×H
+    //     像素，刷新率根本提不上去。现在位图常驻、每帧只算新增列，
+    //     这个限制已经解除，两级间隔才敢从 100/200ms 降到 33/33ms。）
+    //
+    // 数据只做**增量追加**：dst 已有 k 列就只拷 [k, frames_done) 这一段，
+    // 整轨累计拷贝量等于一次全量拷贝（约 800*1025*4B ≈ 3.3MB），
+    // 而不是每次都全量重拷。
+    uint64_t last_publish_tick = 0;
+    // R3：100ms → 33ms。这是分析线程向 GUI 交付新列的最小间隔，
+    // 和 TIMER_REPAINT 的 33ms 对齐，两级节流合起来才是真实帧率
+    // （改造前 100ms 发布 × 200ms 定时器 ≈ 5fps，所以看起来一块一块蹦）。
+    // 交付本身很便宜（一次 memcpy 式 insert），贵的是重绘，
+    // 而重绘成本已经被 R2 的位图缓存压到只算新增列。
+    const uint64_t publish_interval_ms = 33;
+    bool header_published = false;
+
+    auto publish_partial = [&](int frames_done, int frames_total) {
+        (void)frames_total;
+        if (m_shutdown) return;
+        if (frames_done <= 0 || data.fft_bins <= 0) return;
+
+        const uint64_t now = GetTickCount64();
+        if (header_published && (now - last_publish_tick) < publish_interval_ms) return;
+        last_publish_tick = now;
+
+        std::lock_guard<std::mutex> lock(m_tracks_mutex);
+        if (m_shutdown) return;
+
+        // target 由 shared_ptr 保活，写它永远安全；但只有它还在
+        // m_tracks 里时才值得触发重绘（OnRefresh 会整体换掉对象，
+        // 那种情况下旧线程的进度不该再上屏）。
+        bool still_listed = false;
+        for (auto& t : m_tracks) {
+            if (t.get() == target.get()) { still_listed = true; break; }
+        }
+        if (!still_listed) return;
+
+        SpectrumData& dst = target->data;
+
+        if (!header_published) {
+            header_published = true;
+            // 复用的 TrackSpectrum 可能残留上一轮的结果/错误，先清干净，
+            // 否则 OnPaint 会走进 error 分支或拿旧列数当分母。
+            dst = SpectrumData();
+            dst.track_path = data.track_path;
+            dst.title = data.title;
+            dst.sample_rate = data.sample_rate;
+            dst.channels = data.channels;
+            dst.duration = data.duration;
+            dst.fft_size = data.fft_size;
+            dst.fft_bins = data.fft_bins;
+            dst.hop_size = data.hop_size;
+            dst.window = data.window;
+            dst.data.reserve((size_t)data.total_frames * (size_t)data.fft_bins);
+        }
+        // total_frames 是渲染端的时间轴分母，分析末尾会收敛到真实列数，
+        // 所以每次都同步。
+        dst.total_frames = data.total_frames;
+
+        const size_t nb = (size_t)data.fft_bins;
+        const size_t want = (size_t)frames_done * nb;
+        const size_t have = dst.data.size();
+        if (want > have && want <= data.data.size()) {
+            dst.data.insert(dst.data.end(),
+                            data.data.begin() + (ptrdiff_t)have,
+                            data.data.begin() + (ptrdiff_t)want);
+        }
+        dst.time_frames = (int)(dst.data.size() / nb);
+        target->needs_repaint = true;
+    };
+
     try {
-        m_analyzer.analyze(handle, data, target->abort);
+        m_analyzer.analyze(handle, data, target->abort, publish_partial);
     } catch (...) {
         // aborted or failed; mark as done so destructor/selection update can proceed
         std::lock_guard<std::mutex> lock(m_tracks_mutex);
@@ -661,7 +757,10 @@ void SpectrumCompareWindow::OnPaint(CDCHandle) {
     // Layout measurements (designed at 96 DPI, scaled to actual DPI)
     const int padding_outer = scale(8);      // outer margin around all content
     const int label_height = scale(22);      // title label row height
-    const int freq_axis_width = m_show_freq_axis ? scale(48) : 0;
+    // 频率轴宽度：容纳最宽的标签 "000 kHz" + 刻度线 + 间隙。
+    // 从 48 提到 60 是因为标签加了 " kHz" 单位（对齐 Spek）。
+    // 注意：这个值在 OnLButtonDown 的命中测试里还有一份，必须同步。
+    const int freq_axis_width = m_show_freq_axis ? scale(60) : 0;
     const int time_axis_height = m_show_time_axis ? scale(20) : 0;
     const int track_gap = scale(6);          // gap between tracks
     const int label_to_spec_gap = scale(4);  // gap below label before spectrum
@@ -705,17 +804,37 @@ void SpectrumCompareWindow::OnPaint(CDCHandle) {
 
         CRect spec_rc(spec_left, spec_top, spec_right, spec_bottom);
 
-        // Draw spectrum or status
-        if (m_tracks[i]->data.ready && !m_tracks[i]->data.error) {
-            render_spectrum(dc.m_hDC, spec_rc, m_tracks[i]->data);
-        } else if (m_tracks[i]->data.error) {
+        // 绘制频谱或状态。
+        //
+        // 【渐进显示的分支改造】
+        // 旧逻辑只在 data.ready 时才画频谱，分析中一律显示 "Analyzing..."，
+        // 于是 DSD64 这类高采样素材要空等十几秒。
+        // 现在只要已经有列（time_frames > 0）就先把左侧画出来，
+        // 右侧还没算到的区域保留背景，并在那片空白里显示进度提示，
+        // 这样用户从第一秒就能看到频谱从左往右生长。
+        const SpectrumData& tdata = m_tracks[i]->data;
+        const bool has_partial = (tdata.time_frames > 0 && tdata.fft_bins > 0 && !tdata.error);
+
+        if (tdata.error) {
             dc.SetTextColor(RGB(255, 80, 80));
             dc.SetBkMode(TRANSPARENT);
             SelectObjectScope fontScope(dc, (HGDIOBJ)m_callback->query_font_ex(ui_font_default));
             pfc::string8 err;
-            err << i18n(S_ERROR, m_language) << m_tracks[i]->data.error_msg.c_str();
+            err << i18n(S_ERROR, m_language) << tdata.error_msg.c_str();
             pfc::stringcvt::string_wide_from_utf8 err_w(err);
             dc.DrawText(err_w, -1, &spec_rc, DT_NOPREFIX | DT_CENTER | DT_VCENTER | DT_SINGLELINE);
+        } else if (has_partial) {
+            int drawn = render_spectrum(dc.m_hDC, spec_rc, *m_tracks[i]);
+            // 尚未画到的右侧区域：分析还在跑就在里面居中显示 "Analyzing..."。
+            if (drawn < spec_rc.Width() && m_tracks[i]->analyzing) {
+                CRect rest_rc(spec_rc.left + drawn, spec_rc.top, spec_rc.right, spec_rc.bottom);
+                dc.SetTextColor(m_callback->query_std_color(ui_color_text));
+                dc.SetBkMode(TRANSPARENT);
+                SelectObjectScope fontScope(dc, (HGDIOBJ)m_callback->query_font_ex(ui_font_default));
+                pfc::stringcvt::string_wide_from_utf8 w_analyzing(i18n(S_ANALYZING, m_language));
+                dc.DrawText(w_analyzing, -1, &rest_rc,
+                            DT_NOPREFIX | DT_CENTER | DT_VCENTER | DT_SINGLELINE | DT_END_ELLIPSIS);
+            }
         } else if (m_tracks[i]->analyzing) {
             dc.SetTextColor(m_callback->query_std_color(ui_color_text));
             dc.SetBkMode(TRANSPARENT);
@@ -775,26 +894,123 @@ void SpectrumCompareWindow::render_track_label(CDCHandle dc, const RECT& rc, con
     dc.DrawText(label_w, -1, &text_rc, DT_NOPREFIX | DT_LEFT | DT_VCENTER | DT_SINGLELINE | DT_END_ELLIPSIS);
 }
 
-void SpectrumCompareWindow::render_spectrum(CDCHandle dc, const RECT& rc, const SpectrumData& data) {
+int SpectrumCompareWindow::render_spectrum(CDCHandle dc, const RECT& rc, TrackSpectrum& track) {
+    const SpectrumData& data = track.data;
     int width = rc.right - rc.left;
     int height = rc.bottom - rc.top;
 
-    if (width <= 0 || height <= 0 || data.time_frames <= 0 || data.fft_bins <= 0) return;
+    if (width <= 0 || height <= 0 || data.time_frames <= 0 || data.fft_bins <= 0) return 0;
 
-    // Create DIB section for fast pixel access
-    BITMAPINFO bmi = {};
-    bmi.bmiHeader.biSize = sizeof(BITMAPINFOHEADER);
-    bmi.bmiHeader.biWidth = width;
-    bmi.bmiHeader.biHeight = -height; // top-down
-    bmi.bmiHeader.biPlanes = 1;
-    bmi.bmiHeader.biBitCount = 32;
-    bmi.bmiHeader.biCompression = BI_RGB;
+    // ==============================================================
+    // 渐进显示：只绘制已经算出来的左侧部分
+    // ==============================================================
+    //
+    // 【为什么要区分 avail 和 total】
+    // 分析线程边算边交付（见 SpectrumAnalyzer::progress_cb），所以进来时
+    // data.time_frames 可能只有计划列数的一小部分。
+    //
+    // 时间轴映射必须用**计划总列数** total 当分母，而不是当前已有的
+    // avail。否则每来一批新列，同一个源列就会被映射到不同的像素 x，
+    // 画面会像手风琴一样被反复拉伸 —— 用户看到的是整幅图不停横向缩放，
+    // 而不是从左往右生长。用 total 当分母后，第 k 列永远落在同一个像素
+    // 位置上，新数据只是往右接续，已画出的部分完全静止。
+    //
+    // 这也是我们和 Spek 的设计分歧点：Spek 让「一列 == 一个屏幕像素列」
+    // （samples = 面板宽度），天然不存在这个问题，但代价是改变窗口宽度
+    // 必须整轨重新分析。我们选择保留重采样，换取改窗口大小零成本。
+    const int total = data.total_frames > 0 ? data.total_frames : data.time_frames;
+    int avail = data.time_frames;
+    if (avail > total) avail = total;
+    if (avail <= 0) return 0;
 
-    void* pixels = nullptr;
-    HBITMAP hbmp = CreateDIBSection(dc, &bmi, DIB_RGB_COLORS, &pixels, NULL, 0);
-    if (!hbmp || !pixels) return;
+    // 已算出的列对应到多少像素宽。avail == total 时必须正好等于 width，
+    // 否则分析结束后右侧会残留一条永久空白。
+    int draw_width = (avail >= total)
+        ? width
+        : (int)((int64_t)width * (int64_t)avail / (int64_t)total);
+    if (draw_width < 1) draw_width = 1;
+    if (draw_width > width) draw_width = width;
 
-    uint32_t* pixel_data = (uint32_t*)pixels;
+    // ==============================================================
+    // R2：常驻位图缓存 —— 每帧只计算「新长出来」的那几列
+    // ==============================================================
+    //
+    // 【改造前的问题】
+    // 这里原本每次调用都 CreateDIBSection 新建位图，然后把整幅
+    // draw_width × height 重算一遍。每个像素含一次 log10f + 一次
+    // palette 插值，外加对源数据的区间面积平均求和 —— 单帧成本
+    // O(W×H)。分析过程中要重绘几十次，同一批像素被反复算了几十遍。
+    // 这就是「渐进显示不丝滑」的真正根因：单帧太贵 → 只能用
+    // 100ms 发布 + 200ms 定时器硬压到约 5fps → 看起来一块一块蹦。
+    //
+    // 【为什么可以缓存】
+    // 时间轴分母恒定为 total（见上面的长注释），所以源列 k 永远映射到
+    // 同一个像素 x，已画出的像素永远不会移动，新数据只向右接续。
+    //
+    // 【边界列会被算残，所以不能全部入缓存】
+    // draw_width 由 floor 得出，最右那一两列的源区间上界（box 模式的
+    // ceil、双线性模式的 lo+1）可能超过 avail，被夹紧后只能拿现有数据
+    // 凑一个偏暗的临时值。临时值上屏没问题（用户要看到生长），但一旦
+    // 进了缓存就会被永久冻结成一条竖向暗纹。
+    // 因此 tmap 构建时直接检测夹紧、算出 final_cols（第一个残缺列），
+    // 水位线只推进到 final_cols，残缺列下一帧重算。
+    //
+    // 【失效判据】
+    // 与其去每个改状态的地方挂钩子（OnSize / 调色板 / 轴开关 /
+    // 重分析），不如把建缓存时的全部前提存下来、每帧比对，
+    // 漏一个都不可能：
+    //   w,h      → OnSize、轴开关改变了 spec rect 几何
+    //   total    → 分析结束时 total_frames 收敛成真实列数，分母变了
+    //   bins     → fft 配置变化
+    //   palette  → 颜色映射变化
+    //   cache_cols <= draw_width → 防御 time_frames 变小（重分析复用对象）
+    //
+    // 位图按**完整** width 分配而非 draw_width，使行距在整个生长过程中
+    // 恒定，老像素一次都不用搬移。右侧未计算区域不会被 BitBlt 取用。
+    const bool cache_valid =
+        track.cache_bmp != nullptr &&
+        track.cache_pixels != nullptr &&
+        track.cache_w == width &&
+        track.cache_h == height &&
+        track.cache_total == total &&
+        track.cache_bins == data.fft_bins &&
+        track.cache_palette == (int)m_palette &&
+        track.cache_cols <= draw_width;
+
+    if (!cache_valid) {
+        track.discard_render_cache();
+
+        // 32bpp 下行距 = width * 4，永远满足 DIB 的 DWORD 对齐要求。
+        BITMAPINFO bmi = {};
+        bmi.bmiHeader.biSize = sizeof(BITMAPINFOHEADER);
+        bmi.bmiHeader.biWidth = width;
+        bmi.bmiHeader.biHeight = -height; // top-down
+        bmi.bmiHeader.biPlanes = 1;
+        bmi.bmiHeader.biBitCount = 32;
+        bmi.bmiHeader.biCompression = BI_RGB;
+
+        void* pixels = nullptr;
+        HBITMAP hbmp = CreateDIBSection(dc, &bmi, DIB_RGB_COLORS, &pixels, NULL, 0);
+        if (!hbmp || !pixels) {
+            if (hbmp) DeleteObject(hbmp);
+            return 0;
+        }
+
+        track.cache_bmp = hbmp;
+        track.cache_pixels = (uint32_t*)pixels;
+        track.cache_w = width;
+        track.cache_h = height;
+        track.cache_total = total;
+        track.cache_bins = data.fft_bins;
+        track.cache_palette = (int)m_palette;
+        track.cache_cols = 0;
+    }
+
+    uint32_t* const pixel_data = track.cache_pixels;
+    const int stride = track.cache_w;
+    // 本帧只需要计算 [start_col, draw_width) 这一段新列。
+    // 相等时下面的像素循环自然空转，只做一次 BitBlt。
+    const int start_col = track.cache_cols;
 
     // Dynamic range for dB scaling — matches Spek upstream default:
     //   spek-spectrogram.cc  LRANGE=-120, URANGE=0  → range=120 dB
@@ -819,59 +1035,201 @@ void SpectrumCompareWindow::render_spectrum(CDCHandle dc, const RECT& rc, const 
     // gain 0.5 补偿（× 4 / N），所以真实 0dBFS 正弦峰 bin ≈ 1.0。
     const float ref_level = 1.0f;
 
-    // Map spectrum data to pixels.
+    // ==============================================================
+    // P2：真正的区间面积平均（box filter）替代纯双线性点采样
+    // ==============================================================
     //
-    // X axis: time  (left = start, right = end).
-    // Y axis: freq  (bottom = 0 Hz, top = Nyquist).  We use LINEAR mapping,
-    //         which matches Spek/Spek-X exactly:
+    // 【旧实现的缺陷】
+    // 旧代码对每个目标像素只做一次双线性插值，即"点采样"：
+    //   freq_f = (1 - py/(H-1)) * (bins-1)   然后只取 fi 与 fi+1 两个 bin。
+    // 当 1025 个 bin 压进 400px 面板时，缩放比 ≈ 2.56，
+    // 每个像素只读 2 个 bin，剩下 0.56 个 bin **永远不会被读到**。
+    // 也就是说超过一半的频谱数据被直接丢弃 —— 这是典型的欠采样，
+    // 后果是高频细节丢失 + 摩尔纹/锯齿闪烁（改变窗口高度时尤为明显）。
+    // 时间轴同理：分析阶段固定产出最多 800 列（见 m_target_frames），
+    // 面板宽度小于 800px 时同样在丢列。
     //
-    //   fft_bins[]        ——  index 0 = DC, index (fft_bins-1) ≈ Nyquist/2
-    //   pixel row py      ——  py=height-1 (bottom of rect) → DC,
-    //                          py=0 (top of rect) → Nyquist.
+    // 【正确做法】
+    // 下采样时对目标像素覆盖的**全部**源单元求平均（面积/盒式滤波），
+    // 这才是数学上正确的降采样，也正是 Spek 的画质来源 ——
+    // Spek 调用 image.Scale(w,h)，wxWidgets 在缩小时内部就是盒式滤波
+    // （见 spek-spectrogram.cc:276）。
     //
-    // Thus fbin_idx = (1 - py/(H-1)) * (fft_bins - 1)  (linear, no curve).
+    // 【与被删掉的 soften_spectrum 的本质区别】
+    // 1) 域不同：soften 在 **RGB 空间**模糊。RGB 是 palette 非线性映射
+    //    后的结果，对它取平均等于对颜色查找表插值，物理上毫无意义，
+    //    甚至会跨越 palette 的锚点产生假色。
+    //    本实现在 **线性幅度域**平均，之后才转 dB→palette，
+    //    等价于对能量做正确积分。
+    // 2) 信息量不同：soften 只是把已经丢掉数据的图再抹匀（丢失不可逆），
+    //    面积平均是把本来读不到的数据全部纳入计算（信息量真实增加）。
+    // 3) soften 默认 strength=0，运行时根本没执行，属于死代码。
     //
-    // 注意：前一版使用 powf(freq_norm, 1.5f) "类对数压缩"，使得频率轴
-    // 的 0-5kHz 被人为拉伸超过 5-10kHz 的距离，造成截图中看到的
-    // "刻度不均匀"。现已去掉该曲线，render_freq_axis 也做了对应调整，
-    // 两者保持一致 → 0/5/10/15/20/22kHz 每段间距完全相等。
+    // 【上采样保持双线性】
+    // 当面板比数据还大（比如 22kHz 文件拉到 1000px 高）时，一个目标像素
+    // 落在源单元内部，此时面积平均会退化成"最近邻"产生方块感，
+    // 所以这种情况仍走双线性插值。两种模式按轴独立判断。
     //
-    // To avoid the "staircase blocky look" that appears when
-    // bins > panel_height (we're now using linear mapping, so a 1025-bin
-    // spectrum displayed in a 500px rect would otherwise show every 2nd
-    // bin as a 2px row), we do bilinear interpolation both vertically
-    // (between bin i and bin i+1) and horizontally (between time frame
-    // t and frame t+1).  This is exactly what Spek does when it calls
-    // image.Scale(W,H) on the wxImage before blitting (wx uses bilinear
-    // by default).  It adds ~5% CPU but materially improves "细腻度".
+    // 【实现要点：预计算区间表】
+    // 把每个目标像素的源区间 [lo, hi) 预先算好存表，避免在
+    // W*H 双重循环里反复做除法。频率表 H 项、时间表 W 项，
+    // 内存开销可忽略（几 KB），却省下 W*H 次浮点除法。
+    struct axis_map {
+        int lo;        // 源起始索引（含）
+        int hi;        // 源结束索引（不含），保证 hi > lo
+        float frac;    // 上采样模式下的插值系数
+        bool box;      // true = 面积平均, false = 双线性
+    };
+
+    // 频率轴映射表：py=height-1（矩形底部）→ DC，py=0（顶部）→ Nyquist
+    std::vector<axis_map> fmap((size_t)height);
+    {
+        // 每个目标像素对应多少个源 bin
+        const float bins_per_px = (float)data.fft_bins / (float)height;
+        const bool  use_box = (bins_per_px > 1.0f);
+        for (int py = 0; py < height; py++) {
+            axis_map& m = fmap[(size_t)py];
+            m.box = use_box;
+            if (use_box) {
+                // 像素行 py 在频率轴上的归一化区间（注意 y 轴翻转）
+                // py 覆盖 [py, py+1) 像素带 → 频率从高到低
+                float top = (float)(height - py)     * bins_per_px; // 上边界(高频)
+                float bot = (float)(height - py - 1) * bins_per_px; // 下边界(低频)
+                m.lo = (int)bot;
+                m.hi = (int)ceilf(top);
+                if (m.lo < 0) m.lo = 0;
+                if (m.hi > data.fft_bins) m.hi = data.fft_bins;
+                if (m.hi <= m.lo) m.hi = m.lo + 1;
+                if (m.hi > data.fft_bins) { m.hi = data.fft_bins; m.lo = m.hi - 1; }
+                m.frac = 0.0f;
+            } else {
+                float f = (height > 1)
+                    ? (1.0f - (float)py / (float)(height - 1)) * (float)(data.fft_bins - 1)
+                    : 0.0f;
+                if (f < 0) f = 0;
+                if (f > (float)(data.fft_bins - 1)) f = (float)(data.fft_bins - 1);
+                m.lo = (int)f;
+                m.frac = f - (float)m.lo;
+                m.hi = (m.lo + 1 < data.fft_bins) ? m.lo + 1 : m.lo;
+            }
+        }
+    }
+
+    // 时间轴映射表：px=0 → 起点，px=width-1 → 整轨终点
+    //
+    // 分母固定用 total（计划总列数）而不是 avail，这样第 k 列永远落在
+    // 同一个像素上；表本身只需要建到 draw_width，右边还没算出来的像素
+    // 这一帧不会被访问。
+    // 索引上界仍要按 avail 夹紧：draw_width 是整数截断的结果，
+    // 边界像素的区间有可能算出比 avail 大一点的下标。
+    //
+    // R2：只有 [start_col, draw_width) 会被读到，所以只填这一段；
+    // 前面的项保持默认值不会被访问。表仍按 draw_width 分配，
+    // 让 px 可以直接当下标，省一次减法。
+    //
+    // 【final_cols：哪些列可以永久缓存】
+    // 一列只有在它的源区间**没有被 avail 夹紧**时才是终值。被夹紧说明
+    // 它想读的源列还没算出来，这一帧只能拿现有数据凑一个临时值 ——
+    // 临时值可以上屏（用户要看到生长），但绝不能进缓存，否则会被永久
+    // 冻结成一条颜色偏暗的竖线。
+    //
+    // 与其去推导"要保留几列"（下采样时约 1 列，上采样时约 width/total 列，
+    // 还要考虑 total/width 的 float 舍入误差），不如**直接检测**：
+    // 记下第一个发生夹紧的列，缓存水位线就停在那里，下一帧从它重算。
+    // 这是精确判据，不依赖任何余量估算。
+    //
+    // 分析结束时 avail == total、draw_width == width，代入可知两个分支
+    // 都不会再夹紧（box: hi = ceil(total) = total；bilinear: f < total-1），
+    // 于是 final_cols == width，整幅图完整入缓存。
+    int final_cols = draw_width;
+    std::vector<axis_map> tmap((size_t)draw_width);
+    {
+        const float frames_per_px = (float)total / (float)width;
+        const bool  use_box = (frames_per_px > 1.0f);
+        for (int px = start_col; px < draw_width; px++) {
+            axis_map& m = tmap[(size_t)px];
+            m.box = use_box;
+            if (use_box) {
+                m.lo = (int)((float)px * frames_per_px);
+                const int hi_raw = (int)ceilf((float)(px + 1) * frames_per_px);
+                m.hi = hi_raw;
+                if (m.lo < 0) m.lo = 0;
+                if (m.hi > avail) m.hi = avail;
+                if (m.hi <= m.lo) m.hi = m.lo + 1;
+                if (m.hi > avail) { m.hi = avail; m.lo = m.hi - 1; }
+                if (m.lo < 0) m.lo = 0;
+                m.frac = 0.0f;
+                if (hi_raw > avail && px < final_cols) final_cols = px;
+            } else {
+                float f = (width > 0)
+                    ? (float)px / (float)width * (float)(total - 1)
+                    : 0.0f;
+                if (f < 0) f = 0;
+                const bool clamped = (f > (float)(avail - 1));
+                if (clamped) f = (float)(avail - 1);
+                m.lo = (int)f;
+                m.frac = f - (float)m.lo;
+                m.hi = (m.lo + 1 < avail) ? m.lo + 1 : m.lo;
+                // hi 退化成 lo 也算残缺：右邻列还没到，插值没法做。
+                if ((clamped || m.lo + 1 >= avail) && px < final_cols) final_cols = px;
+            }
+        }
+    }
+
+    const float* src = data.data.data();
+    const int    nbins = data.fft_bins;
+
+    // px 从 start_col 起 —— 左边的列已经在缓存位图里，是终值，不重算。
     for (int py = 0; py < height; py++) {
-        // Vertical (frequency) sample position — float so we can lerp
-        float freq_f = (1.0f - (float)py / (height - 1)) * (data.fft_bins - 1);
-        if (freq_f < 0) freq_f = 0;
-        if (freq_f > (data.fft_bins - 1)) freq_f = (float)(data.fft_bins - 1);
-        int fi = (int)floor(freq_f);
-        float ff = freq_f - (float)fi;
-        int fi2 = (fi + 1 < data.fft_bins) ? fi + 1 : fi;
-        // (spectrum values are stored bin0=DC; our data layout matches)
+        const axis_map& fm = fmap[(size_t)py];
 
-        for (int px = 0; px < width; px++) {
-            // Horizontal (time) sample position
-            float time_f = (float)px / width * (data.time_frames - 1);
-            if (time_f < 0) time_f = 0;
-            if (time_f > (data.time_frames - 1)) time_f = (float)(data.time_frames - 1);
-            int ti = (int)floor(time_f);
-            float tf = time_f - (float)ti;
-            int ti2 = (ti + 1 < data.time_frames) ? ti + 1 : ti;
+        for (int px = start_col; px < draw_width; px++) {
+            const axis_map& tm = tmap[(size_t)px];
 
-            // Four neighbours for bilinear
-            float v00 = data.get(ti,  fi);
-            float v10 = data.get(ti,  fi2);
-            float v01 = data.get(ti2, fi);
-            float v11 = data.get(ti2, fi2);
-
-            float v0 = v00 + (v01 - v00) * tf;  // top edge (freq fi → fi+1), at time ti+tf  in ti
-            float v1 = v10 + (v11 - v10) * tf;  // bottom edge
-            float val = v0 + (v1 - v0) * ff;    // then lerp vertically
+            // ---- 在线性幅度域取值 ----
+            // 四种组合分开写，让编译器能在各自的热循环里做向量化，
+            // 而不是在最内层反复判断 box 标志。
+            float val;
+            if (fm.box && tm.box) {
+                // 时间 + 频率双向下采样：完整二维面积平均
+                float sum = 0.0f;
+                for (int t = tm.lo; t < tm.hi; t++) {
+                    const float* row = src + (size_t)t * nbins;
+                    float rs = 0.0f;
+                    for (int f = fm.lo; f < fm.hi; f++) rs += row[f];
+                    sum += rs;
+                }
+                const int cnt = (tm.hi - tm.lo) * (fm.hi - fm.lo);
+                val = sum / (float)cnt;
+            } else if (fm.box) {
+                // 仅频率下采样；时间方向在两列之间线性插值
+                const float* row0 = src + (size_t)tm.lo * nbins;
+                const float* row1 = src + (size_t)tm.hi * nbins;
+                float s0 = 0.0f, s1 = 0.0f;
+                for (int f = fm.lo; f < fm.hi; f++) { s0 += row0[f]; s1 += row1[f]; }
+                const float inv = 1.0f / (float)(fm.hi - fm.lo);
+                s0 *= inv; s1 *= inv;
+                val = s0 + (s1 - s0) * tm.frac;
+            } else if (tm.box) {
+                // 仅时间下采样；频率方向在两 bin 之间线性插值
+                float sum = 0.0f;
+                for (int t = tm.lo; t < tm.hi; t++) {
+                    const float* row = src + (size_t)t * nbins;
+                    const float a = row[fm.lo];
+                    const float b = row[fm.hi];
+                    sum += a + (b - a) * fm.frac;
+                }
+                val = sum / (float)(tm.hi - tm.lo);
+            } else {
+                // 双向上采样：保持原双线性插值，避免方块感
+                const float* row0 = src + (size_t)tm.lo * nbins;
+                const float* row1 = src + (size_t)tm.hi * nbins;
+                const float v00 = row0[fm.lo], v10 = row0[fm.hi];
+                const float v01 = row1[fm.lo], v11 = row1[fm.hi];
+                const float v0 = v00 + (v01 - v00) * tm.frac;
+                const float v1 = v10 + (v11 - v10) * tm.frac;
+                val = v0 + (v1 - v0) * fm.frac;
+            }
 
             // Convert to dBFS relative to track peak, then clamp to
             // [floor_db, 0] exactly like Spek's:
@@ -904,27 +1262,114 @@ void SpectrumCompareWindow::render_spectrum(CDCHandle dc, const RECT& rc, const 
             // Windows top-down 32-bit DIB 的 DWORD 格式也是 0x00RRGGBB
             // （小端内存顺序 = B G R X），因此直接写入 color 即可。
             // 错误做法：(b<<16)|(g<<8)|r 会把 R 和 B 通道对调，导致橙黄显示成深蓝。
-            pixel_data[py * width + px] = color;
+            // 行距用 stride（= 完整 rect 宽度）而不是 draw_width：
+            // 位图按完整宽度分配，生长时行距恒定，老像素无需搬移。
+            pixel_data[(size_t)py * (size_t)stride + (size_t)px] = color;
         }
     }
 
-    // --------------------------------------------------------------
-    // Post-process: configurable soften/smooth (cosmetic only).
-    // m_soften_strength = 0 OFF, 1 LIGHT, 2 NORMAL  (see header for details)
-    // NOTE: the real spek-style "silky smear" comes from FFT overlap
-    // (Hann window + 75% overlap -> 4x temporal oversample), not from
-    // post blur. Tweaking this strength from outside is cheap:
-    //   search for `m_soften_strength = 1;` in spectrum_window.h
-    // --------------------------------------------------------------
-    soften_spectrum(pixel_data, width, height, m_soften_strength);
+    // 推进缓存水位线：只把**终值列**记进去。
+    // final_cols 是本帧第一个源区间被 avail 夹紧的列（见 tmap 构建处），
+    // 它和右边所有列都是拿不完整数据凑出来的临时值 —— 它们已经写进位图、
+    // 会随本次 BitBlt 上屏（用户能看到生长），但不计入水位线，
+    // 下一帧会从 final_cols 重新算，直到源数据补齐才定格。
+    // 分析结束时 final_cols == width，整幅图入缓存，此后每帧纯 BitBlt。
+    if (final_cols > track.cache_cols) track.cache_cols = final_cols;
 
-    // Blit to screen
+    // 注意：这里原先有一次 soften_spectrum() 后置 RGB 模糊调用。
+    // P2 已将其彻底移除 —— 上面的面积平均在线性幅度域做了正确的抗锯齿，
+    // 再叠加一层 RGB 模糊只会白白牺牲清晰度（且它默认 strength=0 从未生效）。
+
+    // Blit to screen —— 只贴已算出的 draw_width 那部分。
+    // 位图是缓存，绝不能在这里 DeleteObject；它由 TrackSpectrum
+    // 的 discard_render_cache()/析构函数负责释放。
     HDC mem_dc = CreateCompatibleDC(dc);
-    HBITMAP old_bmp = (HBITMAP)SelectObject(mem_dc, hbmp);
-    BitBlt(dc, rc.left, rc.top, width, height, mem_dc, 0, 0, SRCCOPY);
+    HBITMAP old_bmp = (HBITMAP)SelectObject(mem_dc, track.cache_bmp);
+    BitBlt(dc, rc.left, rc.top, draw_width, height, mem_dc, 0, 0, SRCCOPY);
     SelectObject(mem_dc, old_bmp);
     DeleteDC(mem_dc);
-    DeleteObject(hbmp);
+    return draw_width;
+}
+
+// ===========================================================================
+// P3：通用刻度选取算法 —— 移植自 Spek 的 SpekRuler::draw
+//     （spek/src/spek-ruler.cc，原实现 30-52 行）
+//
+// 【为什么要换掉原来的做法】
+// 改造前三条轴各写一套硬编码步长，各有各的毛病：
+//   - 频率轴：一个 `if (max_khz <= 22)` 特例 + nice_steps[] 表 +
+//             两趟"舒适区间 [4,10]"启发式，逻辑长且难预测；
+//   - 时间轴：`const int time_interval = 20` 固定 20 秒。
+//             一首 3 小时的文件会画 540 个标签，糊成一片黑；
+//   - dB 轴：固定每 10dB 一刻度、每 20dB 一标签。
+//             面板拉矮时同样重叠。
+// 更根本的问题是：三者都在**猜**标签有多大（label_half_h = scale(8)、
+// label_half_w = scale(22) 这类魔法数），一旦用户换了大字号或高 DPI，
+// 猜测立刻失效。
+//
+// 【Spek 的做法】
+// 只有一条规则：真实测量一个样例标签的像素尺寸 len，然后从**升序**因子
+// 数组里挑出第一个满足下式的因子：
+//
+//     |scale * factor| >= spacing * len
+//
+// 其中 scale = 像素/单位，spacing 是"标签间至少留几倍标签长度"。
+// 这保证无论采样率、时长、面板尺寸、字号怎么变，标签永远不会挤在一起，
+// 且总是取信息量最大（最密）的那一档。
+//
+// 【首尾端点】
+// Spek 无条件画 min 和 max 两个端点（频率轴因此总能看到精确 Nyquist，
+// 不再需要原来那段 `gap_px >= label_h` 的补丁）。中间刻度一旦逼近 max
+// 就 break，避免和端点标签撞上 —— 判据是 len * 1.2。
+//
+// 【参数说明】
+//   horizontal : true 用样例标签的宽度做判据（横轴），false 用高度（纵轴）。
+//                这就是 Spek 里 `pos == TOP || pos == BOTTOM` 的分支。
+//   factors    : 升序排列、以 0 结尾的因子数组。
+//   返回值     : 测得的 len（像素）。调用方直接拿它当标签尺寸用，
+//                彻底取代原先的魔法数。
+//
+// 前置条件：调用前必须已经把目标字体 SelectObject 进 hdc，否则量出来的
+// 是系统默认字体的尺寸。
+// ===========================================================================
+static int pick_ruler_ticks(
+    HDC hdc,
+    const wchar_t* sample_label,
+    bool horizontal,
+    const int* factors,
+    int min_units,
+    int max_units,
+    double spacing,
+    double scale,
+    std::vector<int>& out)
+{
+    out.clear();
+    if (max_units <= min_units) return 0;
+
+    SIZE ext = { 0, 0 };
+    ::GetTextExtentPoint32(hdc, sample_label, (int)wcslen(sample_label), &ext);
+    const int len = horizontal ? ext.cx : ext.cy;
+
+    // 挑出第一个能拉开足够间距的因子；若一个都不满足（面板极小），
+    // factor 保持 0，下面就只画首尾两个端点。
+    int factor = 0;
+    for (int i = 0; factors[i] != 0; ++i) {
+        if (fabs(scale * (double)factors[i]) >= spacing * (double)len) {
+            factor = factors[i];
+            break;
+        }
+    }
+
+    out.push_back(min_units);
+    if (factor > 0) {
+        for (int tick = min_units + factor; tick < max_units; tick += factor) {
+            // 逼近 max 端点标签就停，防止最后两个标签重叠
+            if (fabs(scale * (double)(max_units - tick)) < (double)len * 1.2) break;
+            out.push_back(tick);
+        }
+    }
+    out.push_back(max_units);
+    return len;
 }
 
 void SpectrumCompareWindow::render_freq_axis(CDCHandle dc, const RECT& rc, int sample_rate) {
@@ -933,49 +1378,12 @@ void SpectrumCompareWindow::render_freq_axis(CDCHandle dc, const RECT& rc, int s
     if (width <= 0 || height <= 0 || sample_rate <= 0) return;
 
     int nyquist = sample_rate / 2;
-    int max_khz = (nyquist + 500) / 1000;
 
     // DPI-aware tick and label dimensions
     int dpi = m_dpi;
     auto scale = [dpi](int v) { return MulDiv(v, dpi, 96); };
     int tick_len = scale(4);
-    int label_half_h = scale(8);
     int tick_gap = scale(2);
-
-    // Adaptively choose frequency ticks based on Nyquist and available
-    // height.  Spek uses ~20 kHz spacing for high-sample-rate files;
-    // we do the same and extend to even larger steps for DSD (>1 MHz).
-    //
-    //   44.1 kHz file  (Nyquist 22 kHz)  →  0, 5, 10, 15, 20       (keep original)
-    //   96  kHz file  (Nyquist 48 kHz)  →  0, 20, 40, 48             (like Spek)
-    //   192 kHz file  (Nyquist 96 kHz)  →  0, 20, 40, 60, 80, 96    (like Spek)
-    //   DSD64         (Nyquist 1411 kHz) → 0, 200, 400, …, 1400    (adaptive)
-    int label_h = 2 * label_half_h;
-    int max_labels = height / label_h;
-    if (max_labels < 4) max_labels = 4;
-
-    std::vector<int> ticks;
-    if (max_khz <= 22) {
-        // 44.1 kHz / 48 kHz files: keep original 5 kHz spacing
-        for (int k = 0; k <= 20; k += 5) ticks.push_back(k);
-    } else {
-        // Higher sample rates: pick the smallest "nice" step whose
-        // tick count fits the available height.
-        static const int nice_steps[] = {20, 50, 100, 200, 500, 1000, 2000};
-        int step = 20;
-        for (int s : nice_steps) {
-            int count = max_khz / s + 2;   // +2 for Nyquist tail margin
-            if (count <= max_labels) { step = s; break; }
-            step = s;                       // fallback to largest
-        }
-        for (int k = 0; k <= max_khz; k += step) ticks.push_back(k);
-        // Append exact Nyquist if there's enough pixel space for a label
-        if (!ticks.empty() && ticks.back() < max_khz) {
-            int gap_khz = max_khz - ticks.back();
-            int gap_px = (int)((float)gap_khz / max_khz * height);
-            if (gap_px >= label_h) ticks.push_back(max_khz);
-        }
-    }
 
     COLORREF text_color = m_callback->query_std_color(ui_color_text);
     COLORREF bg_color = m_callback->query_std_color(ui_color_background);
@@ -987,7 +1395,27 @@ void SpectrumCompareWindow::render_freq_axis(CDCHandle dc, const RECT& rc, int s
 
     dc.SetTextColor(text_color);
     dc.SetBkMode(TRANSPARENT);
+    // 字体必须先选进 DC，pick_ruler_ticks 才能量到正确的标签尺寸
     SelectObjectScope fontScope(dc, (HGDIOBJ)m_callback->query_font_ex(ui_font_default));
+
+    // 因子数组，单位 Hz。前 5 项与 Spek 的 freq_factors 完全一致
+    // （spek-spectrogram.cc:{1000,2000,5000,10000,20000,0}）；
+    // 后几项是为高采样率素材扩展的 —— 修好采样率来源后，最高的
+    // DSD64 抽取成 352800 Hz、Nyquist 176.4 kHz，20 kHz 因子会画出
+    // 9 个标签，够用；但 384/768 kHz 的 PCM 仍需要更大的因子。
+    static const int freq_factors[] = {
+        1000, 2000, 5000, 10000, 20000,
+        50000, 100000, 200000, 0
+    };
+
+    // 纵向标尺 → 用样例标签的**高度**判间距（对应 Spek 的 LEFT 标尺）。
+    // 这也顺带说明为什么标签里的位数无关紧要：竖排挤的是行高，不是字宽。
+    std::vector<int> ticks;
+    int label_h = pick_ruler_ticks(
+        dc, L"000 kHz", false, freq_factors,
+        0, nyquist, 3.0, (double)height / (double)nyquist, ticks);
+    if (label_h <= 0) label_h = scale(16);
+    const int label_half_h = label_h / 2;
 
     // Draw axis line on the right edge
     CPen axisPen;
@@ -996,9 +1424,8 @@ void SpectrumCompareWindow::render_freq_axis(CDCHandle dc, const RECT& rc, int s
     dc.MoveTo(rc.right - 1, rc.top);
     dc.LineTo(rc.right - 1, rc.bottom);
 
-    for (int khz : ticks) {
-        int freq_hz = khz * 1000;
-        if (freq_hz > nyquist) continue;
+    for (int freq_hz : ticks) {
+        if (freq_hz < 0 || freq_hz > nyquist) continue;
 
         // Map frequency to y-coordinate: LINEAR over [0, nyquist],
         // matching render_spectrum()'s new linear bin mapping.  So the
@@ -1014,9 +1441,11 @@ void SpectrumCompareWindow::render_freq_axis(CDCHandle dc, const RECT& rc, int s
         dc.MoveTo(rc.right - tick_len - tick_gap, py);
         dc.LineTo(rc.right - tick_gap, py);
 
-        // Label (right-aligned, left of tick)
+        // 标签文本对齐 Spek：数值 + 空格 + "kHz"（spek-ruler.cc 的
+        // format 是 "%d kHz"）。原来写的是紧凑的 "176k"，少了单位也少
+        // 了空格。四舍五入到最近的 kHz，这样 Nyquist=22050 显示 "22 kHz"。
         pfc::string8 label;
-        label << khz << "k";
+        label << ((freq_hz + 500) / 1000) << " kHz";
         pfc::stringcvt::string_wide_from_utf8 label_w(label);
         CRect label_rc(rc.left, py - label_half_h, rc.right - tick_len - tick_gap - 1, py + label_half_h);
         dc.DrawText(label_w, -1, &label_rc, DT_NOPREFIX | DT_RIGHT | DT_VCENTER | DT_SINGLELINE);
@@ -1028,15 +1457,11 @@ void SpectrumCompareWindow::render_time_axis(CDCHandle dc, const RECT& rc, doubl
     int height = rc.bottom - rc.top;
     if (width <= 0 || height <= 0 || duration <= 0) return;
 
-    // Time labels at 20-second intervals (like Spek)
-    const int time_interval = 20; // seconds
-
     // DPI-aware dimensions
     int dpi = m_dpi;
     auto scale = [dpi](int v) { return MulDiv(v, dpi, 96); };
     int tick_len = scale(4);
     int tick_gap = scale(1);
-    int label_half_w = scale(22);
 
     COLORREF text_color = m_callback->query_std_color(ui_color_text);
     COLORREF bg_color = m_callback->query_std_color(ui_color_background);
@@ -1048,7 +1473,23 @@ void SpectrumCompareWindow::render_time_axis(CDCHandle dc, const RECT& rc, doubl
 
     dc.SetTextColor(text_color);
     dc.SetBkMode(TRANSPARENT);
+    // 字体必须先选进 DC，pick_ruler_ticks 才能量到正确的标签尺寸
     SelectObjectScope fontScope(dc, (HGDIOBJ)m_callback->query_font_ex(ui_font_default));
+
+    // 因子数组，单位「秒」。前 12 项与 Spek 的 time_factors 完全一致；
+    // 末尾补了 3600/7200（1 小时 / 2 小时），因为本组件要面对整盘 SACD、
+    // 演唱会实录这类超长音轨，否则 30 分钟的因子会挤出上百个刻度。
+    static const int time_factors[] = {
+        1, 2, 5, 10, 20, 30, 60, 120, 300, 600, 1200, 1800,
+        3600, 7200, 0
+    };
+
+    std::vector<int> ticks;
+    int label_w = pick_ruler_ticks(
+        dc, L"00:00", true, time_factors,
+        0, (int)duration, 1.5, (double)width / duration, ticks);
+    if (label_w <= 0) label_w = scale(44);
+    const int label_half_w = label_w / 2 + tick_gap;
 
     // Draw axis line on top edge
     CPen axisPen;
@@ -1057,7 +1498,8 @@ void SpectrumCompareWindow::render_time_axis(CDCHandle dc, const RECT& rc, doubl
     dc.MoveTo(rc.left, rc.top + tick_gap);
     dc.LineTo(rc.right, rc.top + tick_gap);
 
-    for (int t = 0; t <= (int)duration; t += time_interval) {
+    for (int t : ticks) {
+        if (t < 0 || t > (int)duration) continue;
         int px = rc.left + (int)((double)t / duration * width);
         if (px < rc.left || px > rc.right) continue;
 
@@ -1065,77 +1507,16 @@ void SpectrumCompareWindow::render_time_axis(CDCHandle dc, const RECT& rc, doubl
         dc.MoveTo(px, rc.top + tick_gap);
         dc.LineTo(px, rc.top + tick_len + tick_gap);
 
-        // Label (centered below tick)
+        // Label (centered below tick)，格式与 Spek 的 "%d:%02d" 一致
         int min = t / 60;
         int sec = t % 60;
         pfc::string8 label;
         label << min << ":";
         if (sec < 10) label << "0";
         label << sec;
-        pfc::stringcvt::string_wide_from_utf8 label_w(label);
+        pfc::stringcvt::string_wide_from_utf8 label_w_str(label);
         CRect label_rc(px - label_half_w, rc.top + tick_len + tick_gap + 1, px + label_half_w, rc.bottom);
-        dc.DrawText(label_w, -1, &label_rc, DT_NOPREFIX | DT_CENTER | DT_VCENTER | DT_SINGLELINE);
-    }
-}
-
-// ---------------------------------------------------------------------------
-// soften_spectrum — separable 1D-then-transpose blur on a top-down 32-bit DIB.
-// Strength table:
-//   0 = OFF                       bypass (no copy, no cycle)
-//   1 = LIGHT  (default)          [1,6,1] / 8    center 75%, edge 12.5% each
-//   2 = NORMAL                    [1,2,1] / 4    center 50%, edge 25% each
-//   3+ reserved.  Anything unknown falls back to OFF.
-// Why not a 5-tap kernel? Because the real "spek smear" comes from its
-// FFT overlap (Hann window + 75% overlap = 4x oversample along time axis)
-// which we can't mimic here without redoing the analysis pipeline. This
-// post-process is cosmetic only, so keep it cheap and bounded.
-// ---------------------------------------------------------------------------
-static void soften_spectrum(uint32_t* pixels, int width, int height, int strength) {
-    if (!pixels || width < 3 || height < 3) return;
-    int a, b, c, shift;
-    switch (strength) {
-    case 1: a = 1; b = 6; c = 1; shift = 3; break;  // / 8
-    case 2: a = 1; b = 2; c = 1; shift = 2; break;  // / 4
-    case 0: default: return;
-    }
-    const int round = 1 << (shift - 1);  // .5 for integer division rounding
-
-    std::vector<uint32_t> tmp(size_t(width) * height);
-
-    // --- Horizontal pass ---
-    for (int y = 0; y < height; y++) {
-        const uint32_t* src = pixels + size_t(y) * width;
-        uint32_t* dst = tmp.data() + size_t(y) * width;
-        for (int x = 0; x < width; x++) {
-            int xl = (x > 0) ? x - 1 : x;
-            int xr = (x < width - 1) ? x + 1 : x;
-            uint32_t cl = src[xl], cc = src[x], cr = src[xr];
-            uint32_t rl = (cl >> 16) & 0xFF, gl = (cl >> 8) & 0xFF, bl = cl & 0xFF;
-            uint32_t rm = (cc >> 16) & 0xFF, gm = (cc >> 8) & 0xFF, bm = cc & 0xFF;
-            uint32_t rr = (cr >> 16) & 0xFF, gr = (cr >> 8) & 0xFF, br = cr & 0xFF;
-            uint32_t ro = (a * rl + b * rm + c * rr + round) >> shift;
-            uint32_t go = (a * gl + b * gm + c * gr + round) >> shift;
-            uint32_t bo = (a * bl + b * bm + c * br + round) >> shift;
-            dst[x] = (ro << 16) | (go << 8) | bo;
-        }
-    }
-
-    // --- Vertical pass ---
-    for (int x = 0; x < width; x++) {
-        for (int y = 0; y < height; y++) {
-            int yu = (y > 0) ? y - 1 : y;
-            int yd = (y < height - 1) ? y + 1 : y;
-            uint32_t cu = tmp[size_t(yu) * width + x];
-            uint32_t cm = tmp[size_t(y) * width + x];
-            uint32_t cd = tmp[size_t(yd) * width + x];
-            uint32_t rl = (cu >> 16) & 0xFF, gl = (cu >> 8) & 0xFF, bl = cu & 0xFF;
-            uint32_t rm = (cm >> 16) & 0xFF, gm = (cm >> 8) & 0xFF, bm = cm & 0xFF;
-            uint32_t rr = (cd >> 16) & 0xFF, gr = (cd >> 8) & 0xFF, br = cd & 0xFF;
-            uint32_t ro = (a * rl + b * rm + c * rr + round) >> shift;
-            uint32_t go = (a * gl + b * gm + c * gr + round) >> shift;
-            uint32_t bo = (a * bl + b * bm + c * br + round) >> shift;
-            pixels[size_t(y) * width + x] = (ro << 16) | (go << 8) | bo;
-        }
+        dc.DrawText(label_w_str, -1, &label_rc, DT_NOPREFIX | DT_CENTER | DT_VCENTER | DT_SINGLELINE);
     }
 }
 
@@ -1184,27 +1565,36 @@ void SpectrumCompareWindow::render_db_scale(CDCHandle dc, const RECT& bar_rc, co
     dc.LineTo(bar_rc.left, bar_rc.top);
     SelectObject(dc, oldPen);
 
-    // 2) dB 刻度：每 20dB 一格，再加上 0dB（顶部）和 floor（底部）
+    // 2) dB 刻度：交给 pick_ruler_ticks 按实测字高自适应挑选步长
     int dpi = m_dpi;
     auto scale = [dpi](int v) { return MulDiv(v, dpi, 96); };
-    int label_half_h = scale(8);
     int tick_len = scale(4);
 
     dc.SetTextColor(text_color);
     dc.SetBkMode(TRANSPARENT);
+    // 字体必须先选进 DC，pick_ruler_ticks 才能量到正确的标签尺寸
     SelectObjectScope fontScope(dc, (HGDIOBJ)m_callback->query_font_ex(ui_font_default));
 
-    // 每 10dB 一条刻度线，每 20dB 一档文字标签（避免 13 行文字太挤）
-    std::vector<int> db_ticks;
-    for (int db = 0; db >= (int)floor_db - 5; db -= 10) {
-        db_ticks.push_back(db);
-    }
+    // 因子数组，单位 dB，与 Spek 的 density_factors 完全一致。
+    // 原先是「每 10dB 画线 + 每 20dB 画字」的双重硬编码：色条矮时 13 档线
+    // 糊成一片，色条高时又白白浪费空间。现在步长随色条高度和字号自动伸缩。
+    static const int density_factors[] = { 1, 2, 5, 10, 20, 50, 0 };
+
+    // pick_ruler_ticks 要求 min_units < max_units 的递增区间，所以这里用
+    // 「衰减量」为单位（0 → 120），画的时候再翻回负 dB。
+    std::vector<int> ticks;
+    int label_h = pick_ruler_ticks(
+        dc, L"-00 dB", false, density_factors,
+        0, (int)dyn_range, 3.0, (double)bh / (double)dyn_range, ticks);
+    if (label_h <= 0) label_h = scale(16);
+    const int label_half_h = label_h / 2;
 
     CPen tickPen;
     tickPen.CreatePen(PS_SOLID, 1, grid_color);
     SelectObjectScope tickScope(dc, tickPen);
 
-    for (int db : db_ticks) {
+    for (int atten : ticks) {
+        const int db = -atten;
         // 线性 ratio：(dB - floor) / dyn_range  →  0dB=1.0, -120dB=0.0
         float ratio = ((float)db - floor_db) / dyn_range;
         if (ratio < 0) ratio = 0; if (ratio > 1) ratio = 1;
@@ -1212,19 +1602,17 @@ void SpectrumCompareWindow::render_db_scale(CDCHandle dc, const RECT& bar_rc, co
         int py = bar_rc.top + (int)((1.0f - ratio) * (bh - 1));
         if (py < bar_rc.top || py >= bar_rc.bottom) continue;
 
-        // Tick 小横线（所有人都画）
+        // Tick 小横线
         dc.MoveTo(bar_rc.left - tick_len, py);
         dc.LineTo(bar_rc.left, py);
 
-        // 文字标签：只在 20dB 倍数或 0 点画，防止 13 档文字太挤重叠
-        if (db == 0 || (db % 20 == 0)) {
-            pfc::string8 label;
-            if (db == 0) label = "0 dB";
-            else label << db;
-            pfc::stringcvt::string_wide_from_utf8 label_w(label);
-            CRect lr(label_rc.left, py - label_half_h, label_rc.right, py + label_half_h);
-            dc.DrawText(label_w, -1, &lr, DT_NOPREFIX | DT_LEFT | DT_VCENTER | DT_SINGLELINE);
-        }
+        // 文字标签：刻度已经按字高选过间距，这里不再需要额外的抽稀门控
+        pfc::string8 label;
+        if (db == 0) label = "0 dB";
+        else label << db;
+        pfc::stringcvt::string_wide_from_utf8 label_w(label);
+        CRect lr(label_rc.left, py - label_half_h, label_rc.right, py + label_half_h);
+        dc.DrawText(label_w, -1, &lr, DT_NOPREFIX | DT_LEFT | DT_VCENTER | DT_SINGLELINE);
     }
 }
 
@@ -1852,7 +2240,9 @@ void SpectrumCompareWindow::begin_inline_title_format_edit() {
 
     const int padding_outer = scale(8);
     const int label_height = scale(22);
-    const int freq_axis_width = m_show_freq_axis ? scale(48) : 0;
+    // 必须与 OnPaint 里的 freq_axis_width 完全一致，否则内联编辑框的
+    // 左边缘会和标题行错开。
+    const int freq_axis_width = m_show_freq_axis ? scale(60) : 0;
     const int time_axis_height = m_show_time_axis ? scale(20) : 0;
 
     int track_count = 0;

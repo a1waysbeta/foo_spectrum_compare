@@ -1,4 +1,4 @@
-#include "stdafx.h"
+﻿#include "stdafx.h"
 #include "palette.h"
 #include <cmath>
 #include <assert.h>

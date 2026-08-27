@@ -1,4 +1,4 @@
-#pragma once
+﻿#pragma once
 
 // ============================================================
 // i18n — Chinese / English string table for foo_spectrum_compare
