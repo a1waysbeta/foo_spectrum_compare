@@ -10,6 +10,99 @@
 SpectrumAnalyzer::SpectrumAnalyzer() {}
 SpectrumAnalyzer::~SpectrumAnalyzer() {}
 
+// ================================================================
+// T7：让表头能同时显示标称采样率和实际分析的 PCM 率
+//
+// 起因：DSD64 的表头显示 "2822400 Hz"，但频谱图的频率轴上限只到
+// 176400 Hz —— 因为 foobar 的 DSD 解码器跑了 FIR 抽取，真正进 FFT 的是
+// 352800 Hz 的 PCM（详见 F1 段）。表头和纵轴对不上，用户没法判断到底
+// 哪个是真的，也看不出自己在 foobar 里设的 DSD 输出速率生效成了多少。
+//
+// 为什么不能只加一个 titleformat 字段就完事：%samplerate% 由 foobar 从
+// **元数据**解析，我们无法改变它的取值。而真实 PCM 率只有解码器吐出第一
+// 个 chunk 之后才知道（F1 探测），这在时间上晚于原来格式化标题的位置。
+// 所以 T7 做了两件事：
+//   1) 把标题格式化从 analyze() 开头挪到 F1 探测之后（见下方调用点）；
+//   2) 用这个 hook 注入一个自定义字段，把探测到的值送进 titleformat。
+//
+// 字段命名 %analysis_samplerate%：故意带 analysis_ 前缀，既不会撞上
+// foobar 现有字段，也向用户表明"这是分析链路的值，不是文件属性"。
+//
+// process_field 的三态返回是这里的关键（sdk titleformat.cpp:111）：
+//   return true  + found=true   → 字段归我，有值，已写入
+//   return true  + found=false  → 字段归我，但**没值**，外层 [] 折叠掉
+//   return false                → 不认识，交给下一个 hook（file_info）
+// 第二种是实现"两率相同时整段消失"的机制：DSD 之外的绝大多数格式
+// 标称率 == PCM 率，此时再显示一遍纯属噪音，让 [] 自动收掉最干净。
+// 也正因为返回 false 会落到 file_info hook，%title%/%codec% 等标准字段
+// 完全不受影响。
+// ================================================================
+namespace {
+
+class analysis_info_hook : public titleformat_hook {
+public:
+    // pcm_rate：解码器实测值；nominal_rate：元数据标称值（0 = 未知）
+    analysis_info_hook(int pcm_rate, int nominal_rate)
+        : m_pcm_rate(pcm_rate), m_nominal_rate(nominal_rate) {}
+
+    bool process_field(titleformat_text_out* p_out, const char* p_name,
+                       t_size p_name_length, bool& p_found_flag) override {
+        if (pfc::stricmp_ascii_ex(p_name, p_name_length,
+                                  "analysis_samplerate", SIZE_MAX) == 0) {
+            // 相同则视为"无值"，让外层方括号把整段折叠掉。
+            // 探测失败(m_pcm_rate<=0)时同样折叠 —— 显示一个 0 比不显示更糟。
+            if (m_pcm_rate <= 0 || m_pcm_rate == m_nominal_rate) {
+                p_found_flag = false;
+                return true;
+            }
+            p_out->write_int(titleformat_inputtypes::unknown, m_pcm_rate);
+            p_found_flag = true;
+            return true;
+        }
+        p_found_flag = false;
+        return false;
+    }
+
+    bool process_function(titleformat_text_out*, const char*, t_size,
+                          titleformat_hook_function_params*, bool&) override {
+        return false;
+    }
+
+private:
+    const int m_pcm_rate;
+    const int m_nominal_rate;
+};
+
+} // namespace
+
+// 两条求值路径共用的实现（声明处有完整的动机说明）。
+//
+// 这里自己再取一次 file_info，而不是让调用方传进来：analyze() 手上确实
+// 已经有 info 了，但那次 get_info_async 相对于整轨解码（实测 214ms）是
+// 可忽略的开销，换来的是两条路径走**完全同一份**代码 —— 包括
+// "有 info 用 format_title_from_external_info、没有则退 format_title"
+// 这个分支。不然某天只改了一处，注入字段又会在另一条路径上悄悄消失。
+void SpectrumAnalyzer::format_track_title(metadb_handle_ptr track,
+                                          const service_ptr_t<titleformat_object>& script,
+                                          int pcm_rate, int nominal_rate,
+                                          std::string& out_title) {
+    if (!track.is_valid() || script.is_empty()) return;
+    try {
+        analysis_info_hook hook(pcm_rate, nominal_rate);
+        pfc::string8 title_tmp;
+        file_info_impl info;
+        if (track->get_info_async(info)) {
+            track->format_title_from_external_info(info, &hook, title_tmp, script, NULL);
+        } else {
+            track->format_title(&hook, title_tmp, script, NULL);
+        }
+        // 空结果不覆盖：调用方的兜底值（路径名 / 上一次的标题）比空白有用。
+        if (title_tmp.length() > 0) out_title = title_tmp.c_str();
+    } catch (...) {
+        // 同上，保持 out_title 原值
+    }
+}
+
 // 预计算窗函数表 —— 移植 Spek 的 coss[] 预计算思路。
 //
 // Spek 在 spek_pipeline_open() 里只算一次 cos 表：
@@ -69,28 +162,19 @@ bool SpectrumAnalyzer::analyze(metadb_handle_ptr track, SpectrumData& out, abort
     }
 
     if (got_info) {
-        out.sample_rate = (int)info.info_get_int("samplerate");
+        // 标称率：只进表头，不参与任何计算。out.sample_rate 稍后会被 F1
+        // 探测到的真实 PCM 率覆盖，而这个字段保留元数据原值。
+        out.source_sample_rate = (int)info.info_get_int("samplerate");
+        out.sample_rate = out.source_sample_rate;
         out.channels = (int)info.info_get_int("channels");
         out.duration = info.get_length();
     }
 
-    // Get title using the configured titleformat string
-    try {
-        titleformat_hook* hook = NULL;
-        service_ptr_t<titleformat_object> obj;
-        const char* fmt = m_title_format.empty() ? "%title%" : m_title_format.c_str();
-        static_api_ptr_t<titleformat_compiler>()->compile_safe(obj, fmt);
-        pfc::string8 title_tmp;
-        if (got_info) {
-            track->format_title_from_external_info(info, hook, title_tmp, obj, NULL);
-        } else {
-            track->format_title(hook, title_tmp, obj, NULL);
-        }
-        out.title = title_tmp.c_str();
-    } catch (...) {
-        out.title = pathStr.c_str();
-    }
-    if (out.title.empty()) out.title = pathStr.c_str();
+    // 兜底标题：真正的 titleformat 求值推迟到 F1 探测之后（T7），但下面
+    // 任何一步抛异常都会带着 out.title 去走错误显示路径，所以这里先放上
+    // 路径名。推迟的原因见上方 T7 段：%analysis_samplerate% 要等解码器
+    // 吐出第一个 chunk 才有值。
+    out.title = pathStr.c_str();
 
     try {
         // ================================================================
@@ -136,6 +220,42 @@ bool SpectrumAnalyzer::analyze(metadb_handle_ptr track, SpectrumData& out, abort
         int    n_seek = 0, n_fft = 0;
         int64_t decoded_samples = 0;   // 实际解码出来的样本数
 
+        // ================================================================
+        // T2：chunk 粒度统计 —— 已得出结论，保留为回归监控
+        //
+        // 【当初的疑问】
+        // 按设计每个 FFT 窗口只需解 preroll + nfft 个样本，改 T1 前是
+        // 4096 + 2048 = 6144，乘 1614 窗口 = 992 万，占整轨 7508 万的
+        // 132‰。但实测 decoded = 468‰，是需要量的 3.5 倍。
+        //
+        // 【实测结论：块粒度假说成立】
+        //     chunks 1606, avg 4704, max 4704, used 435/1000
+        // avg == max 是判定性的 —— 块大小**恒定**，不是偶发大块。
+        // 4704 = 352800/75，正好一个 1/75 秒的 DSD 帧。也就是说
+        // input.run() 每次吐出且仅吐出一整帧，我们只想要其中一段，
+        // 但整帧的解码成本已经付掉了。
+        //
+        // 三个数互相印证，说明这套计数是可信的：
+        //   chunks 1606 ≈ n_seek 1606 ≈ n_fft 1605  每窗口恰好一次
+        //   used = 2048/4704 = 435‰                  与实测完全吻合
+        //   used × 1606 × 4704 = 329 万 = 1605 × 2048 ✓
+        //
+        // 注意 used 的理论上限就是 nfft/块大小 = 435‰，不是我一度写的
+        // 667‰（那是拿 preroll+nfft=3072 当分母，但真实分母是整块 4704）。
+        // 换句话说 435‰ 已经**触到上限**，在"每窗口一次 seek"的框架下
+        // 没有剩余压缩空间了；要再降只能改框架（例如一次 seek 复用同一
+        // 块内的多个窗口）。
+        //
+        // 保留这三个计数器的价值：换格式/换采样率时块大小会变，而
+        // T5 的 preroll 是按它算的，这几个数能立刻暴露假设失效。
+        //   n_chunks     run() 返回次数，decoded/n_chunks = 平均块大小
+        //   max_chunk    与平均值对比，判断块大小是否恒定
+        //   used_samples 真正混音写进环形缓冲的样本数，即窗口内样本
+        // ================================================================
+        int     n_chunks = 0;          // input.run() 返回数据的次数
+        int     max_chunk = 0;         // 见过的最大 chunk（每声道样本数）
+        int64_t used_samples = 0;      // 真正进入环形缓冲的样本数
+
         {
             pfc::hires_timer tm; tm.start();
             input.open(NULL, track, decode_flags, abort);
@@ -147,10 +267,18 @@ bool SpectrumAnalyzer::analyze(metadb_handle_ptr track, SpectrumData& out, abort
         //
         // 元数据里的 samplerate 是文件的**原生**速率。对 DSD 来说那是
         // 1-bit 位流速率（DSD64 = 2822400），但 foobar 的 DSD 解码器会跑
-        // 一条 FIR 抽取滤波器，实际吐给我们的是 PCM —— DSD64 抽取成
-        // 352800 Hz，正好 1/8。Spek 头部那行 "352800 Hz" 就是这个值。
+        // 一条 FIR 抽取滤波器，实际吐给我们的是 PCM。
         //
-        // 拿错了会同时错三处（都源于同一个 8 倍因子）：
+        // 关键在于这个 PCM 速率**不是固定倍率、也无法从元数据推出来** ——
+        // 它取决于用户在 foobar 里设的 DSD 输出速率。实测一台设成 192000
+        // 的机器上，2822400 出来就是 192000（甚至不是整数分频，中间还过了
+        // 重采样）；换个人设成 352800 就会变成 352800。Spek 显示 352800 是
+        // 因为它走自己的 libavcodec 链，与 foobar 的偏好设置无关，所以两边
+        // 频率轴上限不同并不代表哪边错了。
+        //
+        // 结论：唯一可信的来源是解码器实际吐出的 audio_chunk。
+        //
+        // 拿错了会同时错三处（以 352800 为例，误差因子 8 倍）：
         //   1) 频率轴 Nyquist 算成 1411 kHz，真值是 176.4 kHz；
         //   2) total_samples 放大 8 倍 → stride 也放大 8 倍；
         //   3) seek 的 inv_rate 缩小 8 倍 → 落点只到目标位置的 1/8。
@@ -168,6 +296,9 @@ bool SpectrumAnalyzer::analyze(metadb_handle_ptr track, SpectrumData& out, abort
         // 必须回到起点而不能顺手把探测到的 chunk 用掉：第一列的 FFT 窗口
         // 就落在 [0, nfft)，吞掉开头几千个样本会让第一列失去数据。
         // ================================================================
+        // 探测到的解码块大小（每声道样本数），0 = 未知。T5 用它算 preroll。
+        int probe_chunk = 0;
+
         {
             audio_chunk_impl_temporary probe;
             pfc::hires_timer tm; tm.start();
@@ -179,6 +310,8 @@ bool SpectrumAnalyzer::analyze(metadb_handle_ptr track, SpectrumData& out, abort
                 // 只在探测到合法值时覆盖，元数据缺失时这里反而是唯一来源。
                 if (pcm_rate > 0) out.sample_rate = pcm_rate;
                 if (pcm_nch > 0) out.channels = pcm_nch;
+                // 顺手记下块大小：这一块反正已经解出来了，读它不花钱。
+                probe_chunk = (int)probe.get_sample_count();
             }
 
             // 回到起点。优先用 seek(0)，它比 close+open 便宜得多；
@@ -203,6 +336,27 @@ bool SpectrumAnalyzer::analyze(metadb_handle_ptr track, SpectrumData& out, abort
                 input.open(NULL, track, decode_flags, abort);
                 t_open += to.query();
             }
+        }
+
+        // ================================================================
+        // T7：真实 PCM 率已知，现在才能求值标题
+        //
+        // 必须在探测块之后：%analysis_samplerate% 的值来自
+        // out.sample_rate，而它刚刚被上面的 probe 覆盖成解码器实测值。
+        // 放在探测之前（T7 之前的位置）拿到的还是元数据标称值，那这整个
+        // 需求就没法实现。
+        //
+        // 具体注入方式见 format_track_title 及 analysis_info_hook 的注释。
+        // 失败降级：函数内部吞掉所有异常且不动 out.title，所以这里会保留
+        // 前面设好的路径名兜底 —— 表头没标题比整轨分析失败好得多。
+        // ================================================================
+        try {
+            service_ptr_t<titleformat_object> obj;
+            const char* fmt = m_title_format.empty() ? "%title%" : m_title_format.c_str();
+            static_api_ptr_t<titleformat_compiler>()->compile_safe(obj, fmt);
+            format_track_title(track, obj, out.sample_rate, out.source_sample_rate, out.title);
+        } catch (...) {
+            // compile_safe 抛异常，保留兜底路径名
         }
 
         FFTPlan fft(FFT_BITS);
@@ -287,19 +441,81 @@ bool SpectrumAnalyzer::analyze(metadb_handle_ptr track, SpectrumData& out, abort
         //      线性幅度，改为在**功率域**（幅度平方）累加平均，再开方
         //      回幅度 —— 这是能量上正确的平均方式，避免 dB 域平均把
         //      深谷过度加权（log 域平均会被极小值拉低，产生假暗条）。
-        //   2) 我们给每列的平均帧数设了上限 MAX_AVG_PER_COLUMN，并把这
-        //      些帧在整个 stride 区间内**均匀铺开**取样，而不是挤在区
-        //      间开头连续取。均匀铺开的帧彼此重叠更少、相关性更低，
-        //      降噪效果比连续取更接近 Spek 的非重叠平均。
+        //   2) Spek 平均区间内的**全部**非重叠 FFT（本例 85 次），我们
+        //      受解码预算限制只能取其中一部分，取法见下方 T6。
         // ================================================================
-        int avg_per_col = stride < MAX_AVG_PER_COLUMN ? stride : MAX_AVG_PER_COLUMN;
-        if (avg_per_col < 1) avg_per_col = 1;
 
-        // 在 [0, stride) 内均匀挑 avg_per_col 个 hop 索引参与平均。
-        // 例：stride=10, avg=4 → 命中 hop 序号 0, 2, 5, 7
-        std::vector<int> avg_hop_slots((size_t)avg_per_col);
-        for (int i = 0; i < avg_per_col; i++) {
-            avg_hop_slots[(size_t)i] = (int)((int64_t)i * stride / avg_per_col);
+        // ================================================================
+        // T6：把「取样点数」和「每点连发数」拆开
+        //
+        // 【问题】用户在采样率对齐后仍反馈"SC 还是更糊更噪"。
+        // 定量核对（Hotel California, DSD64 → 352800 Hz, 803 列）：
+        //     每列区间 = 1.399 亿 / 803 = 174220 样本（494 ms）
+        //     Spek 在区间内做 174220 / 2048 = 85 次非重叠 FFT
+        //     我们只做 2 次
+        // 换成画面上看得见的量（对数域噪声标准差 ≈ 4.34/sqrt(N) dB）：
+        //     N=2  → 3.07 dB 起伏（占 120 dB 调色板的 2.6%）
+        //     N=85 → 0.47 dB 起伏（0.4%）
+        // 差 6.5 倍。这同时解释了"糊"和"噪"—— 3 dB 的随机斑点糊在谐波
+        // 线上，主观感受就是线条发毛、不锐利。是同一个病。
+        //
+        // 【为什么不能直接把 N 提到 85】
+        // 每个取样点要付一次 seek + 一整块解码。85 个点 = decode 从
+        // 214ms 涨到 4 秒量级，等于把整轨解完，S3 的意义全丢了。
+        //
+        // 【解法：榨干块内空间，白拿一倍降噪】
+        // T2/T5 已确认解码器按固定整块计费（本例块 = 4704 恒定）。
+        // 那一整块反正都要解出来，所以块内能塞几个**非重叠** FFT 就
+        // 白拿几个 —— 第二次 FFT 的解码成本是零：
+        //     改前：preroll 2651 + nfft 2048        = 4699 → 1 次 FFT
+        //     改后：preroll  608 + nfft 2048 × 2    = 4704 → 2 次 FFT
+        // 取样点数仍是 2，decode 一个样本都不多解，N 却从 2 变成 4。
+        //
+        // 代价只有一个：preroll 从 2651 降到 608（T5 刚提上去的余量）。
+        // 这是把"FIR 收敛冗余"换成"确定的 1.41 倍降噪"。608 PCM 样本
+        // 对应 4864 个 DSD 样本的预热，与 T1 时期的 1024（8192 DSD）
+        // 同量级，而 T1 那版画面本身并无问题（当时的"变糊"已查明是
+        // 采样率量程变化所致，与 preroll 无关）。这笔交换是值得的。
+        //
+        // 注意 burst 的 FFT 必须**非重叠**（间隔 nfft 而不是 hop）：
+        //   - 重叠的 FFT 看的是几乎相同的样本，噪声高度相关，
+        //     平均下去几乎不降噪，1/sqrt(N) 根本不成立；
+        //   - 非重叠才能拿到独立样本，也正是 Spek 的做法
+        //     （其条件 frames % p->nfft == 0 就是每 nfft 步进一次）。
+        // 为此下面用 fft_end 的**绝对样本位置**来排布连发窗口，
+        // 而不是复用以 hop 为单位的 avg_hop_slots。
+        // ================================================================
+        int seek_points = stride < MAX_SEEK_POINTS_PER_COLUMN
+            ? stride : MAX_SEEK_POINTS_PER_COLUMN;
+        if (seek_points < 1) seek_points = 1;
+
+        // 一个解码块内装得下几个非重叠 nfft 窗口。
+        // probe_chunk 来自 F1 探测块（那一块本来就要解，读它零成本）。
+        // 探测不到时保守取 1，退化为 T5 的行为。
+        int burst = 1;
+        if (probe_chunk > 0) {
+            burst = probe_chunk / nfft;
+            if (burst < 1) burst = 1;
+            if (burst > MAX_BURST_PER_POINT) burst = MAX_BURST_PER_POINT;
+        }
+
+        // 连发窗口不能越过本列的时间区间，否则会偷到下一列的内容，
+        // 时间轴上表现为列间涂抹。区间长度 = stride * hop 个样本。
+        {
+            const int64_t col_span = (int64_t)stride * (int64_t)hop;
+            const int64_t span_per_point = col_span / seek_points;
+            int fit = (int)(span_per_point / (int64_t)nfft);
+            if (fit < 1) fit = 1;
+            if (burst > fit) burst = fit;
+        }
+
+        const int avg_per_col = seek_points * burst;
+
+        // 在 [0, stride) 内均匀挑 seek_points 个 hop 索引作为**连发起点**。
+        // 例：stride=10, seek_points=2 → 命中 hop 序号 0, 5
+        std::vector<int> avg_hop_slots((size_t)seek_points);
+        for (int i = 0; i < seek_points; i++) {
+            avg_hop_slots[(size_t)i] = (int)((int64_t)i * stride / seek_points);
         }
 
         // ================================================================
@@ -414,10 +630,12 @@ bool SpectrumAnalyzer::analyze(metadb_handle_ptr track, SpectrumData& out, abort
         // 而其中真正被 FFT 用到的样本占比极低。
         //
         // 实际需要的样本量有多少？我们总共只做
-        //     columns × avg_per_col = 800 × 2 = 1600 次 FFT，
-        // 每次 FFT 只需要窗口内 nfft = 2048 个连续样本，
-        // 合计 1600 × 2048 ≈ 328 万个样本 —— 占 8.5 亿的 0.4%。
-        // 也就是说 99.6% 的逐样本工作是纯粹浪费。
+        //     columns × avg_per_col = 800 × 4 = 3200 次 FFT，
+        // 每次 FFT 只需要窗口内 nfft = 2048 个连续样本。其中每个取样点
+        // 的 burst 次 FFT 是首尾相接的，合计需要
+        //     columns × seek_points × nfft × burst = 800×2×2048×2 ≈ 655 万
+        // 个样本 —— 占 8.5 亿的 0.8%。
+        // 也就是说 99.2% 的逐样本工作是纯粹浪费。
         //
         // Spek 之所以不受这个问题困扰，是因为它把解码放在 reader 线程、
         // FFT 放在 worker 线程（spek-pipeline.cc reader_func/worker_func），
@@ -430,33 +648,55 @@ bool SpectrumAnalyzer::analyze(metadb_handle_ptr track, SpectrumData& out, abort
         // 跳过一段后 contig 归零，保证不会用不连续的数据做 FFT。
         // ================================================================
 
-        // 逐列、逐平均槽位地推进「下一个 FFT 窗口的结束样本位置」。
-        // 第 c 列第 s 个平均槽的 hop 序号为 c*stride + avg_hop_slots[s]，
-        // 该 hop 的窗口右边界（不含）= (hop_index + 1) * hop。
+        // 逐列、逐取样点、逐连发序号地推进「下一个 FFT 窗口的结束位置」。
+        // 第 c 列第 s 个取样点的 hop 序号为 c*stride + avg_hop_slots[s]，
+        // 该 hop 的窗口右边界（不含）= (hop_index + 1) * hop；
+        // 点内第 b 个连发窗口再往后错开 b*nfft 个样本（非重叠，见 T6）。
         int cur_col = 0;
-        int cur_slot = 0;
+        int cur_point = 0;
+        int cur_burst = 0;
 
         // ================================================================
-        // 一个被评估后**否决**的改法，记录在此避免以后重复踩
+        // 一个被否决的改法，以及 T6 如何把它的洞察换了个方向用
         //
-        // 曾考虑把同一列的 avg_per_col 个平均窗口从「在 stride 区间内均匀
-        // 铺开」改成「首尾相接的连续块」，这样每列只需 1 次 seek，seek 次
-        // 数从 1600 降到 800。算完成本才发现不值得：
+        // 【被否决的版本：用连续块**取代**均匀铺开】
+        // 曾考虑把同一列的两个平均窗口从「在 stride 区间内均匀铺开」改成
+        // 「首尾相接的连续块」，这样每列只需 1 次 seek，seek 次数从 1600
+        // 降到 800。
         //
-        //   均匀铺开：1600 次 seek × (2048 窗口 + 4096 预热) ≈ 983 万样本
-        //   连续块：   800 次 seek × (4096 窗口 + 4096 预热) ≈ 655 万样本
+        // 当初按「每样本计费」估算，以为能省 1.5 倍（983 万 → 655 万样本），
+        // 结论是"省 0.4% 不值得动画质"。T2 量出解码器**按整块计费**
+        // （块 4704 恒定）之后重算，连这 1.5 倍都不存在：
         //
-        // 只差 1.5 倍，而两者相对原来的 8.47 亿都是百倍量级的改进 ——
-        // 省下的那 328 万样本占总量的 0.4%，完全不值得动画质。
+        //   均匀铺开：preroll+2048 = 4704 → 1 块/取样点
+        //             1600 次 × 4704 = 753 万样本
+        //   连续块：  preroll+4096 = 6752 → 跨 2 块
+        //             800 次 × 9408 = 753 万样本
         //
-        // 代价那边却是实打实的：均匀铺开让两个窗口落在该列 106 万样本时间
-        // 区间的两端，对区间内容的代表性明显更好；改成连续块后一列只反映
-        // 4096 个样本（区间的 0.4%）那一瞬间的频谱，遇到列内有瞬态/切换
-        // 时更容易采偏。
+        // 完全相等 —— 少一半 seek 次数，但每次要多跨一个块，两者精确抵消。
+        // 所以作为**替代**方案它是纯粹的画质损失、零收益：一列只反映
+        // 4096 个样本（区间的 2.4%）那一瞬间，遇到列内有瞬态时容易采偏，
+        // 而均匀铺开的两个窗口落在区间两端，代表性明显更好。
         //
-        // 所以窗口位置**一个字节都不动**：S3 只改「怎么把样本取到手」，
-        // 不改「取哪些样本」。这样验证也简单 —— 画面若有任何变化，那就是
-        // seek 有 bug，而不是设计取舍。
+        // 【T6 采纳的版本：连续块**叠加**在均匀铺开之上】
+        // 上面那笔账里藏着一个正面结论：连续块方案的 6752 个样本仍然只
+        // 跨 2 个块，也就是说**一个块里塞得下两个非重叠 FFT 而不多付钱**。
+        // 既然如此，就不要用连续块去替换均匀铺开（那是拿画质换零收益），
+        // 而是在**保留** 2 个均匀铺开取样点的前提下，让每个点在自己那一
+        // 块内多做一次 FFT：
+        //     2 个点 × 每点 2 次连发 = 每列 4 帧平均
+        //     解码量 1600 × 4704 = 753 万样本（与改前**完全相同**）
+        // 时间代表性一点没丢（取样点位置不变），噪声降 sqrt(2) 倍。
+        //
+        // 所以取样点位置**一个字节都不动**：S3/T5 只改「怎么把样本取到
+        // 手」。T6 是唯一动了窗口集合的改动 —— 它只**新增**窗口，不移动
+        // 任何已有窗口，且新增的都落在已付费的块内。
+        //
+        // 【"画面变了就是 seek 有 bug"这条判据要小心用】
+        // 实测踩过一次：改 preroll 的同一轮里画面确实变糊了，当时差点去查
+        // seek，结果是用户同时把 foobar 的 DSD 输出速率从 192000 改成了
+        // 352800，Nyquist 从 96k 变 176.4k，轴量程变了。用这条判据之前，
+        // 必须先确认 R4 日志里的采样率那一项没变。
         // ================================================================
 
         // 返回当前待处理 FFT 的窗口结束位置（全局样本下标）；
@@ -464,8 +704,12 @@ bool SpectrumAnalyzer::analyze(metadb_handle_ptr track, SpectrumData& out, abort
         auto next_fft_end = [&]() -> int64_t {
             if (cur_col >= columns) return -1;
             const int64_t hop_index =
-                (int64_t)cur_col * stride + avg_hop_slots[(size_t)cur_slot];
-            return (hop_index + 1) * (int64_t)hop;
+                (int64_t)cur_col * stride + avg_hop_slots[(size_t)cur_point];
+            // 连发窗口紧邻排列、互不重叠：+ b*nfft。
+            // 用绝对样本偏移而不是 hop 偏移 —— hop 只有 nfft/2，按 hop
+            // 排会让相邻窗口重叠 50%，噪声高度相关，平均下去不降噪。
+            return (hop_index + 1) * (int64_t)hop
+                 + (int64_t)cur_burst * (int64_t)nfft;
         };
 
         // ================================================================
@@ -480,8 +724,8 @@ bool SpectrumAnalyzer::analyze(metadb_handle_ptr track, SpectrumData& out, abort
         //   1) 预热（preroll）。解码器 seek 之后内部滤波器/预测器状态是重
         //      置过的，紧随其后的头几百个样本可能带瞬态或衰减。我们落到
         //      窗口**前面** preroll 个样本处，让这段照常解码但直接丢弃，
-        //      只用它把解码器状态喂热。代价是解码量翻倍（0.4% → 0.8%），
-        //      相对 200 多倍的收益完全可以忽略。
+        //      只用它把解码器状态喂热。见下方 T5：由于解码器按整块计费，
+        //      这段预热在「块大小 - nfft」以内时是**完全免费**的。
         //
         //   2) 门槛（seek_threshold）。一次 seek 要付文件定位 + 解码器复位
         //      + 可能的帧重解，大致相当于解码几千个样本。间隔太小时顺序读
@@ -499,7 +743,71 @@ bool SpectrumAnalyzer::analyze(metadb_handle_ptr track, SpectrumData& out, abort
             seekable = false;
         }
         const double inv_rate = out.sample_rate > 0 ? 1.0 / (double)out.sample_rate : 0.0;
-        const int64_t preroll = (int64_t)nfft * 2;
+
+        // ================================================================
+        // T5：preroll 取"整块内免费"的最大值（T6 起要为连发窗口让位）
+        //
+        // 【T1 的两个结论都被实测推翻了，记录在这里避免重犯】
+        //
+        // T1 把 preroll 从 nfft*2(4096) 降到 nfft/2(1024)，当时写的理由是
+        // "每窗口取样量 6144 → 3072，直接砍半"，并断言"只影响丢弃掉的样本，
+        // 画面必须与改前完全一致"。两句话都错：
+        //
+        //   错误一：成本不是线性的。T2 的 chunk 统计量出
+        //           chunks 1606, avg 4704, max 4704
+        //   avg == max 说明解码器**按固定整块计费**（4704 = 352800/75，
+        //   正好一个 1/75 秒的 DSD 帧）。所以真实成本只看"跨几个块"：
+        //       preroll + nfft*burst ≤ 4704  → 1 块
+        //       preroll + nfft*burst ≤ 9408  → 2 块
+        //   改前 6144 落在 2 块，改后 3072 落在 1 块。收益是**台阶式的
+        //   2 倍**，与 preroll 具体取 1024 还是 2000 无关。
+        //
+        //   错误二：用户实测"画面变糊了"。但归因也错了 —— 那一轮用户同时
+        //   把 foobar 的 DSD 输出从 192000 改成了 352800，频率轴顶端
+        //   (Nyquist) 从 96k 变成 176.4k。FFT 点数固定 2048，于是每个 bin
+        //   从 93.75 Hz 变成 172.3 Hz，且 0-20kHz 的乐音区被压进原来 54%
+        //   的高度。变糊是轴量程变化的必然结果，与 preroll 无关。
+        //
+        // 【块内空间怎么分配】
+        // 一整块反正都要解出来，所以块内的每个样本都是已付费的。T5 起
+        // 把整块吃满，但"吃满"有两种花法，T6 改了优先级：
+        //
+        //   T5：全给预热。preroll 2651 + nfft 2048 = 4699，1 次 FFT。
+        //   T6：先喂 FFT，剩下的给预热。
+        //       preroll 603 + nfft 2048 × 2 = 4699，2 次 FFT。
+        //
+        // 两者解码量完全相同（都是 1 块），但后者每列的平均帧数翻倍，
+        // 换来 sqrt(2) ≈ 1.41 倍降噪。预热只需让解码器 FIR 收敛，几百
+        // 个样本足够（603 PCM = 4864 个 DSD 样本），把上千个样本囤在
+        // 预热区是浪费 —— 那些配额喂给 FFT 才有画质回报。
+        //
+        // probe_chunk 来自 F1 探测块（那一块本来就要解，读它零成本）。
+        // 探测失败时退回 nfft/2，即 T1 的保守值。
+        //
+        // 【probe_chunk 偏差的方向是安全的】
+        // 实测 preroll 算出 2651 而非预期的 2656，反推 probe_chunk = 4699，
+        // 比稳态 4704 少 5 个样本 —— 解码器吐出的**第一块**偏短（DSD 抽取
+        // FIR 通常会在起点扣掉自己的群延迟做对齐，5 个 PCM 样本 = 40 个
+        // DSD 样本，量级吻合）。偏小恰好落在安全的一侧：算出的 preroll
+        // 偏保守，仍在 1 块内。反方向（首块比稳态**大**）才危险，会让
+        // preroll+nfft*burst 跨过块边界使 decode 翻倍。这个风险已经可
+        // 观测：R4 日志同时打了 preroll、burst 和 avg，只要
+        //     preroll + 2048*burst ≤ avg
+        // 成立就没跨块，换格式或换采样率时看一眼这三个数即可。
+        // ================================================================
+        int64_t preroll = (int64_t)nfft / 2;
+        {
+            // FFT 窗口先占坑，剩下的才是预热配额。
+            const int64_t fft_room = (int64_t)nfft * burst;
+            if ((int64_t)probe_chunk > fft_room) {
+                const int64_t free_room = (int64_t)probe_chunk - fft_room;
+                // 上限夹紧：块特别大时(某些格式一次吐几十万样本)会让
+                // preroll 大到毫无意义 —— FIR 收敛只需几百个样本，
+                // nfft*2 已是数倍冗余，再多纯属浪费。
+                const int64_t preroll_cap = (int64_t)nfft * 2;
+                preroll = free_room < preroll_cap ? free_room : preroll_cap;
+            }
+        }
         const int64_t seek_threshold = (int64_t)nfft * 8;
 
         int64_t fft_end = next_fft_end();
@@ -570,6 +878,8 @@ bool SpectrumAnalyzer::analyze(metadb_handle_ptr track, SpectrumData& out, abort
             int nsamples = pfc::downcast_guarded<int, t_size>(chunk.get_sample_count());
             if (nch <= 0) continue;
             decoded_samples += nsamples;
+            n_chunks++;
+            if (nsamples > max_chunk) max_chunk = nsamples;
 
             // 声道平均用倒数乘替代除法：浮点除法约 14 周期且不流水，
             // 乘法 4 周期且可向量化。
@@ -620,6 +930,7 @@ bool SpectrumAnalyzer::analyze(metadb_handle_ptr track, SpectrumData& out, abort
                     if (contig < bufsz) contig++;
                 }
                 pos += take;
+                used_samples += take;
 
                 // ---- 阶段 C：窗口填满 → 做 FFT，并推进到下一个目标 ----
                 if (pos >= fft_end) {
@@ -627,14 +938,22 @@ bool SpectrumAnalyzer::analyze(metadb_handle_ptr track, SpectrumData& out, abort
                         run_fft_into_accum();
                     }
 
-                    cur_slot++;
-                    if (cur_slot >= avg_per_col) {
-                        // 本列的平均槽位都取完了，输出这一列
-                        cur_slot = 0;
-                        if (acc_count > 0) {
-                            flush_column();
+                    // 两层推进：先走完本取样点的所有连发窗口，再换点。
+                    // 连发窗口在样本上紧邻，所以 phase 0 的 seek 门槛判断
+                    // 会发现"已经在位置上"而不 seek，直接顺序读下去 ——
+                    // 这正是连发不额外花解码成本的原因。
+                    cur_burst++;
+                    if (cur_burst >= burst) {
+                        cur_burst = 0;
+                        cur_point++;
+                        if (cur_point >= seek_points) {
+                            // 本列的取样点都取完了，输出这一列
+                            cur_point = 0;
+                            if (acc_count > 0) {
+                                flush_column();
+                            }
+                            cur_col++;
                         }
-                        cur_col++;
                     }
                     fft_end = next_fft_end();
                 }
@@ -683,6 +1002,23 @@ bool SpectrumAnalyzer::analyze(metadb_handle_ptr track, SpectrumData& out, abort
         //   接近 1.0  → seek 没起作用（或退回了顺序跳读），整轨都在解码；
         //   远小于 1.0 → seek 生效，只解码了窗口附近的样本。
         // DSD64 五分钟约 8.5 亿样本，理想值在 1% 上下。
+        //
+        // T2 追加的三个数用来解释 decoded 为何远高于理论值（见上方 T2 注释）：
+        //   chunks   run() 返回数据的次数
+        //   avg      decoded/chunks，即平均块大小 —— 判定性的那个数
+        //   max      最大块，用来区分块大小恒定还是偶发大块
+        //   used     真正进 FFT 的样本占解码量的千分比。因为解码器按整块
+        //            计费，理论上限是 nfft*burst/块大小（本例 4096/4704 =
+        //            870‰），**不是** nfft/(preroll+nfft)。
+        //   preroll  T6 算出来的实际预热长度（块内喂完 FFT 后的余量）。
+        //   burst    每个取样点连发几次非重叠 FFT，由块大小算出。
+        //   avgN     每列实际平均的帧数 = seek_points × burst。画面噪声
+        //            按 4.34/sqrt(avgN) dB 走，Spek 在本例是 85。
+        //
+        // 【换格式/换采样率时的自检公式】
+        //     preroll + 2048 * burst ≤ avg
+        // 成立说明每个取样点仍只解 1 个块。一旦不成立就是跨块了，
+        // decode 会成倍上涨 —— 这三个数就是为了让这件事一眼可见。
         // ================================================================
         {
             const double total_ms = t_total.query() * 1000.0;
@@ -690,12 +1026,20 @@ bool SpectrumAnalyzer::analyze(metadb_handle_ptr track, SpectrumData& out, abort
             const int decoded_permille = planned > 0
                 ? (int)((int64_t)1000 * decoded_samples / planned)
                 : 0;
+            const int avg_chunk = n_chunks > 0
+                ? (int)(decoded_samples / n_chunks)
+                : 0;
+            const int used_permille = decoded_samples > 0
+                ? (int)((int64_t)1000 * used_samples / decoded_samples)
+                : 0;
             const double other_ms = total_ms
                 - (t_open + t_seek + t_decode + t_fft) * 1000.0;
             console::printf(
                 "spectrum_compare: %s | %ims total"
                 " (open %i, seek %i x%i, decode %i, fft %i x%i, other %i)"
-                " | %i Hz %ich, %i cols, decoded %i/1000 of stream",
+                " | %i Hz %ich, %i cols, decoded %i/1000 of stream"
+                " | chunks %i, avg %i, max %i, used %i/1000 of decoded"
+                " | preroll %i, burst %i, avgN %i",
                 out.title.c_str(),
                 (int)total_ms,
                 (int)(t_open * 1000.0),
@@ -704,7 +1048,9 @@ bool SpectrumAnalyzer::analyze(metadb_handle_ptr track, SpectrumData& out, abort
                 (int)(t_fft * 1000.0), n_fft,
                 (int)(other_ms < 0 ? 0 : other_ms),
                 out.sample_rate, out.channels,
-                out.time_frames, decoded_permille);
+                out.time_frames, decoded_permille,
+                n_chunks, avg_chunk, max_chunk, used_permille,
+                (int)preroll, burst, avg_per_col);
         }
 
         return true;

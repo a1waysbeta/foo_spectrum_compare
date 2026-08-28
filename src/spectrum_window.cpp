@@ -583,6 +583,11 @@ void SpectrumCompareWindow::analysis_worker(metadb_handle_ptr handle, std::share
             dst.track_path = data.track_path;
             dst.title = data.title;
             dst.sample_rate = data.sample_rate;
+            // 标称率也要带过来：refresh_track_titles() 重算标签时需要它和
+            // sample_rate 比较，才能决定 %analysis_samplerate% 是显示还是
+            // 折叠。漏掉这一行的后果是它恒等于 0（!= 真实率），于是 DSD
+            // 之外的普通 PCM 文件也会多显示一段重复的采样率。
+            dst.source_sample_rate = data.source_sample_rate;
             dst.channels = data.channels;
             dst.duration = data.duration;
             dst.fft_size = data.fft_size;
@@ -662,21 +667,13 @@ void SpectrumCompareWindow::refresh_track_titles() {
         std::lock_guard<std::mutex> lock(m_tracks_mutex);
         for (auto& t : m_tracks) {
             if (!t->handle.is_valid() || !t->data.ready) continue;
-            try {
-                titleformat_hook* hook = NULL;
-                pfc::string8 title_tmp;
-                file_info_impl info;
-                if (t->handle->get_info_async(info)) {
-                    t->handle->format_title_from_external_info(info, hook, title_tmp, obj, NULL);
-                } else {
-                    t->handle->format_title(hook, title_tmp, obj, NULL);
-                }
-                if (title_tmp.length() > 0) {
-                    t->data.title = title_tmp.c_str();
-                }
-            } catch (...) {
-                // keep old title on failure
-            }
+            // 走 analyze() 用的同一个函数，把 %analysis_samplerate% 一起
+            // 注入（T7）。这里两个速率取自这条轨道**已完成的**分析结果，
+            // 所以改格式串不需要重新解码就能保持数值正确。
+            SpectrumAnalyzer::format_track_title(t->handle, obj,
+                                                 t->data.sample_rate,
+                                                 t->data.source_sample_rate,
+                                                 t->data.title);
         }
     }
 

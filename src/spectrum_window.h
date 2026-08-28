@@ -14,9 +14,22 @@ static const GUID guid_spectrum_compare =
 static const wchar_t* SPECTRUM_WND_CLASS = L"{SpectrumCompare-8F3A2B1C-4D5E-6F7A-8B9C-0D1E2F3A4B5C}";
 
 // Default title format string (foobar2000 titleformat syntax)
+//
+// %analysis_samplerate% 不是 foobar 的标准字段，是我们自己注入的
+// （见 spectrum_analyzer.cpp 的 T7 段）：%samplerate% 来自元数据的
+// 标称值，而这个是解码器实际吐出、真正进 FFT 的 PCM 率。
+//
+// 之所以要两个都显示：DSD64 标称 2822400 Hz，但 foobar 的 DSD 解码器
+// 会抽取成 PCM（速率取决于用户在 foobar 首选项里设的 DSD 输出速率），
+// 频谱图的频率轴上限是**后者**的一半。只显示标称值会让表头和纵轴对不上。
+//
+// 用方括号包起来是关键：两率相同时（绝大多数 PCM 格式）hook 会报"无值"，
+// 整段 " -> ... Hz" 自动消失，表头不会多出一堆冗余文字。
 static const char* DEFAULT_TITLE_FORMAT =
     "%title% | %codec% | %bitrate% kbps"
-    "[ | $info(bitspersample) bit] | %samplerate% Hz | $info(channels) CH | %path%";
+    "[ | $info(bitspersample) bit] | %samplerate% Hz"
+    "[ \xe2\x86\x92 %analysis_samplerate% Hz]"
+    " | $info(channels) CH | %path%";
 
 // Config storage GUIDs — 5 persisted settings.  The numerical values and
 // relative order of the palette/max_tracks/axis/title entries are part
