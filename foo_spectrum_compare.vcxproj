@@ -62,7 +62,12 @@
   <ImportGroup Condition="'$(Configuration)|$(Platform)'=='Debug|x64'" Label="PropertySheets">
     <Import Project="$(UserRootDir)\Microsoft.Cpp.$(Platform).user.props" Condition="exists('$(UserRootDir)\Microsoft.Cpp.$(Platform).user.props')" Label="LocalAppDataPlatform" />
   </ImportGroup>
-  <PropertyGroup Label="UserMacros" />
+  <PropertyGroup Label="UserMacros">
+    <!-- Maps MSBuild Platform (Win32/x64) to the outdir prefix used when
+         building SDK dependencies via /p:OutDir=x86\... or x64\... -->
+    <LibArchDir Condition="'$(Platform)'=='Win32'">x86</LibArchDir>
+    <LibArchDir Condition="'$(Platform)'=='x64'">x64</LibArchDir>
+  </PropertyGroup>
   <PropertyGroup>
     <_ProjectFileVersion>10.0.30319.1</_ProjectFileVersion>
     <OutDir Condition="'$(Configuration)|$(Platform)'=='Debug|Win32'">$(SolutionDir)$(Configuration)\</OutDir>
@@ -85,17 +90,17 @@
       <PrecompiledHeaderFile>stdafx.h</PrecompiledHeaderFile>
       <WarningLevel>Level3</WarningLevel>
       <DebugInformationFormat>ProgramDatabase</DebugInformationFormat>
-      <AdditionalIncludeDirectories>sdk\foobar2000;sdk;%(AdditionalIncludeDirectories)</AdditionalIncludeDirectories>
+      <AdditionalIncludeDirectories>lib\columns_ui;lib\columns_ui\foobar2000;lib\columns_ui\foobar2000\SDK;lib\columns_ui\foobar2000\helpers;lib\columns_ui\pfc;lib\columns_ui\libPPUI;%(AdditionalIncludeDirectories)</AdditionalIncludeDirectories>
       <FloatingPointModel>Fast</FloatingPointModel>
       <LanguageStandard>stdcpp17</LanguageStandard>
+      <AdditionalOptions>/utf-8 %(AdditionalOptions)</AdditionalOptions>
       <PreprocessorDefinitions>_WIN32_WINNT=0x0601;%(PreprocessorDefinitions)</PreprocessorDefinitions>
     </ClCompile>
     <Link>
       <GenerateDebugInformation>true</GenerateDebugInformation>
       <SubSystem>Windows</SubSystem>
       <RandomizedBaseAddress>false</RandomizedBaseAddress>
-      <AdditionalLibraryDirectories>sdk\foobar2000\shared;%(AdditionalLibraryDirectories)</AdditionalLibraryDirectories>
-      <AdditionalDependencies>shared-$(Platform).lib;%(AdditionalDependencies)</AdditionalDependencies>
+      <AdditionalDependencies>$(ProjectDir)lib\columns_ui\pfc\$(LibArchDir)\pfc\pfc.lib;$(ProjectDir)lib\columns_ui\foobar2000\SDK\$(LibArchDir)\foobar2000_SDK\foobar2000_SDK.lib;$(ProjectDir)lib\columns_ui\foobar2000\helpers\$(LibArchDir)\helpers\foobar2000_sdk_helpers.lib;$(ProjectDir)lib\columns_ui\libPPUI\$(LibArchDir)\libPPUI\libPPUI.lib;$(ProjectDir)lib\columns_ui\foobar2000\shared\shared-$(Platform).lib;%(AdditionalDependencies)</AdditionalDependencies>
     </Link>
   </ItemDefinitionGroup>
   <ItemDefinitionGroup Condition="'$(Configuration)|$(Platform)'=='Debug|x64'">
@@ -107,17 +112,17 @@
       <PrecompiledHeaderFile>stdafx.h</PrecompiledHeaderFile>
       <WarningLevel>Level3</WarningLevel>
       <DebugInformationFormat>ProgramDatabase</DebugInformationFormat>
-      <AdditionalIncludeDirectories>sdk\foobar2000;sdk;%(AdditionalIncludeDirectories)</AdditionalIncludeDirectories>
+      <AdditionalIncludeDirectories>lib\columns_ui;lib\columns_ui\foobar2000;lib\columns_ui\foobar2000\SDK;lib\columns_ui\foobar2000\helpers;lib\columns_ui\pfc;lib\columns_ui\libPPUI;%(AdditionalIncludeDirectories)</AdditionalIncludeDirectories>
       <FloatingPointModel>Fast</FloatingPointModel>
       <LanguageStandard>stdcpp17</LanguageStandard>
+      <AdditionalOptions>/utf-8 %(AdditionalOptions)</AdditionalOptions>
       <PreprocessorDefinitions>_WIN32_WINNT=0x0601;%(PreprocessorDefinitions)</PreprocessorDefinitions>
     </ClCompile>
     <Link>
       <GenerateDebugInformation>true</GenerateDebugInformation>
       <SubSystem>Windows</SubSystem>
       <RandomizedBaseAddress>false</RandomizedBaseAddress>
-      <AdditionalLibraryDirectories>sdk\foobar2000\shared;%(AdditionalLibraryDirectories)</AdditionalLibraryDirectories>
-      <AdditionalDependencies>shared-$(Platform).lib;%(AdditionalDependencies)</AdditionalDependencies>
+      <AdditionalDependencies>$(ProjectDir)lib\columns_ui\pfc\$(LibArchDir)\pfc\pfc.lib;$(ProjectDir)lib\columns_ui\foobar2000\SDK\$(LibArchDir)\foobar2000_SDK\foobar2000_SDK.lib;$(ProjectDir)lib\columns_ui\foobar2000\helpers\$(LibArchDir)\helpers\foobar2000_sdk_helpers.lib;$(ProjectDir)lib\columns_ui\libPPUI\$(LibArchDir)\libPPUI\libPPUI.lib;$(ProjectDir)lib\columns_ui\foobar2000\shared\shared-$(Platform).lib;%(AdditionalDependencies)</AdditionalDependencies>
     </Link>
   </ItemDefinitionGroup>
   <ItemDefinitionGroup Condition="'$(Configuration)|$(Platform)'=='Release|Win32'">
@@ -129,10 +134,11 @@
       <DebugInformationFormat>ProgramDatabase</DebugInformationFormat>
       <FunctionLevelLinking>true</FunctionLevelLinking>
       <IntrinsicFunctions>true</IntrinsicFunctions>
-      <AdditionalIncludeDirectories>sdk\foobar2000;sdk;%(AdditionalIncludeDirectories)</AdditionalIncludeDirectories>
+      <AdditionalIncludeDirectories>lib\columns_ui;lib\columns_ui\foobar2000;lib\columns_ui\foobar2000\SDK;lib\columns_ui\foobar2000\helpers;lib\columns_ui\pfc;lib\columns_ui\libPPUI;%(AdditionalIncludeDirectories)</AdditionalIncludeDirectories>
       <FloatingPointModel>Fast</FloatingPointModel>
       <PreprocessorDefinitions>NDEBUG;_WINDLL;_WIN32_WINNT=0x0601;%(PreprocessorDefinitions)</PreprocessorDefinitions>
       <LanguageStandard>stdcpp17</LanguageStandard>
+      <AdditionalOptions>/utf-8 %(AdditionalOptions)</AdditionalOptions>
     </ClCompile>
     <Link>
       <GenerateDebugInformation>true</GenerateDebugInformation>
@@ -140,8 +146,7 @@
       <OptimizeReferences>true</OptimizeReferences>
       <EnableCOMDATFolding>true</EnableCOMDATFolding>
       <RandomizedBaseAddress>false</RandomizedBaseAddress>
-      <AdditionalLibraryDirectories>sdk\foobar2000\shared;%(AdditionalLibraryDirectories)</AdditionalLibraryDirectories>
-      <AdditionalDependencies>shared-$(Platform).lib;%(AdditionalDependencies)</AdditionalDependencies>
+      <AdditionalDependencies>$(ProjectDir)lib\columns_ui\pfc\$(LibArchDir)\pfc\pfc.lib;$(ProjectDir)lib\columns_ui\foobar2000\SDK\$(LibArchDir)\foobar2000_SDK\foobar2000_SDK.lib;$(ProjectDir)lib\columns_ui\foobar2000\helpers\$(LibArchDir)\helpers\foobar2000_sdk_helpers.lib;$(ProjectDir)lib\columns_ui\libPPUI\$(LibArchDir)\libPPUI\libPPUI.lib;$(ProjectDir)lib\columns_ui\foobar2000\shared\shared-$(Platform).lib;%(AdditionalDependencies)</AdditionalDependencies>
     </Link>
   </ItemDefinitionGroup>
   <ItemDefinitionGroup Condition="'$(Configuration)|$(Platform)'=='Release|x64'">
@@ -153,10 +158,11 @@
       <DebugInformationFormat>ProgramDatabase</DebugInformationFormat>
       <FunctionLevelLinking>true</FunctionLevelLinking>
       <IntrinsicFunctions>true</IntrinsicFunctions>
-      <AdditionalIncludeDirectories>sdk\foobar2000;sdk;%(AdditionalIncludeDirectories)</AdditionalIncludeDirectories>
+      <AdditionalIncludeDirectories>lib\columns_ui;lib\columns_ui\foobar2000;lib\columns_ui\foobar2000\SDK;lib\columns_ui\foobar2000\helpers;lib\columns_ui\pfc;lib\columns_ui\libPPUI;%(AdditionalIncludeDirectories)</AdditionalIncludeDirectories>
       <FloatingPointModel>Fast</FloatingPointModel>
       <PreprocessorDefinitions>NDEBUG;_WINDLL;_WIN32_WINNT=0x0601;%(PreprocessorDefinitions)</PreprocessorDefinitions>
       <LanguageStandard>stdcpp17</LanguageStandard>
+      <AdditionalOptions>/utf-8 %(AdditionalOptions)</AdditionalOptions>
     </ClCompile>
     <Link>
       <GenerateDebugInformation>true</GenerateDebugInformation>
@@ -164,8 +170,7 @@
       <OptimizeReferences>true</OptimizeReferences>
       <EnableCOMDATFolding>true</EnableCOMDATFolding>
       <RandomizedBaseAddress>false</RandomizedBaseAddress>
-      <AdditionalLibraryDirectories>sdk\foobar2000\shared;%(AdditionalLibraryDirectories)</AdditionalLibraryDirectories>
-      <AdditionalDependencies>shared-$(Platform).lib;%(AdditionalDependencies)</AdditionalDependencies>
+      <AdditionalDependencies>$(ProjectDir)lib\columns_ui\pfc\$(LibArchDir)\pfc\pfc.lib;$(ProjectDir)lib\columns_ui\foobar2000\SDK\$(LibArchDir)\foobar2000_SDK\foobar2000_SDK.lib;$(ProjectDir)lib\columns_ui\foobar2000\helpers\$(LibArchDir)\helpers\foobar2000_sdk_helpers.lib;$(ProjectDir)lib\columns_ui\libPPUI\$(LibArchDir)\libPPUI\libPPUI.lib;$(ProjectDir)lib\columns_ui\foobar2000\shared\shared-$(Platform).lib;%(AdditionalDependencies)</AdditionalDependencies>
     </Link>
   </ItemDefinitionGroup>
   <ItemGroup>
@@ -181,6 +186,9 @@
     </ClCompile>
     <ClCompile Include="src\spectrum_analyzer.cpp" />
     <ClCompile Include="src\spectrum_window.cpp" />
+    <ClCompile Include="lib\columns_ui\foobar2000\foobar2000_component_client\component_client.cpp">
+      <PrecompiledHeader>NotUsing</PrecompiledHeader>
+    </ClCompile>
   </ItemGroup>
   <ItemGroup>
     <ClInclude Include="src\fft.h" />
@@ -189,26 +197,6 @@
     <ClInclude Include="src\spectrum_analyzer.h" />
     <ClInclude Include="src\spectrum_window.h" />
     <ClInclude Include="src\stdafx.h" />
-  </ItemGroup>
-  <ItemGroup>
-    <!-- SDK static libraries: provide compiled code for pfc, helpers, libPPUI, etc.
-         The plugin uses WIN32_OP (libPPUI/win32_op.cpp) and ui_element_impl_withpopup
-         (helpers/BumpableElem.h) which need these compiled into the link. -->
-    <ProjectReference Include="sdk\pfc\pfc.vcxproj">
-      <Project>{EBFFFB4E-261D-44D3-B89C-957B31A0BF9C}</Project>
-    </ProjectReference>
-    <ProjectReference Include="sdk\foobar2000\SDK\foobar2000_SDK.vcxproj">
-      <Project>{E8091321-D79D-4575-86EF-064EA1A4A20D}</Project>
-    </ProjectReference>
-    <ProjectReference Include="sdk\foobar2000\helpers\foobar2000_sdk_helpers.vcxproj">
-      <Project>{EE47764E-A202-4F85-A767-ABDAB4AFF35F}</Project>
-    </ProjectReference>
-    <ProjectReference Include="sdk\libPPUI\libPPUI.vcxproj">
-      <Project>{7729EB82-4069-4414-964B-AD399091A03F}</Project>
-    </ProjectReference>
-    <ProjectReference Include="sdk\foobar2000\foobar2000_component_client\foobar2000_component_client.vcxproj">
-      <Project>{71AD2674-065B-48F5-B8B0-E1F9D3892081}</Project>
-    </ProjectReference>
   </ItemGroup>
   <Import Project="$(VCTargetsPath)\Microsoft.Cpp.targets" />
   <ImportGroup Label="ExtensionTargets">

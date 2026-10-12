@@ -1,8 +1,9 @@
-# Visual Studio / MSBuild build output (only at project root, not in sdk/)
+# Visual Studio / MSBuild build output
 /Debug/
 /Release/
 /x64/
 /Win32/
+/bin/
 *.obj
 *.pdb
 *.ilk
@@ -48,5 +49,6 @@ $RECYCLE.BIN/
 *.bak
 *.cache
 
-# NOTE: Do NOT ignore *.lib in sdk/ directory - those are precompiled
-# foobar2000 SDK shared libraries required for building.
+# Remote SDK dependencies (fetched via CI or manually for local dev)
+# See .github/workflows/build.yml for the required repos and paths.
+/lib/
