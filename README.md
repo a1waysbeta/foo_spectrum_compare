@@ -10,7 +10,7 @@
   <a href="../../actions"><img src="https://img.shields.io/github/actions/workflow/status/a1waysbeta/foo_spectrum_compare/build.yml?style=flat-square&label=Build&color=blue" alt="编译状态"></a>
 </p>
 
-一个为 foobar2000 设计的垂直多轨频谱对比面板组件，适用于默认界面（Default UI）。
+一个为 foobar2000 设计的垂直多轨频谱对比面板组件，适用于默认界面（Default UI）和 Columns UI（CUI）。
 
 <p align="center">
   <img src="Preview image.jpg" alt="Preview" width="800" />

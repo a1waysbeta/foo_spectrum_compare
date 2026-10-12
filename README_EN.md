@@ -10,7 +10,7 @@
   <a href="../../actions"><img src="https://img.shields.io/github/actions/workflow/status/a1waysbeta/foo_spectrum_compare/build.yml?style=flat-square&label=Build&color=blue" alt="Build Status"></a>
 </p>
 
-A vertical multi-track spectrogram comparison panel component for foobar2000, designed for the Default UI.
+A vertical multi-track spectrogram comparison panel component for foobar2000, designed for the Default UI and Columns UI.
 
 <p align="center">
   <img src="Preview image.jpg" alt="Preview" width="800" />
