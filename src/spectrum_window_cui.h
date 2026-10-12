@@ -8,6 +8,23 @@ static const GUID guid_spectrum_compare_cui =
     { 0xb4c5d6e7, 0xf8a9, 0x0b1c, { 0x2d, 0x3e, 0x4f, 0x50, 0x61, 0x72, 0x83, 0x94 } };
 
 // =============================================================================
+// SpectrumCompareWindowConcrete
+//
+// SpectrumCompareWindow inherits ui_element_instance which has two pure
+// virtual methods (get_guid, get_subclass).  In DUI mode, the ui_element_impl
+// template provides these by delegating to the static g_get_guid /
+// g_get_subclass.  For CUI we need a concrete subclass that does the same
+// bridging so service_impl_t<Concrete> can instantiate it.
+// =============================================================================
+class SpectrumCompareWindowConcrete : public SpectrumCompareWindow {
+public:
+    using SpectrumCompareWindow::SpectrumCompareWindow;  // inherit constructors
+
+    GUID get_guid() override { return g_get_guid(); }
+    GUID get_subclass() override { return g_get_subclass(); }
+};
+
+// =============================================================================
 // CuiSpectrumCallback
 //
 // Adapter that bridges the DUI ui_element_instance_callback interface to CUI's

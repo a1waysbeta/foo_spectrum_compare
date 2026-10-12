@@ -107,10 +107,10 @@ HWND SpectrumCompareWindowCUI::create_or_transfer_window(
     }
 
     // Construct the inner SpectrumCompareWindow with the CUI callback adapter.
-    // SpectrumCompareWindow is abstract (inherits service_base); service_impl_t
-    // provides the service_base implementations. service_ptr_t manages the
-    // refcount — assigning nullptr in destroy_window() triggers deletion.
-    m_inner = new service_impl_t<SpectrumCompareWindow>(
+    // SpectrumCompareWindow is abstract (inherits service_base and
+    // ui_element_instance); SpectrumCompareWindowConcrete provides get_guid/
+    // get_subclass, and service_impl_t provides service_base methods.
+    m_inner = new service_impl_t<SpectrumCompareWindowConcrete>(
         config, m_callback.ui_element_instance_callback_get_ptr());
 
     // Create the actual HWND (ATL CWindowImpl::Create).
