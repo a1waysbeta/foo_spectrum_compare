@@ -75,6 +75,18 @@ jobs:
         }
         Move-Item "$env:TEMP\fb2k_sdk\libPPUI" "foo_spectrum_compare\lib\columns_ui\libPPUI"
 
+    # columns_ui-sdk: required for the CUI (Columns UI) panel adapter
+    # (spectrum_window_cui.cpp implements uie::window).  Pinned to the
+    # same commit used by Columns UI v3.7.0 (matches foo_modernplaylist
+    # and foo_nowbar build workflows).
+    - name: Checkout Columns UI SDK
+      uses: actions/checkout@v6
+      with:
+        repository: reupen/columns_ui-sdk
+        ref: 69972e36febc4bfc2685fa1a7620d0ee8789e10f
+        path: foo_spectrum_compare/lib/columns_ui/columns_ui-sdk
+        fetch-depth: 1
+
     # -------------------------------------------------------------------------
     # 2. Build Environment Setup
     # -------------------------------------------------------------------------
@@ -130,6 +142,23 @@ jobs:
           }
         }
 
+    - name: Stub DarkMode.cpp in SDK helpers
+      # The foobar2000 SDK helpers' DarkMode.h references APIs from a newer
+      # libPPUI than what is available in the pinned SDK version, causing
+      # ~25 compilation errors.  Our component (and the columns_ui-sdk) does
+      # not use DarkMode at all, so replacing DarkMode.cpp with a minimal
+      # stub (just the precompiled header include) is safe: no unresolved
+      # symbols because nothing references DarkMode functions.
+      shell: pwsh
+      run: |
+        $darkMode = "foo_spectrum_compare\lib\columns_ui\foobar2000\helpers\DarkMode.cpp"
+        if (Test-Path $darkMode) {
+          Set-Content $darkMode -Value '#include "StdAfx.h"' -NoNewline
+          Write-Host "Stubbed DarkMode.cpp"
+        } else {
+          Write-Host "DarkMode.cpp not found, skipping stub"
+        }
+
     # -------------------------------------------------------------------------
     # 3. Build Dependencies (in dependency order)
     # -------------------------------------------------------------------------
@@ -172,6 +201,17 @@ jobs:
           /p:Configuration=Release-Static ^
           /p:Platform=${{ matrix.msbuild_platform }} ^
           /p:OutDir=${{ matrix.outdir_platform }}\libPPUI\
+
+    - name: Build Columns UI SDK (${{ matrix.platform }})
+      # Required: spectrum_window_cui.cpp implements uie::window (CUI panel)
+      # using the columns_ui-sdk headers and lib.  The columns_ui-sdk.vcxproj
+      # Release config already has RuntimeLibrary=MultiThreaded (/MT).
+      shell: cmd
+      run: |
+        msbuild foo_spectrum_compare\lib\columns_ui\columns_ui-sdk\columns_ui-sdk.vcxproj ^
+          /p:Configuration=${{ env.BUILD_CONFIGURATION }} ^
+          /p:Platform=${{ matrix.msbuild_platform }} ^
+          /p:OutDir=${{ matrix.outdir_platform }}\columns_ui_sdk\
 
     # -------------------------------------------------------------------------
     # 4. Build Component
