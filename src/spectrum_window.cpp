@@ -81,6 +81,7 @@ SpectrumCompareWindow::~SpectrumCompareWindow() {
     if (m_hWnd) {
         KillTimer(TIMER_REPAINT);
         KillTimer(TIMER_END_EDIT);
+        KillTimer(TIMER_PARENT_WATCH);
     }
 
     // Unregister playlist callback
@@ -127,6 +128,12 @@ void SpectrumCompareWindow::initialize_window(HWND parent) {
     // Subclass the popup host (parent) window to strip "Export settings" etc.
     // from its system menu. This runs after Create(parent) so m_hWnd is valid.
     subclass_parent_window();
+
+    // Start watching the host background if pseudo transparency is on.
+    if (m_pseudo_transparency) {
+        m_parent_key = current_parent_key();
+        watch_parent_background();
+    }
 
     // Initial selection update
     update_selection();
@@ -487,6 +494,10 @@ void SpectrumCompareWindow::update_selection() {
     // Remember the selection snapshot AFTER a successful processing run so
     // the fast path can return on subsequent identical callbacks.
     m_last_selection.assign(max_tracks_sz, selected, display_count);
+
+    // New track(s): hosts often repaint art/background around track changes,
+    // so check the pseudo-transparency capture more often for a few seconds.
+    if (m_parent_watch) parent_busy(2000);
 
     Invalidate();
 }
@@ -1618,10 +1629,21 @@ void SpectrumCompareWindow::render_db_scale(CDCHandle dc, const RECT& bar_rc, co
 // ============================================================
 
 void SpectrumCompareWindow::OnSize(UINT nType, CSize size) {
+    // Our own geometry changed: this repaint recaptures the parent pixels
+    // anyway, so refresh the watcher's key/capture state instead of letting
+    // the watch timer fire an extra full repaint for the same change.
+    if (m_pseudo_transparency) {
+        m_parent_key = current_parent_key();
+        m_parent_pixels.clear();
+    }
     Invalidate();
 }
 
 void SpectrumCompareWindow::OnTimer(UINT_PTR nIDEvent) {
+    if (nIDEvent == TIMER_PARENT_WATCH) {
+        check_parent_background();
+        return;
+    }
     if (nIDEvent == TIMER_END_EDIT) {
         // Fire-and-forget timer: the subclass proc set m_edit_commit and
         // started this timer to defer end_inline_title_format_edit() out of
@@ -1988,10 +2010,13 @@ void SpectrumCompareWindow::OnContextMenu(CWindow wnd, CPoint point) {
     CMenu menu;
     WIN32_OP(menu.CreatePopupMenu() != NULL);
 
-    // Build settings block with id_base = 0, so each leaf's cmd id is a
-    // 0-based index we can look up in `leaf_idms`.
+    // Build settings block with id_base = 1. TrackPopupMenu returns 0 both
+    // when the menu is cancelled AND when the menu item with command id 0 is
+    // chosen — with id_base = 0 the first leaf ("1 track") got id 0 and was
+    // indistinguishable from a cancel, making the 1-track option inert.
+    constexpr unsigned k_menu_id_base = 1;
     const std::vector<UINT> leaf_idms = build_settings_block(
-        menu, 0, m_max_tracks, m_palette,
+        menu, k_menu_id_base, m_max_tracks, m_palette,
         m_show_freq_axis, m_show_time_axis, m_show_db_scale,
         m_pseudo_transparency, m_language);
 
@@ -2009,8 +2034,8 @@ void SpectrumCompareWindow::OnContextMenu(CWindow wnd, CPoint point) {
         0, m_hWnd, NULL
     );
 
-    if (cmd > 0) {
-        const size_t idx = (size_t)cmd;
+    if (cmd >= (int)k_menu_id_base) {
+        const size_t idx = (size_t)cmd - k_menu_id_base;
         if (idx < leaf_idms.size() && leaf_idms[idx] != 0) {
             SendMessage(WM_COMMAND, MAKEWPARAM(leaf_idms[idx], 0), 0);
         }
@@ -2126,7 +2151,157 @@ void SpectrumCompareWindow::OnTogglePseudoTransparency(UINT uNotifyCode, int nID
     (void)uNotifyCode; (void)nID; (void)wndCtl;
     m_pseudo_transparency = !m_pseudo_transparency;
     g_cfg_pseudo_transparency = m_pseudo_transparency;
+    if (m_pseudo_transparency) {
+        // Fresh capture state, then watch the host background for changes.
+        m_parent_pixels.clear();
+        m_parent_key = current_parent_key();
+        watch_parent_background();
+    } else if (m_parent_watch) {
+        KillTimer(TIMER_PARENT_WATCH);
+        m_parent_watch = false;
+    }
     Invalidate();
+}
+
+// ============================================================
+// Pseudo transparency — parent background watcher
+// ------------------------------------------------------------
+// Adapted from foo_modernplaylist (artwork_win.h / playlist_view.cpp):
+//   * TIMER_PARENT_WATCH fires every 100 ms.
+//   * A 3-RECT geometry key (this window + its parent in root coordinates,
+//     plus the root client rect) detects moves of this panel or any
+//     ancestor — including floating containers, which never send us
+//     WM_SIZE/WINDOWPOSCHANGED.
+//   * Otherwise the parent's pixels (captured via WM_ERASEBKGND into a DIB)
+//     are memcmp'd with the last capture: every 250 ms while "busy"
+//     (3 s after startup, 2 s after a detected change or a new track),
+//     every 1 s when idle, and never faster than 20x the last capture cost
+//     so watching stays a negligible share of UI-thread time.
+//   * Only a changed capture causes Invalidate(); OnPaint then repaints
+//     the parent's background into our surface as usual.
+// ============================================================
+
+std::array<RECT, 3> SpectrumCompareWindow::current_parent_key() const {
+    std::array<RECT, 3> key{};
+    HWND parent = ::GetParent(m_hWnd);
+    HWND root = ::GetAncestor(m_hWnd, GA_ROOT);
+    if (root) {
+        GetClientRect(m_hWnd, &key[0]);
+        ::MapWindowPoints(m_hWnd, root, reinterpret_cast<POINT*>(&key[0]), 2);
+        if (parent) {
+            GetClientRect(parent, &key[1]);
+            ::MapWindowPoints(parent, root, reinterpret_cast<POINT*>(&key[1]), 2);
+        }
+        GetClientRect(root, &key[2]);
+    }
+    return key;
+}
+
+void SpectrumCompareWindow::watch_parent_background() {
+    if (m_parent_watch || !m_hWnd || m_shutdown) return;
+    m_parent_watch = true;
+    parent_busy(3000);
+    SetTimer(TIMER_PARENT_WATCH, 100, NULL);
+}
+
+void SpectrumCompareWindow::parent_busy(ULONGLONG duration_ms) {
+    const ULONGLONG now = GetTickCount64();
+    m_parent_busy_until = (std::max)(m_parent_busy_until, now + duration_ms);
+    m_parent_check_due = (std::min)(m_parent_check_due, now);
+}
+
+bool SpectrumCompareWindow::capture_parent_pixels(uint8_t* out, int w, int h) {
+    HWND parent = ::GetParent(m_hWnd);
+    if (!parent || w <= 0 || h <= 0) return false;
+    HDC wnd_dc = ::GetDC(m_hWnd);
+    if (!wnd_dc) return false;
+
+    BITMAPINFO info{};
+    info.bmiHeader.biSize = sizeof(BITMAPINFOHEADER);
+    info.bmiHeader.biWidth = w;
+    info.bmiHeader.biHeight = -h;  // top-down
+    info.bmiHeader.biPlanes = 1;
+    info.bmiHeader.biBitCount = 32;
+    info.bmiHeader.biCompression = BI_RGB;
+
+    void* bits = nullptr;
+    HBITMAP bmp = CreateDIBSection(wnd_dc, &info, DIB_RGB_COLORS, &bits, nullptr, 0);
+    HDC mem = CreateCompatibleDC(wnd_dc);
+    bool captured = false;
+    if (mem && bmp && bits) {
+        HGDIOBJ old = SelectObject(mem, bmp);
+        int saved = SaveDC(mem);
+        if (saved) {
+            POINT origin{};
+            ::MapWindowPoints(m_hWnd, parent, &origin, 1);
+            OffsetWindowOrgEx(mem, origin.x, origin.y, nullptr);
+            SendMessageW(parent, WM_ERASEBKGND, reinterpret_cast<WPARAM>(mem), 0);
+            RestoreDC(mem, saved);
+            GdiFlush();  // finish GDI writes before reading the DIB's pixels
+            memcpy(out, bits, (size_t)w * (size_t)h * 4);
+            captured = true;
+        }
+        SelectObject(mem, old);
+    }
+    if (mem) DeleteDC(mem);
+    if (bmp) DeleteObject(bmp);
+    ::ReleaseDC(m_hWnd, wnd_dc);
+    return captured;
+}
+
+bool SpectrumCompareWindow::capture_parent_changed(int w, int h) {
+    m_parent_scratch.assign((size_t)w * (size_t)h * 4, 0);
+    // Fill with the host background colour first so a failed capture still
+    // produces deterministic pixels (and a one-time repaint), not garbage.
+    const COLORREF bg = m_callback->query_std_color(ui_color_background);
+    for (size_t i = 0; i < m_parent_scratch.size(); i += 4) {
+        m_parent_scratch[i] = GetBValue(bg);
+        m_parent_scratch[i + 1] = GetGValue(bg);
+        m_parent_scratch[i + 2] = GetRValue(bg);
+        m_parent_scratch[i + 3] = 255;
+    }
+    capture_parent_pixels(m_parent_scratch.data(), w, h);
+    m_parent_key = current_parent_key();
+    if (w == m_parent_w && h == m_parent_h
+        && m_parent_pixels.size() == m_parent_scratch.size()
+        && memcmp(m_parent_pixels.data(), m_parent_scratch.data(), m_parent_scratch.size()) == 0) {
+        return false;
+    }
+    m_parent_pixels.swap(m_parent_scratch);
+    m_parent_w = w;
+    m_parent_h = h;
+    return true;
+}
+
+void SpectrumCompareWindow::check_parent_background() {
+    if (!m_pseudo_transparency || m_shutdown) {
+        KillTimer(TIMER_PARENT_WATCH);
+        m_parent_watch = false;
+        return;
+    }
+    if (!IsWindowVisible() || IsIconic(::GetAncestor(m_hWnd, GA_ROOT))) return;
+    RECT r{};
+    GetClientRect(&r);
+    if (r.right <= 0 || r.bottom <= 0 || (uint64_t)r.right * (uint64_t)r.bottom > 16000000) return;
+
+    const ULONGLONG now = GetTickCount64();
+    const auto key = current_parent_key();
+    const bool moved = !std::equal(key.begin(), key.end(), m_parent_key.begin(),
+        [](const RECT& a, const RECT& b) { return EqualRect(&a, &b) != FALSE; });
+    if (now < (moved ? m_parent_move_due : m_parent_check_due)) return;
+
+    const auto started = std::chrono::steady_clock::now();
+    const bool changed = capture_parent_changed(r.right, r.bottom);
+    const ULONGLONG cost = (ULONGLONG)std::chrono::duration_cast<std::chrono::milliseconds>(
+        std::chrono::steady_clock::now() - started).count();
+
+    if (changed) {
+        parent_busy(2000);
+        Invalidate();
+    }
+    // Keep capturing to a small share of the UI thread's time.
+    m_parent_move_due = now + cost * 3;
+    m_parent_check_due = now + (std::max<ULONGLONG>)(now < m_parent_busy_until ? 250 : 1000, cost * 20);
 }
 
 // ============================================================

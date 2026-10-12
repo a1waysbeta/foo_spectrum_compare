@@ -39,11 +39,16 @@ t_ui_font CuiSpectrumCallback::query_font_ex(const GUID& p_what)
 
     if (m_cached_font) return m_cached_font;
 
-    try {
-        auto api = fb2k::std_api_get<cui::fonts::manager>();
-        m_cached_font = api->get_font(cui::fonts::font_type_items);
-    } catch (...) {
-        m_cached_font = nullptr;
+    // std_api_try_get (not std_api_get): in DUI mode the CUI manager service
+    // does not exist and std_api_get would call uBugCheck(), a fatal SEH
+    // exception that try/catch cannot intercept.
+    cui::fonts::manager::ptr api;
+    if (fb2k::std_api_try_get(api)) {
+        try {
+            m_cached_font = api->get_font(cui::fonts::font_type_items);
+        } catch (...) {
+            m_cached_font = nullptr;
+        }
     }
     return m_cached_font;
 }
@@ -63,15 +68,20 @@ void CuiSpectrumCallback::invalidate_font() const
 SpectrumCompareWindowCUI::SpectrumCompareWindowCUI()
 {
     // Register for global CUI colour and font change notifications.
-    try {
-        m_colours_api = fb2k::std_api_get<cui::colours::manager>();
-        m_colours_api->register_common_callback(this);
-    } catch (...) {}
+    // std_api_try_get (not std_api_get): when running under DUI the CUI
+    // manager services do not exist; std_api_get would uBugCheck() — a
+    // fatal SEH exception, uncatchable by try/catch — crashing startup.
+    if (fb2k::std_api_try_get(m_colours_api)) {
+        try {
+            m_colours_api->register_common_callback(this);
+        } catch (...) { m_colours_api.release(); }
+    }
 
-    try {
-        m_fonts_api = fb2k::std_api_get<cui::fonts::manager>();
-        m_fonts_api->register_common_callback(this);
-    } catch (...) {}
+    if (fb2k::std_api_try_get(m_fonts_api)) {
+        try {
+            m_fonts_api->register_common_callback(this);
+        } catch (...) { m_fonts_api.release(); }
+    }
 }
 
 SpectrumCompareWindowCUI::~SpectrumCompareWindowCUI()

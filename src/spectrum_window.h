@@ -5,6 +5,8 @@
 #include "i18n.h"
 #include <thread>
 #include <atomic>
+#include <array>
+#include <chrono>
 
 // GUID for our UI element
 static const GUID guid_spectrum_compare =
@@ -339,6 +341,32 @@ private:
 
     static const UINT_PTR TIMER_REPAINT = 1;
     static const UINT_PTR TIMER_END_EDIT = 2;
+    static const UINT_PTR TIMER_PARENT_WATCH = 4;
+
+    // ================= 伪透明背景监视 =================
+    // The host does not tell us when it repaints behind the panel. While
+    // pseudo transparency is on, TIMER_PARENT_WATCH (100 ms) checks whether
+    // this panel or an ancestor (e.g. a floating container) moved by
+    // comparing a 3-RECT geometry key, and compares the parent's captured
+    // pixels with the last capture — every 250 ms for a few seconds after
+    // startup / a change / a new track, and every second otherwise (plus a
+    // cost-based throttle so capturing stays a small share of UI time).
+    // Only a changed capture triggers Invalidate(). Mechanism adapted from
+    // foo_modernplaylist's parent background watcher.
+    void watch_parent_background();
+    void parent_busy(ULONGLONG duration_ms);
+    void check_parent_background();
+    bool capture_parent_pixels(uint8_t* out, int w, int h);
+    bool capture_parent_changed(int w, int h);
+    std::array<RECT, 3> current_parent_key() const;
+
+    bool m_parent_watch = false;
+    ULONGLONG m_parent_busy_until = 0;
+    ULONGLONG m_parent_move_due = 0;
+    ULONGLONG m_parent_check_due = 0;
+    std::array<RECT, 3> m_parent_key{};
+    std::vector<uint8_t> m_parent_pixels, m_parent_scratch;
+    int m_parent_w = 0, m_parent_h = 0;
     static const UINT WM_SPECTRUM_READY = WM_USER + 100;
     static const UINT_PTR IDC_INLINE_TITLE_EDIT = 2001;
     static const UINT_PTR IDC_PARENT_SUBCLASS = 3;
