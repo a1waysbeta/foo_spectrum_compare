@@ -161,10 +161,15 @@ jobs:
 
     - name: Build libPPUI (${{ matrix.platform }})
       # Required: spectrum_window.cpp uses WIN32_OP from libPPUI.
+      # Use Configuration=Release-Static (not Release): the official SDK
+      # libPPUI.vcxproj's Release config has NO <RuntimeLibrary> tag and
+      # inherits /MD by default; only Release-Static explicitly sets
+      # <RuntimeLibrary>MultiThreaded</RuntimeLibrary> (/MT) to match the
+      # component and other deps.
       shell: cmd
       run: |
         msbuild foo_spectrum_compare\lib\columns_ui\libPPUI\libPPUI.vcxproj ^
-          /p:Configuration=${{ env.BUILD_CONFIGURATION }} ^
+          /p:Configuration=Release-Static ^
           /p:Platform=${{ matrix.msbuild_platform }} ^
           /p:OutDir=${{ matrix.outdir_platform }}\libPPUI\
 
