@@ -101,16 +101,32 @@ jobs:
         Write-Host "WTL 10 headers available at $includePath"
         echo "CL=/I`"$includePath`"" >> $env:GITHUB_ENV
 
-    - name: Fix Platform Toolset for GitHub Actions
+    - name: Fix Platform Toolset and RuntimeLibrary for GitHub Actions
       # The remote SDK sub-projects may default to v140/v141 which are absent
       # on windows-2022 runners. Patch every vcxproj under lib/ to use v143.
+      # Also force /MT (MultiThreaded) instead of /MD (MultiThreadedDLL) so all
+      # dependency libs match the component's RuntimeLibrary setting. msbuild
+      # /p:RuntimeLibrary=MultiThreaded on the command line does NOT override
+      # <RuntimeLibrary> tags inside <ItemDefinitionGroup> in the vcxproj,
+      # so the file itself must be patched.
       shell: pwsh
       run: |
         Get-ChildItem -Path foo_spectrum_compare -Recurse -Filter *.vcxproj | ForEach-Object {
           $content = Get-Content $_.FullName -Raw
+          $changed = $false
           if ($content -match 'v14[05]') {
-            Write-Host "Fixing: $($_.Name)"
-            $content -replace 'v14[05]', 'v143' | Set-Content $_.FullName -NoNewline
+            Write-Host "Fixing toolset: $($_.Name)"
+            $content = $content -replace 'v14[05]', 'v143'
+            $changed = $true
+          }
+          if ($content -match 'MultiThreadedDLL') {
+            Write-Host "Fixing RuntimeLibrary MD->MT: $($_.Name)"
+            $content = $content -replace 'MultiThreadedDebugDLL', 'MultiThreadedDebug'
+            $content = $content -replace 'MultiThreadedDLL', 'MultiThreaded'
+            $changed = $true
+          }
+          if ($changed) {
+            Set-Content $_.FullName -Value $content -NoNewline
           }
         }
 
@@ -123,8 +139,7 @@ jobs:
         msbuild foo_spectrum_compare\lib\columns_ui\pfc\pfc.vcxproj ^
           /p:Configuration=${{ env.BUILD_CONFIGURATION }} ^
           /p:Platform=${{ matrix.msbuild_platform }} ^
-          /p:OutDir=${{ matrix.outdir_platform }}\pfc\ ^
-          /p:RuntimeLibrary=MultiThreaded
+          /p:OutDir=${{ matrix.outdir_platform }}\pfc\
 
     - name: Build Foobar2000 SDK (${{ matrix.platform }})
       shell: cmd
@@ -132,33 +147,26 @@ jobs:
         msbuild foo_spectrum_compare\lib\columns_ui\foobar2000\SDK\foobar2000_SDK.vcxproj ^
           /p:Configuration=${{ env.BUILD_CONFIGURATION }} ^
           /p:Platform=${{ matrix.msbuild_platform }} ^
-          /p:OutDir=${{ matrix.outdir_platform }}\foobar2000_SDK\ ^
-          /p:RuntimeLibrary=MultiThreaded
+          /p:OutDir=${{ matrix.outdir_platform }}\foobar2000_SDK\
 
     - name: Build Foobar2000 SDK Helpers (${{ matrix.platform }})
       # Required: spectrum_window.cpp uses input_helper from the helpers library.
       # Also requires WTL headers (atlapp.h) made available via the CL env var.
-      # /p:RuntimeLibrary=MultiThreaded forces /MT to match the component and
-      # other deps — reupen helpers.vcxproj defaults to MultiThreadedDLL (/MD).
       shell: cmd
       run: |
         msbuild foo_spectrum_compare\lib\columns_ui\foobar2000\helpers\foobar2000_sdk_helpers.vcxproj ^
           /p:Configuration=${{ env.BUILD_CONFIGURATION }} ^
           /p:Platform=${{ matrix.msbuild_platform }} ^
-          /p:OutDir=${{ matrix.outdir_platform }}\helpers\ ^
-          /p:RuntimeLibrary=MultiThreaded
+          /p:OutDir=${{ matrix.outdir_platform }}\helpers\
 
     - name: Build libPPUI (${{ matrix.platform }})
       # Required: spectrum_window.cpp uses WIN32_OP from libPPUI.
-      # /p:RuntimeLibrary=MultiThreaded forces /MT — official SDK libPPUI.vcxproj
-      # defaults to MultiThreadedDLL (/MD), mismatching the component's /MT.
       shell: cmd
       run: |
         msbuild foo_spectrum_compare\lib\columns_ui\libPPUI\libPPUI.vcxproj ^
           /p:Configuration=${{ env.BUILD_CONFIGURATION }} ^
           /p:Platform=${{ matrix.msbuild_platform }} ^
-          /p:OutDir=${{ matrix.outdir_platform }}\libPPUI\ ^
-          /p:RuntimeLibrary=MultiThreaded
+          /p:OutDir=${{ matrix.outdir_platform }}\libPPUI\
 
     # -------------------------------------------------------------------------
     # 4. Build Component
