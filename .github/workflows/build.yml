@@ -123,7 +123,8 @@ jobs:
         msbuild foo_spectrum_compare\lib\columns_ui\pfc\pfc.vcxproj ^
           /p:Configuration=${{ env.BUILD_CONFIGURATION }} ^
           /p:Platform=${{ matrix.msbuild_platform }} ^
-          /p:OutDir=${{ matrix.outdir_platform }}\pfc\
+          /p:OutDir=${{ matrix.outdir_platform }}\pfc\ ^
+          /p:RuntimeLibrary=MultiThreaded
 
     - name: Build Foobar2000 SDK (${{ matrix.platform }})
       shell: cmd
@@ -131,26 +132,33 @@ jobs:
         msbuild foo_spectrum_compare\lib\columns_ui\foobar2000\SDK\foobar2000_SDK.vcxproj ^
           /p:Configuration=${{ env.BUILD_CONFIGURATION }} ^
           /p:Platform=${{ matrix.msbuild_platform }} ^
-          /p:OutDir=${{ matrix.outdir_platform }}\foobar2000_SDK\
+          /p:OutDir=${{ matrix.outdir_platform }}\foobar2000_SDK\ ^
+          /p:RuntimeLibrary=MultiThreaded
 
     - name: Build Foobar2000 SDK Helpers (${{ matrix.platform }})
       # Required: spectrum_window.cpp uses input_helper from the helpers library.
       # Also requires WTL headers (atlapp.h) made available via the CL env var.
+      # /p:RuntimeLibrary=MultiThreaded forces /MT to match the component and
+      # other deps — reupen helpers.vcxproj defaults to MultiThreadedDLL (/MD).
       shell: cmd
       run: |
         msbuild foo_spectrum_compare\lib\columns_ui\foobar2000\helpers\foobar2000_sdk_helpers.vcxproj ^
           /p:Configuration=${{ env.BUILD_CONFIGURATION }} ^
           /p:Platform=${{ matrix.msbuild_platform }} ^
-          /p:OutDir=${{ matrix.outdir_platform }}\helpers\
+          /p:OutDir=${{ matrix.outdir_platform }}\helpers\ ^
+          /p:RuntimeLibrary=MultiThreaded
 
     - name: Build libPPUI (${{ matrix.platform }})
       # Required: spectrum_window.cpp uses WIN32_OP from libPPUI.
+      # /p:RuntimeLibrary=MultiThreaded forces /MT — official SDK libPPUI.vcxproj
+      # defaults to MultiThreadedDLL (/MD), mismatching the component's /MT.
       shell: cmd
       run: |
         msbuild foo_spectrum_compare\lib\columns_ui\libPPUI\libPPUI.vcxproj ^
           /p:Configuration=${{ env.BUILD_CONFIGURATION }} ^
           /p:Platform=${{ matrix.msbuild_platform }} ^
-          /p:OutDir=${{ matrix.outdir_platform }}\libPPUI\
+          /p:OutDir=${{ matrix.outdir_platform }}\libPPUI\ ^
+          /p:RuntimeLibrary=MultiThreaded
 
     # -------------------------------------------------------------------------
     # 4. Build Component
