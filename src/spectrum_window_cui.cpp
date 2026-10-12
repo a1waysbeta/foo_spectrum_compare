@@ -87,7 +87,7 @@ SpectrumCompareWindowCUI::~SpectrumCompareWindowCUI()
     // Ensure the inner window is destroyed before m_callback.
     // destroy_window() should have been called by the host already, but
     // guard against the host not doing so.
-    m_inner.reset();
+    m_inner = nullptr;
 }
 
 HWND SpectrumCompareWindowCUI::create_or_transfer_window(
@@ -107,9 +107,10 @@ HWND SpectrumCompareWindowCUI::create_or_transfer_window(
     }
 
     // Construct the inner SpectrumCompareWindow with the CUI callback adapter.
-    // ui_element_instance_callback_get_ptr() creates a service object wrapping
-    // this CuiSpectrumCallback; the inner window holds a ref to it.
-    m_inner = std::make_unique<SpectrumCompareWindow>(
+    // SpectrumCompareWindow is abstract (inherits service_base); service_impl_t
+    // provides the service_base implementations. service_ptr_t manages the
+    // refcount — assigning nullptr in destroy_window() triggers deletion.
+    m_inner = new service_impl_t<SpectrumCompareWindow>(
         config, m_callback.ui_element_instance_callback_get_ptr());
 
     // Create the actual HWND (ATL CWindowImpl::Create).
@@ -131,7 +132,7 @@ void SpectrumCompareWindowCUI::destroy_window()
     // Save the current configuration before destroying the inner window,
     // so get_config() can return valid data even after the panel is removed
     // from the layout (e.g. undo/redo).
-    if (m_inner) {
+    if (m_inner.is_valid()) {
         try {
             auto config = m_inner->get_configuration();
             t_size size = config->get_data_size();
@@ -144,7 +145,7 @@ void SpectrumCompareWindowCUI::destroy_window()
         // Destroy the inner window first.  This releases the inner window's
         // ref to the callback service while CuiSpectrumCallback is still alive
         // (it's a member declared before m_inner, so it outlives m_inner).
-        m_inner.reset();
+        m_inner = nullptr;
     }
 
     m_host.release();
@@ -162,7 +163,7 @@ void SpectrumCompareWindowCUI::set_config(stream_reader* p_reader, t_size p_size
 
 void SpectrumCompareWindowCUI::get_config(stream_writer* p_writer, abort_callback& p_abort) const
 {
-    if (m_inner) {
+    if (m_inner.is_valid()) {
         // Live window: serialize current runtime config.
         auto config = m_inner->get_configuration();
         p_writer->write(config->get_data(), config->get_data_size(), p_abort);
@@ -177,7 +178,7 @@ void SpectrumCompareWindowCUI::get_config(stream_writer* p_writer, abort_callbac
 void SpectrumCompareWindowCUI::on_colour_changed(uint32_t changed_items_mask) const
 {
     (void)changed_items_mask;
-    if (m_inner && m_inner->get_wnd()) {
+    if (m_inner.is_valid() && m_inner->get_wnd()) {
         InvalidateRect(m_inner->get_wnd(), nullptr, FALSE);
     }
 }
@@ -186,7 +187,7 @@ void SpectrumCompareWindowCUI::on_bool_changed(uint32_t changed_items_mask) cons
 {
     // Dark mode toggle is a bool change — repaint to pick up new colours.
     (void)changed_items_mask;
-    if (m_inner && m_inner->get_wnd()) {
+    if (m_inner.is_valid() && m_inner->get_wnd()) {
         InvalidateRect(m_inner->get_wnd(), nullptr, FALSE);
     }
 }
@@ -198,7 +199,7 @@ void SpectrumCompareWindowCUI::on_font_changed(uint32_t changed_items_mask) cons
     (void)changed_items_mask;
     // Invalidate the cached font so the next query_font_ex() recreates it.
     m_callback.invalidate_font();
-    if (m_inner && m_inner->get_wnd()) {
+    if (m_inner.is_valid() && m_inner->get_wnd()) {
         InvalidateRect(m_inner->get_wnd(), nullptr, FALSE);
     }
 }

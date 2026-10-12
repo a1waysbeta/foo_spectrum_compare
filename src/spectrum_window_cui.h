@@ -96,7 +96,9 @@ public:
         const ui_helpers::window_position_t& p_position = ui_helpers::window_position_null) override;
 
     void destroy_window() override;
-    HWND get_wnd() const override;
+    HWND get_wnd() const override {
+        return m_inner.is_valid() ? m_inner->get_wnd() : nullptr;
+    }
 
     // --- config (extension_base) ---
     void set_config(stream_reader* p_reader, t_size p_size, abort_callback& p_abort) override;
@@ -115,7 +117,9 @@ private:
     // releasing the callback service before the callback receiver itself
     // is destroyed.
     CuiSpectrumCallback m_callback;
-    std::unique_ptr<SpectrumCompareWindow> m_inner;
+    // SpectrumCompareWindow inherits service_base (abstract); must use
+    // service_impl_t to instantiate. service_ptr_t manages refcounting.
+    service_ptr_t<SpectrumCompareWindow> m_inner;
     uie::window_host_ptr m_host;
 
     // Raw config bytes received via set_config() before the window is created.
