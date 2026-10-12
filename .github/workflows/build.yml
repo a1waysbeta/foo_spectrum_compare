@@ -116,6 +116,17 @@ jobs:
           }
         }
 
+    - name: Stub DarkMode.cpp (libPPUI version mismatch workaround)
+      # The helpers DarkMode.h at SDK 2026-10-01 requires DarkMode::param_t
+      # from libPPUI, but the libPPUI from foo_traycontrols_cn (Dec 2025)
+      # is too old to have it. This component does not use the DarkMode API
+      # (colors come from query_std_color), so stubbing DarkMode.cpp is safe.
+      shell: pwsh
+      run: |
+        $path = "foo_spectrum_compare\lib\columns_ui\foobar2000\helpers\DarkMode.cpp"
+        Set-Content -Path $path -Value '#include "StdAfx.h"' -NoNewline
+        Write-Host "Stubbed $path (libPPUI param_t version mismatch)"
+
     # -------------------------------------------------------------------------
     # 3. Build Dependencies (in dependency order)
     # -------------------------------------------------------------------------
