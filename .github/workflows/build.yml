@@ -58,24 +58,22 @@ jobs:
         path: foo_spectrum_compare/lib/columns_ui/pfc
         fetch-depth: 1
 
-    # libPPUI (headers required): spectrum_window.cpp uses WIN32_OP from
-    # libPPUI/win32_op.h. reupen/foobar2000-sdk-modified does not include
-    # libPPUI, so we fetch it from foo_traycontrols_cn via sparse checkout.
-    - name: Checkout libPPUI from foo_traycontrols_cn
-      uses: actions/checkout@v6
-      with:
-        repository: a1waysbeta/foo_traycontrols_cn
-        path: temp_traycontrols
-        fetch-depth: 1
-        filter: blob:none
-        sparse-checkout: lib/foobar2000_SDK/libPPUI
-        sparse-checkout-cone-mode: false
-
-    - name: Move libPPUI
+    # libPPUI: spectrum_window.cpp uses WIN32_OP from libPPUI/win32_op.h.
+    # reupen/foobar2000-sdk-modified does not include libPPUI, so it is
+    # extracted from the official foobar2000 SDK archive (pinned 2026-10-01,
+    # the same SDK version the reupen forks are based on).
+    - name: Download official SDK and extract libPPUI
+      shell: pwsh
       run: |
-        move temp_traycontrols\lib\foobar2000_SDK\libPPUI foo_spectrum_compare\lib\columns_ui\libPPUI
-        rmdir /s /q temp_traycontrols
-      shell: cmd
+        $sdkUrl = "https://www.foobar2000.org/downloads/SDK-2026-10-01.7z"
+        $zip = "$env:TEMP\fb2k_sdk.7z"
+        Invoke-WebRequest -Uri $sdkUrl -OutFile $zip
+        7z x $zip -o"$env:TEMP\fb2k_sdk" | Out-Null
+        if (-not (Test-Path "$env:TEMP\fb2k_sdk\libPPUI\libPPUI.vcxproj")) {
+          Write-Host "::error::libPPUI not found in official SDK archive"
+          exit 1
+        }
+        Move-Item "$env:TEMP\fb2k_sdk\libPPUI" "foo_spectrum_compare\lib\columns_ui\libPPUI"
 
     # -------------------------------------------------------------------------
     # 2. Build Environment Setup
@@ -115,17 +113,6 @@ jobs:
             $content -replace 'v14[05]', 'v143' | Set-Content $_.FullName -NoNewline
           }
         }
-
-    - name: Stub DarkMode.cpp (libPPUI version mismatch workaround)
-      # The helpers DarkMode.h at SDK 2026-10-01 requires DarkMode::param_t
-      # from libPPUI, but the libPPUI from foo_traycontrols_cn (Dec 2025)
-      # is too old to have it. This component does not use the DarkMode API
-      # (colors come from query_std_color), so stubbing DarkMode.cpp is safe.
-      shell: pwsh
-      run: |
-        $path = "foo_spectrum_compare\lib\columns_ui\foobar2000\helpers\DarkMode.cpp"
-        Set-Content -Path $path -Value '#include "StdAfx.h"' -NoNewline
-        Write-Host "Stubbed $path (libPPUI param_t version mismatch)"
 
     # -------------------------------------------------------------------------
     # 3. Build Dependencies (in dependency order)
