@@ -86,8 +86,16 @@ SpectrumCompareWindowCUI::~SpectrumCompareWindowCUI()
 
     // Ensure the inner window is destroyed before m_callback.
     // destroy_window() should have been called by the host already, but
-    // guard against the host not doing so.
-    m_inner = nullptr;
+    // guard against the host not doing so.  Destroy the HWND first to
+    // avoid the CWindowImplRoot destructor's DestroyWindow() running after
+    // member destructors (use-after-destroy crash).
+    if (m_inner.is_valid()) {
+        HWND hwnd = m_inner->get_wnd();
+        if (hwnd && ::IsWindow(hwnd)) {
+            ::DestroyWindow(hwnd);
+        }
+        m_inner = nullptr;
+    }
 }
 
 HWND SpectrumCompareWindowCUI::create_or_transfer_window(
@@ -142,9 +150,19 @@ void SpectrumCompareWindowCUI::destroy_window()
             }
         } catch (...) {}
 
-        // Destroy the inner window first.  This releases the inner window's
-        // ref to the callback service while CuiSpectrumCallback is still alive
-        // (it's a member declared before m_inner, so it outlives m_inner).
+        // Destroy the HWND while the SpectrumCompareWindow object is still
+        // fully alive.  If we don't do this, ~CWindowImplRoot() would call
+        // DestroyWindow() AFTER member destructors have already run,
+        // causing WM_DESTROY/WM_NCDESTROY handlers to access destroyed
+        // members — a use-after-destroy crash during shutdown.
+        HWND hwnd = m_inner->get_wnd();
+        if (hwnd && ::IsWindow(hwnd)) {
+            ::DestroyWindow(hwnd);
+        }
+
+        // Now release the service.  The destructor's ~CWindowImplRoot()
+        // will see m_hWnd == NULL (set by ATL's WM_NCDESTROY handler) and
+        // skip the DestroyWindow() call.
         m_inner = nullptr;
     }
 
