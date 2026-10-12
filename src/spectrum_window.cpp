@@ -2186,13 +2186,15 @@ std::array<RECT, 3> SpectrumCompareWindow::current_parent_key() const {
     HWND parent = ::GetParent(m_hWnd);
     HWND root = ::GetAncestor(m_hWnd, GA_ROOT);
     if (root) {
-        GetClientRect(m_hWnd, &key[0]);
+        // :: prefix — ATL's CWindow::GetClientRect(HWND-less) would otherwise
+        // shadow the Win32 API and reject the two-argument form.
+        ::GetClientRect(m_hWnd, &key[0]);
         ::MapWindowPoints(m_hWnd, root, reinterpret_cast<POINT*>(&key[0]), 2);
         if (parent) {
-            GetClientRect(parent, &key[1]);
+            ::GetClientRect(parent, &key[1]);
             ::MapWindowPoints(parent, root, reinterpret_cast<POINT*>(&key[1]), 2);
         }
-        GetClientRect(root, &key[2]);
+        ::GetClientRect(root, &key[2]);
     }
     return key;
 }
@@ -2279,7 +2281,7 @@ void SpectrumCompareWindow::check_parent_background() {
         m_parent_watch = false;
         return;
     }
-    if (!IsWindowVisible() || IsIconic(::GetAncestor(m_hWnd, GA_ROOT))) return;
+    if (!IsWindowVisible() || ::IsIconic(::GetAncestor(m_hWnd, GA_ROOT))) return;
     RECT r{};
     GetClientRect(&r);
     if (r.right <= 0 || r.bottom <= 0 || (uint64_t)r.right * (uint64_t)r.bottom > 16000000) return;
