@@ -6,7 +6,6 @@ on:
   workflow_dispatch:
 
 env:
-  SOLUTION_FILE_PATH: .
   BUILD_CONFIGURATION: Release
 
 permissions:
@@ -27,25 +26,68 @@ jobs:
         include:
           - platform: x86
             msbuild_platform: Win32
-            # x86 DLL goes at the ROOT of the .fb2k-component archive.
-            component_rel_dir: .
+            outdir_platform: x86
           - platform: x64
             msbuild_platform: x64
-            # x64 DLL goes in a top-level x64\ subdirectory.
-            component_rel_dir: x64
+            outdir_platform: x64
       fail-fast: false
 
     steps:
-    - name: Checkout repository
+    # -------------------------------------------------------------------------
+    # 1. Checkout Repositories (all fetch-depth: 1 for shallow clone)
+    # -------------------------------------------------------------------------
+    - name: Checkout foo_spectrum_compare
       uses: actions/checkout@v6
+      with:
+        path: foo_spectrum_compare
+        fetch-depth: 1
 
+    - name: Checkout Foobar2000 SDK
+      uses: actions/checkout@v6
+      with:
+        repository: reupen/foobar2000-sdk-modified
+        ref: f56be547d34468da2ff47fcf49eacee41b6f42b1
+        path: foo_spectrum_compare/lib/columns_ui/foobar2000
+        fetch-depth: 1
+
+    - name: Checkout PFC
+      uses: actions/checkout@v6
+      with:
+        repository: reupen/pfc-modified
+        ref: 75053edf649b41b2202fcc7b9c5c3848a0e9a8cb
+        path: foo_spectrum_compare/lib/columns_ui/pfc
+        fetch-depth: 1
+
+    # libPPUI (headers required): spectrum_window.cpp uses WIN32_OP from
+    # libPPUI/win32_op.h. reupen/foobar2000-sdk-modified does not include
+    # libPPUI, so we fetch it from foo_traycontrols_cn via sparse checkout.
+    - name: Checkout libPPUI from foo_traycontrols_cn
+      uses: actions/checkout@v6
+      with:
+        repository: a1waysbeta/foo_traycontrols_cn
+        path: temp_traycontrols
+        fetch-depth: 1
+        filter: blob:none
+        sparse-checkout: lib/foobar2000_SDK/libPPUI
+        sparse-checkout-cone-mode: false
+
+    - name: Move libPPUI
+      run: |
+        move temp_traycontrols\lib\foobar2000_SDK\libPPUI foo_spectrum_compare\lib\columns_ui\libPPUI
+        rmdir /s /q temp_traycontrols
+      shell: cmd
+
+    # -------------------------------------------------------------------------
+    # 2. Build Environment Setup
+    # -------------------------------------------------------------------------
     - name: Setup MSBuild
       uses: microsoft/setup-msbuild@v3
 
     - name: Download WTL 10.0.10320 headers
-      # foobar2000 SDK helpers pull in WTL through atlapp.h. Copy the Include
-      # folder under C:\WTL\Include and expose it to ALL cl.exe invocations
-      # through the CL env var (matches the project memory hard constraint).
+      # foobar2000 SDK helpers pull in WTL through atlapp.h (needed because
+      # this component uses input_helper from the helpers library). Copy the
+      # Include folder under C:\WTL\Include and expose it to ALL cl.exe
+      # invocations through the CL env var.
       shell: pwsh
       run: |
         $url = "https://raw.githubusercontent.com/Win32-WTL/WTL/main/Releases/WTL10_10320_Final.zip"
@@ -61,64 +103,73 @@ jobs:
         Write-Host "WTL 10 headers available at $includePath"
         echo "CL=/I`"$includePath`"" >> $env:GITHUB_ENV
 
-    - name: Restore NuGet packages (if any)
-      working-directory: ${{ env.GITHUB_WORKSPACE }}
-      shell: pwsh
-      run: nuget restore "${{ env.SOLUTION_FILE_PATH }}" 2>$null; if ($LASTEXITCODE -ne 0) { Write-Host "NuGet restore skipped or failed (may be normal on fresh checkouts)" }
-
-    - name: Build ${{ matrix.platform }} (msbuild ${{ matrix.msbuild_platform }})
-      working-directory: ${{ env.GITHUB_WORKSPACE }}
-      # /p:PlatformToolset=v143 forces the VS 2022 toolset for every project in
-      # the solution (the bundled SDK sub-projects default to v142 which is
-      # absent on windows-2022 runners).
+    - name: Fix Platform Toolset for GitHub Actions
+      # The remote SDK sub-projects may default to v140/v141 which are absent
+      # on windows-2022 runners. Patch every vcxproj under lib/ to use v143.
       shell: pwsh
       run: |
-        msbuild /m `
-          /p:Configuration=${{ env.BUILD_CONFIGURATION }} `
-          /p:Platform=${{ matrix.msbuild_platform }} `
-          /p:PlatformToolset=v143 `
-          "${{ env.SOLUTION_FILE_PATH }}"
-        if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
-
-    - name: Locate built DLL (${{ matrix.platform }})
-      id: locate
-      shell: pwsh
-      run: |
-        $msbuild_platform = "${{ matrix.msbuild_platform }}"
-        if ($msbuild_platform -eq "x64") {
-          $dllPath = "x64\${{ env.BUILD_CONFIGURATION }}\foo_spectrum_compare.dll"
-        } else {
-          $dllPath = "${{ env.BUILD_CONFIGURATION }}\foo_spectrum_compare.dll"
-        }
-        if (-not (Test-Path $dllPath)) {
-          Write-Host "DLL not found at $dllPath, searching recursively..."
-          $found = Get-ChildItem -Recurse -Filter "foo_spectrum_compare.dll" | Select-Object -First 1
-          if ($found) { $dllPath = $found.FullName } else {
-            Write-Host "::error::foo_spectrum_compare.dll not built"
-            exit 1
+        Get-ChildItem -Path foo_spectrum_compare -Recurse -Filter *.vcxproj | ForEach-Object {
+          $content = Get-Content $_.FullName -Raw
+          if ($content -match 'v14[05]') {
+            Write-Host "Fixing: $($_.Name)"
+            $content -replace 'v14[05]', 'v143' | Set-Content $_.FullName -NoNewline
           }
         }
-        Write-Host "Using DLL: $dllPath"
-        "dll_path=$dllPath" | Out-File -FilePath $env:GITHUB_OUTPUT -Append -Encoding utf8
 
-    # Stage the DLL into the layout the .fb2k-component archive expects. The
-    # package job later downloads these staged artifacts and zips them up.
-    - name: Stage DLL for packaging
-      shell: pwsh
+    # -------------------------------------------------------------------------
+    # 3. Build Dependencies (in dependency order)
+    # -------------------------------------------------------------------------
+    - name: Build PFC (${{ matrix.platform }})
+      shell: cmd
       run: |
-        $dllPath = "${{ steps.locate.outputs.dll_path }}"
-        $stageRoot = Join-Path $env:GITHUB_WORKSPACE "_component_stage"
-        $destDir = Join-Path $stageRoot "${{ matrix.component_rel_dir }}"
-        New-Item -ItemType Directory -Force -Path $destDir | Out-Null
-        Copy-Item $dllPath (Join-Path $destDir "foo_spectrum_compare.dll") -Force
-        Write-Host "Staged:"
-        Get-ChildItem -Recurse $stageRoot | ForEach-Object { $_.FullName }
+        msbuild foo_spectrum_compare\lib\columns_ui\pfc\pfc.vcxproj ^
+          /p:Configuration=${{ env.BUILD_CONFIGURATION }} ^
+          /p:Platform=${{ matrix.msbuild_platform }} ^
+          /p:OutDir=${{ matrix.outdir_platform }}\pfc\
 
-    - name: Upload staged DLL (${{ matrix.platform }})
+    - name: Build Foobar2000 SDK (${{ matrix.platform }})
+      shell: cmd
+      run: |
+        msbuild foo_spectrum_compare\lib\columns_ui\foobar2000\SDK\foobar2000_SDK.vcxproj ^
+          /p:Configuration=${{ env.BUILD_CONFIGURATION }} ^
+          /p:Platform=${{ matrix.msbuild_platform }} ^
+          /p:OutDir=${{ matrix.outdir_platform }}\foobar2000_SDK\
+
+    - name: Build Foobar2000 SDK Helpers (${{ matrix.platform }})
+      # Required: spectrum_window.cpp uses input_helper from the helpers library.
+      # Also requires WTL headers (atlapp.h) made available via the CL env var.
+      shell: cmd
+      run: |
+        msbuild foo_spectrum_compare\lib\columns_ui\foobar2000\helpers\foobar2000_sdk_helpers.vcxproj ^
+          /p:Configuration=${{ env.BUILD_CONFIGURATION }} ^
+          /p:Platform=${{ matrix.msbuild_platform }} ^
+          /p:OutDir=${{ matrix.outdir_platform }}\helpers\
+
+    - name: Build libPPUI (${{ matrix.platform }})
+      # Required: spectrum_window.cpp uses WIN32_OP from libPPUI.
+      shell: cmd
+      run: |
+        msbuild foo_spectrum_compare\lib\columns_ui\libPPUI\libPPUI.vcxproj ^
+          /p:Configuration=${{ env.BUILD_CONFIGURATION }} ^
+          /p:Platform=${{ matrix.msbuild_platform }} ^
+          /p:OutDir=${{ matrix.outdir_platform }}\libPPUI\
+
+    # -------------------------------------------------------------------------
+    # 4. Build Component
+    # -------------------------------------------------------------------------
+    - name: Build foo_spectrum_compare (${{ matrix.platform }})
+      shell: cmd
+      run: |
+        msbuild foo_spectrum_compare\foo_spectrum_compare.vcxproj ^
+          /p:Configuration=${{ env.BUILD_CONFIGURATION }} ^
+          /p:Platform=${{ matrix.msbuild_platform }} ^
+          /p:OutDir=..\bin\${{ matrix.outdir_platform }}\
+
+    - name: Upload DLL (${{ matrix.platform }})
       uses: actions/upload-artifact@v7
       with:
         name: foo_spectrum_compare_${{ matrix.platform }}
-        path: _component_stage/**/*
+        path: bin/${{ matrix.outdir_platform }}/foo_spectrum_compare.dll
         if-no-files-found: error
 
 # =============================================================================
@@ -130,23 +181,22 @@ jobs:
     name: Package fb2k-component
 
     permissions:
-      contents: write   # required if we later push a tagged release
+      contents: write   # required for tagged release publishing
 
     steps:
-    # x86 archive is the root of the final layout (component_temp\foo_*.dll).
-    - name: Download x86 staged DLL
+    # x86 DLL goes at the ROOT of the component archive.
+    - name: Download x86 DLL
       uses: actions/download-artifact@v8
       with:
         name: foo_spectrum_compare_x86
         path: component_temp
 
-    # x64 archive contains _component_stage\x64\foo_*.dll which maps to
-    # component_temp\x64\foo_*.dll (matches the requested layout exactly).
-    - name: Download x64 staged DLL
+    # x64 DLL goes in a top-level x64\ subdirectory.
+    - name: Download x64 DLL
       uses: actions/download-artifact@v8
       with:
         name: foo_spectrum_compare_x64
-        path: component_temp
+        path: component_temp\x64
 
     - name: Verify component layout
       shell: cmd
@@ -176,9 +226,6 @@ jobs:
         path: foo_spectrum_compare.fb2k-component
         if-no-files-found: error
 
-    # Keep the existing tag-release behaviour so `git tag vX.Y.Z && push`
-    # (then run the workflow manually or via push-trigger removed above) can
-    # still attach the built .fb2k-component to a GitHub Release.
     - name: Publish tagged release
       if: startsWith(github.ref, 'refs/tags/v')
       uses: softprops/action-gh-release@v2
