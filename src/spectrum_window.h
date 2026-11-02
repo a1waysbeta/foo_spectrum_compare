@@ -351,11 +351,6 @@ private:
     // Parent (popup host) window handle — subclassed to clean its system menu.
     HWND m_hwnd_parent = NULL;
 
-    // Host-managed title-bar dark value, cached the first time we override
-    // it so turning the toggle off can restore the host's own state.
-    // -1 = nothing cached / currently not overriding.
-    int m_orig_titlebar_dark = -1;
-
     static const UINT_PTR TIMER_REPAINT = 1;
     static const UINT_PTR TIMER_END_EDIT = 2;
     static const UINT_PTR TIMER_PARENT_WATCH = 4;

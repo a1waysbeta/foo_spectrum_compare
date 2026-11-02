@@ -369,8 +369,15 @@ ui_element_config::ptr SpectrumCompareWindow::g_get_default_configuration() {
 }
 
 void SpectrumCompareWindow::notify(const GUID& p_what, t_size p_param1, const void* p_param2, t_size p_param2size) {
+    (void)p_param1; (void)p_param2; (void)p_param2size;
     if (p_what == ui_element_notify_colors_changed || p_what == ui_element_notify_font_changed) {
         Invalidate();
+        // foobar2000 just re-applied its theme (including possibly the
+        // popup host's DWMWA_USE_IMMERSIVE_DARK_MODE).  If our "Dark title
+        // bar" override is on, re-assert it; otherwise let foobar's new
+        // value take effect (apply_dark_title_bar → reads current DWM
+        // value and writes it back as a no-op).
+        apply_dark_title_bar();
     }
 }
 
@@ -2629,10 +2636,20 @@ LRESULT CALLBACK SpectrumCompareWindow::parent_subclass_proc(
     HWND hWnd, UINT uMsg, WPARAM wParam, LPARAM lParam,
     UINT_PTR uIdSubclass, DWORD_PTR dwRefData)
 {
-    (void)uIdSubclass;
+    (void)uIdSubclass; (void)wParam; (void)lParam;
     SpectrumCompareWindow* self = (SpectrumCompareWindow*)dwRefData;
 
     switch (uMsg) {
+    case WM_THEMECHANGED:
+    case WM_SETTINGCHANGE:
+    case WM_SYSCOLORCHANGE:
+        // foobar2000's theme switch (deep-light / light-dark) arrives on
+        // the popup host as WM_THEMECHANGED.  WM_SETTINGCHANGE /
+        // WM_SYSCOLORCHANGE are the same signal on older systems.  In
+        // either case foobar has just written its own DWMWA value — if
+        // our override is on we must re-assert it.
+        if (self) self->apply_dark_title_bar();
+        break;
     case WM_INITMENUPOPUP: {
         HMENU menu = (HMENU)wParam;
         BOOL is_sys_menu = (BOOL)HIWORD(lParam);
@@ -2723,17 +2740,24 @@ bool SpectrumCompareWindow::is_popup_mode() const {
 void SpectrumCompareWindow::apply_dark_title_bar() {
     if (m_hWnd == NULL || !is_popup_mode()) return;
     HWND root = ::GetAncestor(m_hWnd, GA_ROOT);
+    if (root == NULL) return;
     if (m_dark_title_bar) {
-        // Cache the host-managed value once so a later un-toggle can restore
-        // exactly what foobar2000 had set (covers both light and dark mode).
-        if (m_orig_titlebar_dark < 0) {
-            BOOL cur = FALSE;
-            m_orig_titlebar_dark = (dwm_get_dark_caption(root, cur) && cur) ? 1 : 0;
-        }
+        // Force the caption to dark — this OVERRIDES whatever foobar2000
+        // (or the system) last wrote. Every call re-writes TRUE so that
+        // even if foobar flips it back on a theme change or repaint, the
+        // next WM_THEMECHANGED / WM_SETTINGCHANGE will re-establish it.
         dwm_set_dark_caption(root, TRUE);
-    } else if (m_orig_titlebar_dark >= 0) {
-        dwm_set_dark_caption(root, m_orig_titlebar_dark != 0);
-        m_orig_titlebar_dark = -1;
+    } else {
+        // Let foobar2000 manage the caption color again by restoring
+        // the DWM attribute to whatever it currently has (which foobar
+        // will have just set on a recent theme switch).  If DWM is
+        // unavailable on this OS (pre-1809), just leave it — a no-op is
+        // always safe because the next theme switch from foobar will
+        // write the correct value itself.
+        BOOL cur = FALSE;
+        if (dwm_get_dark_caption(root, cur)) {
+            dwm_set_dark_caption(root, cur);
+        }
     }
 }
 
