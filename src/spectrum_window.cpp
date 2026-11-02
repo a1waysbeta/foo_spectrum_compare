@@ -2741,24 +2741,39 @@ void SpectrumCompareWindow::apply_dark_title_bar() {
     if (m_hWnd == NULL || !is_popup_mode()) return;
     HWND root = ::GetAncestor(m_hWnd, GA_ROOT);
     if (root == NULL) return;
+
+    BOOL want_dark = FALSE;
     if (m_dark_title_bar) {
-        // Force the caption to dark — this OVERRIDES whatever foobar2000
-        // (or the system) last wrote. Every call re-writes TRUE so that
-        // even if foobar flips it back on a theme change or repaint, the
-        // next WM_THEMECHANGED / WM_SETTINGCHANGE will re-establish it.
-        dwm_set_dark_caption(root, TRUE);
+        // User's override: always force dark, regardless of foobar's theme.
+        want_dark = TRUE;
     } else {
-        // Let foobar2000 manage the caption color again by restoring
-        // the DWM attribute to whatever it currently has (which foobar
-        // will have just set on a recent theme switch).  If DWM is
-        // unavailable on this OS (pre-1809), just leave it — a no-op is
-        // always safe because the next theme switch from foobar will
-        // write the correct value itself.
-        BOOL cur = FALSE;
-        if (dwm_get_dark_caption(root, cur)) {
-            dwm_set_dark_caption(root, cur);
+        // Follow foobar2000's CURRENT theme preference.  We CANNOT read it
+        // from the popup host window — while our override was ON, every
+        // WM_THEMECHANGED from foobar was re-written back to TRUE by us,
+        // so the popup host's DWMWA value is stale ("our" value, not
+        // foobar's).  The one window we never touched is foobar's own
+        // main window, whose DWMWA_USE_IMMERSIVE_DARK_MODE is exactly
+        // what foobar just resolved for the current theme.
+        HWND fb_main = core_api::get_main_window();
+        if (fb_main != NULL && fb_main != root && dwm_get_dark_caption(fb_main, want_dark)) {
+            // want_dark now holds foobar's current preference.
+        } else {
+            // Fallback: no main window available (shouldn't happen),
+            // write a neutral value; the next WM_THEMECHANGED from
+            // foobar will correct it anyway.
+            want_dark = FALSE;
         }
     }
+
+    dwm_set_dark_caption(root, want_dark);
+
+    // DwmSetWindowAttribute does NOT repaint the non-client area
+    // immediately — it just sets a property that the DWM consumes on
+    // the next frame.  Force a NC redraw so the caption swaps color
+    // synchronously, especially important on the toggle-off path
+    // where the user is watching.
+    ::SetWindowPos(root, NULL, 0, 0, 0, 0,
+        SWP_FRAMECHANGED | SWP_NOMOVE | SWP_NOSIZE | SWP_NOZORDER | SWP_NOACTIVATE);
 }
 
 // ============================================================
