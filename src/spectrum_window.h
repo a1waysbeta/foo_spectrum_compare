@@ -54,6 +54,8 @@ static const GUID guid_cfg_show_db_scale =
     { 0x71829304, 0xb5c6, 0xd7e8, { 0xf9, 0x0a, 0x1b, 0x2c, 0x3d, 0x4e, 0x5f, 0x70 } };
 static const GUID guid_cfg_pseudo_transparency =
     { 0x82930415, 0xc6d7, 0xe8f9, { 0x0a, 0x1b, 0x2c, 0x3d, 0x4e, 0x5f, 0x70, 0x81 } };
+static const GUID guid_cfg_dark_title_bar =
+    { 0x93041526, 0xd7e8, 0xf90a, { 0x1b, 0x2c, 0x3d, 0x4e, 0x5f, 0x70, 0x81, 0x92 } };
 
 // Persistent config storage (static globals, registered once at startup).
 // Defined as static so they persist across window creation/destruction.
@@ -65,6 +67,7 @@ extern cfg_int g_cfg_palette;
 extern cfg_int g_cfg_language;
 extern cfg_bool g_cfg_show_db_scale;
 extern cfg_bool g_cfg_pseudo_transparency;
+extern cfg_bool g_cfg_dark_title_bar;
 
 // Menu command IDs — values are arbitrary but unique within this window's
 // command range.  Do NOT reuse numbers across different IDs because
@@ -87,6 +90,7 @@ extern cfg_bool g_cfg_pseudo_transparency;
 #define IDM_LANG_CHINESE  1031
 #define IDM_TOGGLE_DB_SCALE 1024
 #define IDM_TOGGLE_PSEUDO_TRANSPARENCY 1025
+#define IDM_TOGGLE_DARK_TITLE_BAR 1026
 
 // Holds per-track spectrum state
 struct TrackSpectrum {
@@ -220,6 +224,7 @@ public:
         COMMAND_ID_HANDLER_EX(IDM_TOGGLE_TIME_AXIS, OnToggleTimeAxis)
         COMMAND_ID_HANDLER_EX(IDM_TOGGLE_DB_SCALE, OnToggleDbScale)
         COMMAND_ID_HANDLER_EX(IDM_TOGGLE_PSEUDO_TRANSPARENCY, OnTogglePseudoTransparency)
+        COMMAND_ID_HANDLER_EX(IDM_TOGGLE_DARK_TITLE_BAR, OnToggleDarkTitleBar)
         COMMAND_ID_HANDLER_EX(IDM_EDIT_TITLE_FORMAT,  OnEditTitleFormat)
         COMMAND_ID_HANDLER_EX(IDM_RESET_TITLE_FORMAT, OnResetTitleFormat)
         COMMAND_ID_HANDLER_EX(IDM_LANG_ENGLISH,  OnLanguage)
@@ -244,6 +249,7 @@ private:
     void OnToggleTimeAxis(UINT uNotifyCode, int nID, CWindow wndCtl);
     void OnToggleDbScale(UINT uNotifyCode, int nID, CWindow wndCtl);
     void OnTogglePseudoTransparency(UINT uNotifyCode, int nID, CWindow wndCtl);
+    void OnToggleDarkTitleBar(UINT uNotifyCode, int nID, CWindow wndCtl);
     void OnEditTitleFormat(UINT uNotifyCode, int nID, CWindow wndCtl);
     void OnResetTitleFormat(UINT uNotifyCode, int nID, CWindow wndCtl);
     void OnLanguage(UINT uNotifyCode, int nID, CWindow wndCtl);
@@ -261,6 +267,11 @@ private:
     static LRESULT CALLBACK parent_subclass_proc(
         HWND hWnd, UINT uMsg, WPARAM wParam, LPARAM lParam,
         UINT_PTR uIdSubclass, DWORD_PTR dwRefData);
+
+    // Dark title bar override for the popup host (View → Spectrum Compare).
+    // Applies DWMWA_USE_IMMERSIVE_DARK_MODE to the top-level host window.
+    bool is_popup_mode() const;
+    void apply_dark_title_bar();
 
     // Spectrum rendering
     // 返回实际绘制出的像素宽度（渐进显示时可能小于 rc 宽度），
@@ -287,6 +298,7 @@ private:
     bool m_show_time_axis = true;
     bool m_show_db_scale = true;
     bool m_pseudo_transparency = false;
+    bool m_dark_title_bar = false;
     pfc::string8 m_title_format = DEFAULT_TITLE_FORMAT;
     language_t m_language = LANG_DEFAULT;
 
@@ -338,6 +350,11 @@ private:
 
     // Parent (popup host) window handle — subclassed to clean its system menu.
     HWND m_hwnd_parent = NULL;
+
+    // Host-managed title-bar dark value, cached the first time we override
+    // it so turning the toggle off can restore the host's own state.
+    // -1 = nothing cached / currently not overriding.
+    int m_orig_titlebar_dark = -1;
 
     static const UINT_PTR TIMER_REPAINT = 1;
     static const UINT_PTR TIMER_END_EDIT = 2;

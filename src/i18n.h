@@ -41,6 +41,7 @@ enum strid_t {
     S_SELECT_TRACKS,         // placeholder text when no tracks
     S_ANALYZING,             // "Analyzing..." status
     S_ERROR,                 // "Error: " prefix
+    S_DARK_TITLE_BAR,        // popup-only toggle
     STRID_COUNT,
 };
 

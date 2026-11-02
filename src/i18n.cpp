@@ -46,6 +46,8 @@ static const char* const g_strings[STRID_COUNT][LANG_COUNT] = {
     { "Analyzing...",        "\xe5\x88\x86\xe6\x9e\x90\xe4\xb8\xad..." },
     // S_ERROR
     { "Error: ",              "\xe9\x94\x99\xe8\xaf\xaf\xef\xbc\x9a " },
+    // S_DARK_TITLE_BAR
+    { "Dark title bar",       "\xe6\xb7\xb1\xe8\x89\xb2\xe6\xa0\x87\xe9\xa2\x98\xe6\xa0\x8f" },
 };
 
 const char* i18n(strid_t id, language_t lang) {

@@ -15,6 +15,7 @@ cfg_int g_cfg_palette(guid_cfg_palette, (int)PALETTE_SOX);
 cfg_int g_cfg_language(guid_cfg_language, (int)LANG_DEFAULT);
 cfg_bool g_cfg_show_db_scale(guid_cfg_show_db_scale, true);
 cfg_bool g_cfg_pseudo_transparency(guid_cfg_pseudo_transparency, false);
+cfg_bool g_cfg_dark_title_bar(guid_cfg_dark_title_bar, false);
 
 SpectrumCompareWindow::SpectrumCompareWindow(
     ui_element_config::ptr config,
@@ -37,6 +38,7 @@ SpectrumCompareWindow::SpectrumCompareWindow(
     m_show_time_axis = g_cfg_show_time_axis;
     m_show_db_scale = g_cfg_show_db_scale;
     m_pseudo_transparency = g_cfg_pseudo_transparency;
+    m_dark_title_bar = g_cfg_dark_title_bar;
     m_title_format = g_cfg_title_format.get();
     m_max_tracks = (int)g_cfg_max_tracks;
     m_palette = (palette_t)pfc::clip_t<int>(
@@ -129,6 +131,11 @@ void SpectrumCompareWindow::initialize_window(HWND parent) {
     // from its system menu. This runs after Create(parent) so m_hWnd is valid.
     subclass_parent_window();
 
+    // If we're inside the popup host, apply the persisted dark-title-bar
+    // override (no-op when embedded, or when the toggle is off and we
+    // haven't overridden anything).
+    apply_dark_title_bar();
+
     // Start watching the host background if pseudo transparency is on.
     if (m_pseudo_transparency) {
         m_parent_key = current_parent_key();
@@ -155,6 +162,7 @@ void SpectrumCompareWindow::initialize_window(HWND parent) {
 //   uint8_t  language        ; language_t (0=EN, 1=ZH)  [v2+]
 //   uint8_t  show_db_scale   ; 0 / 1                      [v3+]
 //   uint8_t  pseudo_transparency ; 0 / 1                  [v4+]
+//   uint8_t  dark_title_bar  ; 0 / 1                      [v5+]
 //
 // v1 readers stop after title_format and ignore the language byte,
 // which is fine — language defaults to English on old .fth files.
@@ -162,8 +170,10 @@ void SpectrumCompareWindow::initialize_window(HWND parent) {
 // defaults to true (dB axis visible).
 // v3 readers stop after show_db_scale and ignore pseudo_transparency,
 // which defaults to false (opaque background).
+// v4 readers stop after pseudo_transparency and ignore dark_title_bar,
+// which defaults to false (title bar follows foobar2000's theme).
 // ============================================================
-static constexpr uint32_t kConfigMagicVersion = 4u;
+static constexpr uint32_t kConfigMagicVersion = 5u;
 static constexpr int        kMinMaxTracks = 1;
 static constexpr int        kMaxMaxTracks = 4;
 
@@ -175,7 +185,8 @@ static ui_element_config::ptr build_instance_config(
     const char* title_format,
     language_t language,
     bool show_db_scale,
-    bool pseudo_transparency)
+    bool pseudo_transparency,
+    bool dark_title_bar)
 {
     ui_element_config_builder b;
     b << kConfigMagicVersion;
@@ -193,6 +204,7 @@ static ui_element_config::ptr build_instance_config(
         (int)language, 0, (int)LANG_COUNT - 1);
     b << (uint8_t)(show_db_scale ? 1u : 0u);
     b << (uint8_t)(pseudo_transparency ? 1u : 0u);
+    b << (uint8_t)(dark_title_bar ? 1u : 0u);
     return b.finish(SpectrumCompareWindow::g_get_guid());
 }
 
@@ -209,6 +221,7 @@ void SpectrumCompareWindow::set_configuration(ui_element_config::ptr config) {
     bool new_show_time = m_show_time_axis;
     bool new_show_db = m_show_db_scale;
     bool new_pseudo = m_pseudo_transparency;
+    bool new_dark_title_bar = m_dark_title_bar;
     pfc::string8 new_title = m_title_format;
     language_t new_language = m_language;
 
@@ -249,6 +262,12 @@ void SpectrumCompareWindow::set_configuration(ui_element_config::ptr config) {
                     uint8_t pt = 0;
                     parser >> pt;
                     new_pseudo = (pt != 0);
+                }
+                // v5+ adds dark_title_bar after pseudo_transparency.
+                if (version >= 5u) {
+                    uint8_t dtb = 0;
+                    parser >> dtb;
+                    new_dark_title_bar = (dtb != 0);
                 }
             }
             // (Earlier experimental versions of this file wrote extra
@@ -294,6 +313,12 @@ void SpectrumCompareWindow::set_configuration(ui_element_config::ptr config) {
         g_cfg_pseudo_transparency = new_pseudo;
         changed_something = true;
     }
+    if (new_dark_title_bar != m_dark_title_bar) {
+        m_dark_title_bar = new_dark_title_bar;
+        g_cfg_dark_title_bar = new_dark_title_bar;
+        // Non-client area only — no repaint / re-analysis needed.
+        apply_dark_title_bar();
+    }
     if (strcmp(new_title.get_ptr(), m_title_format.get_ptr()) != 0) {
         m_title_format = new_title;
         g_cfg_title_format.set(new_title);
@@ -323,7 +348,7 @@ ui_element_config::ptr SpectrumCompareWindow::get_configuration() {
         m_max_tracks, m_palette,
         m_show_freq_axis, m_show_time_axis,
         m_title_format.get_ptr(), m_language, m_show_db_scale,
-        m_pseudo_transparency);
+        m_pseudo_transparency, m_dark_title_bar);
     m_config = fresh;
     return fresh;
 }
@@ -339,7 +364,8 @@ ui_element_config::ptr SpectrumCompareWindow::g_get_default_configuration() {
         (language_t)pfc::clip_t<int>(
             (int)g_cfg_language, 0, (int)LANG_COUNT - 1),
         (bool)g_cfg_show_db_scale,
-        (bool)g_cfg_pseudo_transparency);
+        (bool)g_cfg_pseudo_transparency,
+        (bool)g_cfg_dark_title_bar);
 }
 
 void SpectrumCompareWindow::notify(const GUID& p_what, t_size p_param1, const void* p_param2, t_size p_param2size) {
@@ -1736,6 +1762,8 @@ LRESULT SpectrumCompareWindow::OnSpectrumReady(UINT uMsg, WPARAM wParam, LPARAM 
 //   [11..12] Title format   ▶  Edit / Reset                (2 leaves)
 //   [13..14] Language       ▶  English / Chinese           (2 leaves)
 //   [15]     Refresh analysis                              (1 leaf)
+//   [16]     Dark title bar — POPUP MODE ONLY, omitted
+//            when the panel is embedded                    (0..1 leaf)
 static constexpr size_t kCountIdx     = 0;
 static constexpr size_t kPaletteIdx   = 4;
 static constexpr size_t kAxesIdx      = 7;
@@ -1743,7 +1771,8 @@ static constexpr size_t kPseudoIdx    = 10;
 static constexpr size_t kTitleIdx     = 11;
 static constexpr size_t kLangIdx      = 13;
 static constexpr size_t kRefreshIdx   = 15;
-static constexpr size_t kTotalLeaves  = 16;
+static constexpr size_t kDarkTitleBarIdx = 16;
+static constexpr size_t kTotalLeaves  = 17;
 
 // Helper: narrow UTF-8 -> wide for Win32 menu APIs.
 static void append_menu_i18n(HMENU hmenu, UINT flags, UINT id, strid_t sid, language_t lang) {
@@ -1823,7 +1852,8 @@ static std::vector<UINT> build_settings_block(HMENU p_menu, unsigned p_id_base,
                                               int max_tracks, palette_t palette,
                                               bool show_freq, bool show_time,
                                               bool show_db, bool pseudo_transparency,
-                                              language_t lang) {
+                                              language_t lang,
+                                              bool popup_mode, bool dark_title_bar) {
     std::vector<UINT> leaf_idms;
     leaf_idms.reserve(kTotalLeaves);
 
@@ -1893,7 +1923,17 @@ static std::vector<UINT> build_settings_block(HMENU p_menu, unsigned p_id_base,
     append_menu_i18n(p_menu, MF_STRING, p_id_base + (unsigned)leaf_idms.size(), S_REFRESH, lang);
     leaf_idms.push_back(IDM_REFRESH);
 
-    PFC_ASSERT(leaf_idms.size() == kTotalLeaves);
+    // Dark title bar — only meaningful for the popup host's caption, so the
+    // item is omitted entirely when the panel is embedded in the main window.
+    if (popup_mode) {
+        PFC_ASSERT(leaf_idms.size() == kDarkTitleBarIdx);
+        WIN32_OP_D(::AppendMenu(p_menu, MF_SEPARATOR, 0, _T("")));
+        append_menu_i18n(p_menu, MF_STRING | (dark_title_bar ? MF_CHECKED : 0),
+                         p_id_base + (unsigned)leaf_idms.size(), S_DARK_TITLE_BAR, lang);
+        leaf_idms.push_back(IDM_TOGGLE_DARK_TITLE_BAR);
+    }
+
+    PFC_ASSERT(leaf_idms.size() == (popup_mode ? kTotalLeaves : kTotalLeaves - 1));
     return leaf_idms;
 }
 
@@ -1970,7 +2010,8 @@ void SpectrumCompareWindow::edit_mode_context_menu_build(const POINT& /*p_point*
     m_edit_mode_cmd_to_idm = build_settings_block(
         p_menu, p_id_base, m_max_tracks, m_palette,
         m_show_freq_axis, m_show_time_axis, m_show_db_scale,
-        m_pseudo_transparency, m_language);
+        m_pseudo_transparency, m_language,
+        is_popup_mode(), m_dark_title_bar);
 }
 
 void SpectrumCompareWindow::edit_mode_context_menu_command(
@@ -2018,7 +2059,8 @@ void SpectrumCompareWindow::OnContextMenu(CWindow wnd, CPoint point) {
     const std::vector<UINT> leaf_idms = build_settings_block(
         menu, k_menu_id_base, m_max_tracks, m_palette,
         m_show_freq_axis, m_show_time_axis, m_show_db_scale,
-        m_pseudo_transparency, m_language);
+        m_pseudo_transparency, m_language,
+        is_popup_mode(), m_dark_title_bar);
 
     CPoint ptShow = point;
     if (ptShow.x == -1 && ptShow.y == -1) {
@@ -2161,6 +2203,14 @@ void SpectrumCompareWindow::OnTogglePseudoTransparency(UINT uNotifyCode, int nID
         m_parent_watch = false;
     }
     Invalidate();
+}
+
+void SpectrumCompareWindow::OnToggleDarkTitleBar(UINT uNotifyCode, int nID, CWindow wndCtl) {
+    (void)uNotifyCode; (void)nID; (void)wndCtl;
+    m_dark_title_bar = !m_dark_title_bar;
+    g_cfg_dark_title_bar = m_dark_title_bar;
+    // Non-client area only — DWM repaints the caption itself.
+    apply_dark_title_bar();
 }
 
 // ============================================================
@@ -2613,6 +2663,81 @@ LRESULT CALLBACK SpectrumCompareWindow::parent_subclass_proc(
 }
 
 // ============================================================
+// Dark title bar (popup host)
+// ------------------------------------------------------------
+// The View → Spectrum Compare popup window gets a standard themed
+// caption from foobar2000's popup host: white in light mode, dark in
+// dark mode. In light mode the bright caption is glaring next to the
+// spectrogram, so we offer a popup-only menu toggle that sets
+// DWMWA_USE_IMMERSIVE_DARK_MODE on the top-level host window.
+//
+// Note this is the non-client-area counterpart of the better-known
+// SetWindowTheme(hwnd, L"DarkMode_Explorer", ...) trick — that one
+// darkens *client-area* controls (tooltips, listviews, scrollbars);
+// the caption is owned by DWM and only reacts to the DWM attribute.
+// ============================================================
+namespace {
+typedef HRESULT(WINAPI* DwmSetWindowAttribute_t)(HWND, DWORD, LPCVOID, DWORD);
+typedef HRESULT(WINAPI* DwmGetWindowAttribute_t)(HWND, DWORD, PVOID, DWORD);
+
+struct dwm_api_t {
+    DwmSetWindowAttribute_t set_attr = nullptr;
+    DwmGetWindowAttribute_t get_attr = nullptr;
+    dwm_api_t() {
+        // Runtime-load so no dwmapi.lib link dependency is needed.
+        if (HMODULE m = ::LoadLibraryW(L"dwmapi.dll")) {
+            set_attr = (DwmSetWindowAttribute_t)::GetProcAddress(m, "DwmSetWindowAttribute");
+            get_attr = (DwmGetWindowAttribute_t)::GetProcAddress(m, "DwmGetWindowAttribute");
+        }
+    }
+};
+static const dwm_api_t& dwm_api() { static const dwm_api_t api; return api; }
+
+// DWMWA_USE_IMMERSIVE_DARK_MODE is 20 on Win10 2004+ / Win11 (documented
+// since then) and 19 on Win10 1809–1909 (undocumented). Try 20 first and
+// fall back to 19 so the toggle works on every supported OS release.
+static void dwm_set_dark_caption(HWND hwnd, BOOL dark) {
+    if (!dwm_api().set_attr) return;
+    if (FAILED(dwm_api().set_attr(hwnd, 20, &dark, sizeof(dark))))
+        dwm_api().set_attr(hwnd, 19, &dark, sizeof(dark));
+}
+static bool dwm_get_dark_caption(HWND hwnd, BOOL& out) {
+    if (!dwm_api().get_attr) return false;
+    if (SUCCEEDED(dwm_api().get_attr(hwnd, 20, &out, sizeof(out)))) return true;
+    return SUCCEEDED(dwm_api().get_attr(hwnd, 19, &out, sizeof(out)));
+}
+} // namespace
+
+bool SpectrumCompareWindow::is_popup_mode() const {
+    if (m_hWnd == NULL) return false;
+    HWND root = ::GetAncestor(m_hWnd, GA_ROOT);
+    if (root == NULL) return false;
+    // Embedded: the top-level ancestor is foobar2000's main window.
+    if (root == core_api::get_main_window()) return false;
+    // Anything else top-level with a real caption is the popup host
+    // (or a floating container, where a dark caption is equally useful).
+    const LONG_PTR style = ::GetWindowLongPtrW(root, GWL_STYLE);
+    return (style & WS_CAPTION) == WS_CAPTION;
+}
+
+void SpectrumCompareWindow::apply_dark_title_bar() {
+    if (m_hWnd == NULL || !is_popup_mode()) return;
+    HWND root = ::GetAncestor(m_hWnd, GA_ROOT);
+    if (m_dark_title_bar) {
+        // Cache the host-managed value once so a later un-toggle can restore
+        // exactly what foobar2000 had set (covers both light and dark mode).
+        if (m_orig_titlebar_dark < 0) {
+            BOOL cur = FALSE;
+            m_orig_titlebar_dark = (dwm_get_dark_caption(root, cur) && cur) ? 1 : 0;
+        }
+        dwm_set_dark_caption(root, TRUE);
+    } else if (m_orig_titlebar_dark >= 0) {
+        dwm_set_dark_caption(root, m_orig_titlebar_dark != 0);
+        m_orig_titlebar_dark = -1;
+    }
+}
+
+// ============================================================
 // Component registration
 // ============================================================
 
@@ -2639,7 +2764,7 @@ namespace {
     // Component version info
     DECLARE_COMPONENT_VERSION(
         "Spectrum Compare",
-        "1.5",
+        "1.6",
         "Vertical spectrogram comparison panel for selected tracks. Spek-style coloring.\n\n"
         "Authors: TRAE AI Coding Assistant, always beta, Asion\n\n"
         "Select one or more tracks in the playlist to view their spectrograms.\n"
