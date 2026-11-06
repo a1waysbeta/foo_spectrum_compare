@@ -270,8 +270,10 @@ private:
 
     // Dark title bar override for the popup host (View → Spectrum Compare).
     // Applies DWMWA_USE_IMMERSIVE_DARK_MODE to the top-level host window.
+    // Never touches foobar2000's own main window.
     bool is_popup_mode() const;
     void apply_dark_title_bar();
+    void restore_title_bar_to_theme();
 
     // Spectrum rendering
     // 返回实际绘制出的像素宽度（渐进显示时可能小于 rc 宽度），
